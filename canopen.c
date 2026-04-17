@@ -457,6 +457,27 @@ static co_error_t co_send_heartbeat(co_node_t *node)
     return node->iface.send(node->iface.user, &frame);
 }
 
+static co_error_t co_send_bootup(co_node_t *node)
+{
+    co_can_frame_t frame = {
+        .cob_id = CO_COB_HEARTBEAT_BASE + node->node_id,
+        .len = 1U,
+        .data = {0x00U}
+    };
+    return node->iface.send(node->iface.user, &frame);
+}
+
+static void co_on_reset(co_node_t *node, co_reset_type_t type)
+{
+    node->nmt_state = CO_NMT_INITIALIZING;
+    node->bootup_pending = true;
+    node->last_heartbeat_ms = 0U;
+
+    if (node->iface.on_reset) {
+        node->iface.on_reset(node->iface.user, type);
+    }
+}
+
 static co_error_t co_send_sdo_abort(co_node_t *node, uint16_t index, uint8_t subindex, uint32_t abort_code)
 {
     co_can_frame_t tx = {0};
@@ -549,8 +570,10 @@ static co_error_t co_process_nmt(co_node_t *node, const co_can_frame_t *frame)
             node->nmt_state = CO_NMT_PRE_OPERATIONAL;
             break;
         case 0x81:
+            co_on_reset(node, CO_RESET_COMMUNICATION);
+            break;
         case 0x82:
-            node->nmt_state = CO_NMT_INITIALIZING;
+            co_on_reset(node, CO_RESET_APPLICATION);
             break;
         default:
             return CO_ERROR_INVALID_ARGS;
@@ -564,7 +587,8 @@ void co_init(co_node_t *node, const co_if_t *iface, uint8_t node_id, uint16_t he
     node->iface = *iface;
     node->node_id = node_id;
     node->heartbeat_ms = heartbeat_ms;
-    node->nmt_state = CO_NMT_PRE_OPERATIONAL;
+    node->nmt_state = CO_NMT_INITIALIZING;
+    node->bootup_pending = true;
 
     node->rpdo_map[0] = CO_COB_RPDO1_BASE + node_id;
     node->rpdo_map[1] = CO_COB_RPDO2_BASE + node_id;
@@ -614,6 +638,17 @@ co_error_t co_process(co_node_t *node)
 {
     if (!node || !node->iface.millis || !node->iface.send) {
         return CO_ERROR_INVALID_ARGS;
+    }
+
+    if (node->nmt_state == CO_NMT_INITIALIZING && node->bootup_pending) {
+        const co_error_t err = co_send_bootup(node);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+        node->nmt_state = CO_NMT_PRE_OPERATIONAL;
+        node->bootup_pending = false;
+        node->last_heartbeat_ms = node->iface.millis(node->iface.user);
+        return CO_ERROR_NONE;
     }
 
     if (node->heartbeat_ms == 0U) {
