@@ -7,7 +7,7 @@ This repository contains a compact C implementation intended as a **starting poi
   - Heartbeat production
   - Expedited SDO server (upload/download)
   - RPDO receive / TPDO transmit buffers
-  - Object dictionary entry registration
+- Structured object dictionary registration (built-ins + app extensions)
 - CiA 402 essentials:
   - Basic drive state machine transitions
   - Controlword / statusword handling
@@ -33,12 +33,14 @@ co_stm32_ctx_t can_ctx;
 co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx, 0x01, 100);
 ```
 
-4. Register OD variables (expedited 1..4 byte entries):
+4. Register OD variables (application extensions on top of built-in CiA 301 objects):
 
 ```c
 static uint16_t statusword = 0;
 co_od_add(&canopen_node, 0x6041, 0x00, (uint8_t *)&statusword, sizeof(statusword), true, false);
 ```
+
+Use `co_od_add_ex` for variable-length entries, access flags, and read/write callbacks.
 
 5. In your main loop:
 
