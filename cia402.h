@@ -67,6 +67,10 @@ struct cia402_axis {
     int32_t target_position;
     int32_t target_velocity;
     int16_t target_torque;
+    uint32_t profile_velocity;
+    uint32_t profile_acceleration;
+    uint32_t profile_deceleration;
+    uint32_t quick_stop_deceleration;
     int32_t position_actual;
     int32_t velocity_actual;
     int16_t torque_actual;
@@ -76,8 +80,18 @@ struct cia402_axis {
     bool target_reached;
     bool internal_limit_active;
     bool fault_reaction_complete;
+    bool target_position_valid;
+    bool target_velocity_valid;
+    bool target_torque_valid;
+    bool profile_velocity_valid;
+    bool profile_acceleration_valid;
+    bool profile_deceleration_valid;
+    bool quick_stop_deceleration_valid;
     co_node_t *node;
     uint8_t fault_msef;
+    uint16_t fault_code;
+    int8_t diag_last_mode_checked;
+    uint32_t diag_precondition_mask;
     const cia402_app_if_t *app;
 };
 
