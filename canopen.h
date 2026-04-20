@@ -72,6 +72,8 @@ typedef enum {
 struct co_node;
 typedef struct co_node co_node_t;
 typedef struct co_od_entry co_od_entry_t;
+typedef void (*co_rpdo_map_written_cb_t)(co_node_t *node, uint8_t rpdo_num, uint16_t index, uint8_t subindex, void *user);
+typedef void (*co_tpdo_pre_tx_cb_t)(co_node_t *node, uint8_t tpdo_num, void *user);
 
 typedef uint32_t (*co_od_read_cb_t)(co_node_t *node, const co_od_entry_t *entry, void *user);
 typedef uint32_t (*co_od_write_cb_t)(co_node_t *node,
@@ -213,6 +215,12 @@ struct co_node {
         uint32_t last_activity_ms;
         uint8_t buffer[CO_SDO_TRANSFER_BUF_SIZE];
     } sdo_channels[CO_SDO_CHANNELS];
+
+    struct {
+        co_rpdo_map_written_cb_t on_rpdo_map_written;
+        co_tpdo_pre_tx_cb_t on_tpdo_pre_tx;
+        void *user;
+    } hooks;
 };
 
 void co_init(co_node_t *node, const co_if_t *iface, uint8_t node_id, uint16_t heartbeat_ms);
@@ -246,6 +254,10 @@ uint32_t co_od_write(co_node_t *node,
 co_error_t co_process(co_node_t *node);
 co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame);
 co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num);
+void co_set_hooks(co_node_t *node,
+                  co_rpdo_map_written_cb_t on_rpdo_map_written,
+                  co_tpdo_pre_tx_cb_t on_tpdo_pre_tx,
+                  void *user);
 co_error_t co_fault_raise(co_node_t *node,
                           uint8_t fault_id,
                           uint16_t emcy_code,

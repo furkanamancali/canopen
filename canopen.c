@@ -1894,6 +1894,9 @@ static uint32_t co_rpdo_unpack_to_od(co_node_t *node, uint8_t rpdo_num, const co
         if (write_abort != 0U) {
             return write_abort;
         }
+        if (node->hooks.on_rpdo_map_written) {
+            node->hooks.on_rpdo_map_written(node, rpdo_num, map->index, map->subindex, node->hooks.user);
+        }
         bit_offset += map->bit_length;
     }
     return 0U;
@@ -2002,6 +2005,10 @@ co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num)
         return CO_ERROR_INVALID_ARGS;
     }
 
+    if (node->hooks.on_tpdo_pre_tx) {
+        node->hooks.on_tpdo_pre_tx(node, tpdo_num, node->hooks.user);
+    }
+
     co_can_frame_t frame = {.cob_id = node->tpdo_cfg[tpdo_num].cob_id.can_id, .len = 0U};
     const uint32_t abort_code = co_tpdo_pack_from_od(node, tpdo_num, &frame);
     if (abort_code != 0U) {
@@ -2010,4 +2017,18 @@ co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num)
     node->tpdo_data[tpdo_num].len = frame.len;
     memcpy(node->tpdo_data[tpdo_num].data, frame.data, frame.len);
     return co_send_frame(node, &frame);
+}
+
+void co_set_hooks(co_node_t *node,
+                  co_rpdo_map_written_cb_t on_rpdo_map_written,
+                  co_tpdo_pre_tx_cb_t on_tpdo_pre_tx,
+                  void *user)
+{
+    if (!node) {
+        return;
+    }
+
+    node->hooks.on_rpdo_map_written = on_rpdo_map_written;
+    node->hooks.on_tpdo_pre_tx = on_tpdo_pre_tx;
+    node->hooks.user = user;
 }
