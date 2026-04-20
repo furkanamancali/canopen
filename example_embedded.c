@@ -1,429 +1,475 @@
 /*
- * eRob Actuator CANopen Node — STM32H7 FDCAN
+ * eRob CANopen Master — STM32H7 FDCAN
  *
- * This file is the top-level application glue for a single-axis eRob
- * integrated joint actuator driven over CiA 301 / CiA 402 (Profile Velocity).
+ * This file implements a CANopen master that controls a single eRob integrated
+ * joint actuator (CiA 402, Profile Velocity mode).
  *
- * PDO layout (eRob profile):
+ * Topology
+ * ────────
+ *   STM32H7 (this node, master)  ←──CAN──→  eRob actuator (slave, node 0x01)
  *
- *   RPDO1  COB-ID 0x200+node_id  (56 bits, SYNC-driven, 0x1400/0x1600)
- *     Bytes 0-1  : Controlword          0x6040:00  16 bits
- *     Byte  2    : Modes of Operation   0x6060:00   8 bits
- *     Bytes 3-6  : Target Velocity      0x60FF:00  32 bits  [RPM, signed]
+ *   Master node ID : 0x7F
+ *   eRob  node ID  : 0x01  (match hardware DIP/EEP)
+ *   SYNC producer  : master, 1 ms period (COB-ID 0x080)
  *
- *   RPDO2  COB-ID 0x300+node_id  (64 bits, SYNC-driven, 0x1401/0x1601)
- *     Bytes 0-3  : Profile Acceleration 0x6083:00  32 bits  [RPM/s]
- *     Bytes 4-7  : Profile Deceleration 0x6084:00  32 bits  [RPM/s]
+ * PDO wiring (master perspective)
+ * ────────────────────────────────
+ *   Master TPDO1  0x201  → eRob RPDO1  (56 bits, every SYNC)
+ *     Controlword  0x6040  16 bits
+ *     Mode of Op   0x6060   8 bits   [fixed: Profile Velocity = 3]
+ *     Target Vel   0x60FF  32 bits   [RPM, signed]
  *
- *   TPDO1  COB-ID 0x180+node_id  (56 bits, every SYNC, 0x1800/0x1A00)
- *     Bytes 0-1  : Statusword           0x6041:00  16 bits
- *     Byte  2    : Mode Display         0x6061:00   8 bits
- *     Bytes 3-6  : Velocity Actual      0x606C:00  32 bits  [RPM, signed]
+ *   Master TPDO2  0x301  → eRob RPDO2  (64 bits, every SYNC)
+ *     Profile Accel  0x6083  32 bits  [RPM/s]
+ *     Profile Decel  0x6084  32 bits  [RPM/s]
  *
- *   TPDO2  COB-ID 0x280+node_id  (48 bits, every SYNC, 0x1801/0x1A01)
- *     Bytes 0-3  : Position Actual      0x6064:00  32 bits  [encoder counts]
- *     Bytes 4-5  : Torque Actual        0x6077:00  16 bits  [0.1 % rated]
+ *   eRob TPDO1  0x181  → Master RPDO1  (56 bits, every SYNC)
+ *     Statusword     0x6041  16 bits
+ *     Mode Display   0x6061   8 bits
+ *     Velocity Act   0x606C  32 bits  [RPM, signed]
  *
- * SYNC period : 1 ms  (producer COB-ID 0x080)
- * Heartbeat   : 100 ms producer; consumer monitors master at node 0x7F, 1 s timeout
- * Node ID     : 0x01  (change EROB_NODE_ID below to match hardware DIP/EEP setting)
+ *   eRob TPDO2  0x281  → Master RPDO2  (48 bits, every SYNC)
+ *     Position Act   0x6064  32 bits  [encoder counts]
+ *     Torque Act     0x6077  16 bits  [0.1 % rated]
  *
- * Runtime velocity change:
- *   Call erob_set_target_velocity(rpm) from any task context to update the
- *   target velocity on the fly.  The new value takes effect on the next
- *   cia402_step() — no SDO or RPDO required.
+ * CiA 402 state sequencing
+ * ─────────────────────────
+ *   The master drives the eRob through the CiA 402 state machine by writing
+ *   specific controlword patterns into Master TPDO1:
+ *
+ *     SWITCH_ON_DISABLED → READY_TO_SWITCH_ON : controlword 0x0006
+ *     READY_TO_SWITCH_ON → SWITCHED_ON        : controlword 0x0007
+ *     SWITCHED_ON        → OPERATION_ENABLED  : controlword 0x000F
+ *     OPERATION_ENABLED  → QUICK_STOP         : controlword 0x000B
+ *     any fault          → clear fault        : controlword 0x0080 (rising edge)
+ *
+ * Runtime velocity change
+ * ────────────────────────
+ *   Call erob_set_target_velocity(rpm) at any time.  The new value is packed
+ *   into Master TPDO1 and transmitted on the next SYNC tick.
  */
 
 #include "canopen.h"
-#include "cia402.h"
 #include "canopen_stm32h7_fdcan.h"
 
 extern FDCAN_HandleTypeDef hfdcan1;
 
-/* ── Node configuration ───────────────────────────────────────────────────── */
+/* ── Master / eRob configuration ─────────────────────────────────────────── */
+#define MASTER_NODE_ID           0x7FU
+#define MASTER_HEARTBEAT_MS      100U
+
 #define EROB_NODE_ID             0x01U
-#define EROB_HEARTBEAT_MS        100U
-#define EROB_MASTER_NODE_ID      0x7FU
-#define EROB_MASTER_HB_TIMEOUT   1000U   /* ms – NMT lost-comms detection     */
-#define EROB_SYNC_PERIOD_US      1000UL  /* 1 ms SYNC                         */
+#define EROB_HB_TIMEOUT_MS       1000U   /* declare eRob lost after 1 s       */
 
-/* ── eRob physical limits (adapt to your actuator variant) ───────────────── */
-#define EROB_MAX_VEL_RPM         3000U   /* rated max speed [RPM]             */
-#define EROB_DEFAULT_ACCEL       500U    /* default ramp accel [RPM/s]        */
-#define EROB_DEFAULT_DECEL       500U    /* default ramp decel [RPM/s]        */
-#define EROB_DEFAULT_QS_DECEL    2000U   /* quick-stop decel  [RPM/s]         */
-#define EROB_DEFAULT_VEL_WINDOW  50U     /* velocity window   [RPM]           */
-#define EROB_DEFAULT_VEL_WIN_MS  50U     /* window settle time [ms]           */
+#define SYNC_PERIOD_US           1000UL  /* 1 ms SYNC produced by master      */
 
-/* ── CANopen stack instances ──────────────────────────────────────────────── */
+#define EROB_DEFAULT_ACCEL       500U    /* [RPM/s]  initial profile accel     */
+#define EROB_DEFAULT_DECEL       500U    /* [RPM/s]  initial profile decel     */
+#define EROB_MAX_VEL_RPM         3000    /* [RPM]    clamped before write      */
+
+/* CiA 402 controlword patterns (DS402 §8.1.3) */
+#define CW_SHUTDOWN              0x0006U /* → READY_TO_SWITCH_ON              */
+#define CW_SWITCH_ON             0x0007U /* → SWITCHED_ON                     */
+#define CW_ENABLE_OPERATION      0x000FU /* → OPERATION_ENABLED               */
+#define CW_QUICK_STOP            0x000BU /* → QUICK_STOP                      */
+#define CW_FAULT_RESET           0x0080U /* rising edge clears fault           */
+#define CW_FAULT_RESET_CLEAR     0x0000U /* lower the fault-reset bit          */
+
+/* Profile Velocity mode identifier (CiA 402 §6.1.1) */
+#define EROB_MODE_PROFILE_VEL    ((int8_t)3)
+
+/* ── CANopen stack instance ───────────────────────────────────────────────── */
 static co_node_t      canopen_node;
 static co_stm32_ctx_t can_ctx;
-static cia402_axis_t  axis;
 
-/* ── Hardware interface (written by motor ISR / DMA completion) ───────────── */
-static volatile int32_t  g_vel_feedback_rpm    = 0;   /* [RPM, signed]        */
-static volatile int32_t  g_pos_feedback_counts = 0;   /* [encoder counts]     */
-static volatile int16_t  g_trq_feedback_pct    = 0;   /* [0.1 % rated torque] */
-static volatile bool     g_inverter_fault      = false;
+/* ── OD backing storage for master PDO objects ───────────────────────────── */
+/* TPDO1: command frame sent to eRob every SYNC */
+static uint16_t  m_controlword    = CW_SHUTDOWN;
+static int8_t    m_mode_of_op     = EROB_MODE_PROFILE_VEL;
+static int32_t   m_target_vel     = 0;
 
-/* ── Software trapezoidal velocity ramp ──────────────────────────────────── */
-static struct {
-    int32_t  commanded_rpm;   /* current output to motor inverter [RPM]  */
-    uint32_t last_tick_ms;    /* HAL_GetTick() at previous ramp step     */
-} g_ramp;
+/* TPDO2: ramp parameters sent to eRob every SYNC */
+static uint32_t  m_profile_accel  = EROB_DEFAULT_ACCEL;
+static uint32_t  m_profile_decel  = EROB_DEFAULT_DECEL;
 
-/*
- * Step the trapezoidal ramp from `current` toward `target` in `dt_ms` ms,
- * bounded by accel_rpm_s (acceleration rate) or decel_rpm_s (deceleration).
- * Returns the new commanded value.
- */
-static int32_t ramp_step(int32_t current, int32_t target,
-                         uint32_t accel_rpm_s, uint32_t decel_rpm_s,
-                         uint32_t dt_ms)
+/* RPDO1: feedback received from eRob every SYNC */
+static uint16_t  m_statusword     = 0;
+static int8_t    m_mode_display   = 0;
+static int32_t   m_velocity_act   = 0;
+
+/* RPDO2: feedback received from eRob every SYNC */
+static int32_t   m_position_act   = 0;
+static int16_t   m_torque_act     = 0;
+
+/* ── CiA 402 state machine (master-side, drives controlword) ─────────────── */
+typedef enum {
+    MASTER_CIA402_IDLE = 0,     /* not yet started                          */
+    MASTER_CIA402_FAULT_RESET,  /* sending fault-reset pulse                */
+    MASTER_CIA402_SHUTDOWN,     /* sending Shutdown  → READY_TO_SWITCH_ON   */
+    MASTER_CIA402_SWITCH_ON,    /* sending Switch On → SWITCHED_ON          */
+    MASTER_CIA402_ENABLE,       /* sending Enable Op → OPERATION_ENABLED    */
+    MASTER_CIA402_RUNNING,      /* OPERATION_ENABLED, applying velocity      */
+    MASTER_CIA402_FAULT,        /* eRob reported a fault                     */
+} master_cia402_state_t;
+
+static master_cia402_state_t m_drive_state = MASTER_CIA402_IDLE;
+static uint32_t              m_state_entry_ms = 0;
+
+/* Bit masks for interpreting statusword (CiA 402 §8.2.1) */
+#define SW_RTSO    0x0001U  /* Ready to Switch On       */
+#define SW_SO      0x0002U  /* Switched On              */
+#define SW_OE      0x0004U  /* Operation Enabled        */
+#define SW_FAULT   0x0008U  /* Fault                    */
+#define SW_QS      0x0020U  /* Quick Stop               */
+#define SW_SOD     0x0040U  /* Switch On Disabled       */
+
+static bool erob_in_state_switch_on_disabled(uint16_t sw)
 {
-    int32_t delta = target - current;
-    int32_t limit;
-
-    if (delta > 0) {
-        limit = (int32_t)((accel_rpm_s * dt_ms + 500U) / 1000U);
-        if (delta > limit) {
-            delta = limit;
-        }
-    } else if (delta < 0) {
-        limit = (int32_t)((decel_rpm_s * dt_ms + 500U) / 1000U);
-        if (-delta > limit) {
-            delta = -limit;
-        }
-    }
-
-    return current + delta;
+    return (sw & (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD))
+            == SW_SOD;
+}
+static bool erob_in_state_ready_to_switch_on(uint16_t sw)
+{
+    return (sw & (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD))
+            == (SW_RTSO | SW_QS);
+}
+static bool erob_in_state_switched_on(uint16_t sw)
+{
+    return (sw & (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD))
+            == (SW_RTSO | SW_SO | SW_QS);
+}
+static bool erob_in_state_operation_enabled(uint16_t sw)
+{
+    return (sw & (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD))
+            == (SW_RTSO | SW_SO | SW_OE | SW_QS);
+}
+static bool erob_in_state_fault(uint16_t sw)
+{
+    return (sw & SW_FAULT) != 0U;
 }
 
-/* ── CiA 402 application callbacks ───────────────────────────────────────── */
-
 /*
- * on_feedback: called at the start of every cia402_step().
- * Snapshot hardware feedback into the axis struct so statusword and
- * velocity-window checks operate on fresh data.
+ * Drive the eRob CiA 402 state machine from the master side.
+ * Called once per SYNC tick after RPDO data has been unpacked.
  */
-static void erob_on_feedback(cia402_axis_t *a, int8_t mode, void *user)
+static void erob_state_machine_step(void)
 {
-    (void)mode;
-    (void)user;
-    a->position_actual = g_pos_feedback_counts;
-    a->velocity_actual  = g_vel_feedback_rpm;
-    a->torque_actual    = g_trq_feedback_pct;
-}
-
-/*
- * on_profile_velocity: called each cia402_step() while OPERATION_ENABLED
- * and mode == Profile Velocity (3).
- * Clamps target to the physical limit and advances the trapezoidal ramp.
- */
-static bool erob_on_profile_velocity(cia402_axis_t *a, void *user)
-{
-    (void)user;
-
     uint32_t now_ms = HAL_GetTick();
-    uint32_t dt_ms  = now_ms - g_ramp.last_tick_ms;
-    if (dt_ms == 0U) {
-        dt_ms = 1U;
+    uint16_t sw     = m_statusword;
+
+    switch (m_drive_state) {
+
+    case MASTER_CIA402_IDLE:
+        /* Begin sequencing: attempt fault reset first, then enable. */
+        m_controlword   = CW_FAULT_RESET;
+        m_drive_state   = MASTER_CIA402_FAULT_RESET;
+        m_state_entry_ms = now_ms;
+        break;
+
+    case MASTER_CIA402_FAULT_RESET:
+        /* Hold fault-reset bit for ≥1 SYNC tick, then lower it. */
+        if ((now_ms - m_state_entry_ms) >= 5U) {
+            m_controlword  = CW_FAULT_RESET_CLEAR;
+            m_drive_state  = MASTER_CIA402_SHUTDOWN;
+            m_state_entry_ms = now_ms;
+        }
+        break;
+
+    case MASTER_CIA402_SHUTDOWN:
+        m_controlword = CW_SHUTDOWN;
+        if (erob_in_state_ready_to_switch_on(sw)) {
+            m_drive_state  = MASTER_CIA402_SWITCH_ON;
+            m_state_entry_ms = now_ms;
+        } else if (erob_in_state_fault(sw)) {
+            m_drive_state  = MASTER_CIA402_FAULT;
+            m_state_entry_ms = now_ms;
+        }
+        break;
+
+    case MASTER_CIA402_SWITCH_ON:
+        m_controlword = CW_SWITCH_ON;
+        if (erob_in_state_switched_on(sw)) {
+            m_drive_state  = MASTER_CIA402_ENABLE;
+            m_state_entry_ms = now_ms;
+        } else if (erob_in_state_fault(sw)) {
+            m_drive_state  = MASTER_CIA402_FAULT;
+            m_state_entry_ms = now_ms;
+        }
+        break;
+
+    case MASTER_CIA402_ENABLE:
+        m_controlword = CW_ENABLE_OPERATION;
+        if (erob_in_state_operation_enabled(sw)) {
+            m_drive_state  = MASTER_CIA402_RUNNING;
+            m_state_entry_ms = now_ms;
+        } else if (erob_in_state_fault(sw)) {
+            m_drive_state  = MASTER_CIA402_FAULT;
+            m_state_entry_ms = now_ms;
+        }
+        break;
+
+    case MASTER_CIA402_RUNNING:
+        m_controlword = CW_ENABLE_OPERATION;
+        if (erob_in_state_fault(sw)) {
+            m_drive_state  = MASTER_CIA402_FAULT;
+            m_state_entry_ms = now_ms;
+            m_target_vel   = 0;
+        }
+        break;
+
+    case MASTER_CIA402_FAULT:
+        /* Zero velocity, hold fault-reset high, then restart sequencing. */
+        m_target_vel   = 0;
+        m_controlword  = CW_FAULT_RESET;
+        if ((now_ms - m_state_entry_ms) >= 200U && !erob_in_state_fault(sw)) {
+            m_controlword  = CW_FAULT_RESET_CLEAR;
+            m_drive_state  = MASTER_CIA402_SHUTDOWN;
+            m_state_entry_ms = now_ms;
+        }
+        break;
     }
-    g_ramp.last_tick_ms = now_ms;
-
-    /* Clamp target to actuator's rated limit. */
-    int32_t target = a->target_velocity;
-    if (target >  (int32_t)EROB_MAX_VEL_RPM) {
-        target =  (int32_t)EROB_MAX_VEL_RPM;
-    } else if (target < -(int32_t)EROB_MAX_VEL_RPM) {
-        target = -(int32_t)EROB_MAX_VEL_RPM;
-    }
-
-    g_ramp.commanded_rpm = ramp_step(g_ramp.commanded_rpm, target,
-                                     a->profile_acceleration,
-                                     a->profile_deceleration,
-                                     dt_ms);
-
-    /* TODO: write g_ramp.commanded_rpm to motor inverter
-     *       e.g. via SPI, UART, PWM compare register, or shared memory.    */
-    return true;
 }
+
+/* ── Runtime velocity setter (public API) ────────────────────────────────── */
 
 /*
- * on_quick_stop_reaction_check: called each cia402_step() while in QUICK_STOP.
- * Ramps commanded velocity to zero at the quick-stop deceleration rate.
- * Returns true (reaction complete) when the drive has reached standstill.
- */
-static bool erob_on_quick_stop_reaction_check(cia402_axis_t *a, void *user)
-{
-    (void)user;
-
-    uint32_t now_ms = HAL_GetTick();
-    uint32_t dt_ms  = now_ms - g_ramp.last_tick_ms;
-    if (dt_ms == 0U) {
-        dt_ms = 1U;
-    }
-    g_ramp.last_tick_ms = now_ms;
-
-    g_ramp.commanded_rpm = ramp_step(g_ramp.commanded_rpm, 0,
-                                     a->quick_stop_deceleration,
-                                     a->quick_stop_deceleration,
-                                     dt_ms);
-
-    /* TODO: write g_ramp.commanded_rpm to motor inverter. */
-    return (g_ramp.commanded_rpm == 0);
-}
-
-/*
- * on_fault_reaction_check: called each cia402_step() while FAULT_REACTION_ACTIVE.
- * Immediately command safe torque off; stack transitions to FAULT after this
- * returns true.
- */
-static bool erob_on_fault_reaction_check(cia402_axis_t *a, void *user)
-{
-    (void)a;
-    (void)user;
-    g_ramp.commanded_rpm = 0;
-    /* TODO: assert motor STO (safe torque off) via hardware enable line. */
-    return true;
-}
-
-/* Application interface registered with the CiA 402 stack. */
-static const cia402_app_if_t g_erob_app = {
-    .user                         = NULL,
-    .supported_modes              = CIA402_MODE_BIT(CIA402_MODE_PROFILE_VELOCITY),
-    .on_feedback                  = erob_on_feedback,
-    .on_profile_position          = NULL,
-    .on_velocity                  = NULL,
-    .on_profile_velocity          = erob_on_profile_velocity,
-    .on_profile_torque            = NULL,
-    .on_homing                    = NULL,
-    .on_interpolated_position     = NULL,
-    .on_cyclic_sync_position      = NULL,
-    .on_cyclic_sync_velocity      = NULL,
-    .on_cyclic_sync_torque        = NULL,
-    .on_quick_stop_reaction_check = erob_on_quick_stop_reaction_check,
-    .on_fault_reaction_check      = erob_on_fault_reaction_check,
-};
-
-/* ── Hardware fault monitor ──────────────────────────────────────────────── */
-static void fault_monitor_step(void)
-{
-    if (g_inverter_fault) {
-        (void)co_fault_raise(&canopen_node,
-                             CO_FAULT_CIA402_PROFILE,
-                             CO_EMCY_ERR_PROFILE,
-                             CO_ERROR_REG_DEVICE_PROFILE,
-                             0x01U,  /* MSEF: drive hardware fault */
-                             NULL);
-    } else {
-        (void)co_fault_clear(&canopen_node, CO_FAULT_CIA402_PROFILE, 0x00U, NULL);
-    }
-}
-
-/* ── Runtime velocity setter ─────────────────────────────────────────────── */
-
-/*
- * erob_set_target_velocity() — change the commanded velocity at any time.
+ * erob_set_target_velocity() — change the eRob target velocity at any time.
  *
- * Writes directly to OD entry 0x60FF:00 (Target Velocity), which is the same
- * object that RPDO1 maps.  The new value is clamped to ±EROB_MAX_VEL_RPM by
- * erob_on_profile_velocity() on the next cia402_step().
+ * Clamped to ±EROB_MAX_VEL_RPM.  The value is written into the master's
+ * TPDO1 OD entry (0x60FF:00) and transmitted on the next SYNC tick.
+ * Only effective when the drive is in OPERATION_ENABLED (MASTER_CIA402_RUNNING).
  *
- * Safe to call from the main task; not ISR-safe (co_od_write is not
- * re-entrant with co_on_can_rx).
+ * Not ISR-safe; call from main-task context only.
  */
 void erob_set_target_velocity(int32_t rpm)
 {
+    if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
+    if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
     (void)co_od_write(&canopen_node, 0x60FFU, 0x00U,
                       (const uint8_t *)&rpm, sizeof(rpm));
+}
+
+/* ── RPDO hook: called after eRob feedback PDOs are unpacked ─────────────── */
+static void on_erob_rpdo_written(co_node_t *node, uint8_t rpdo_num,
+                                 uint16_t index, uint8_t subindex, void *user)
+{
+    (void)node; (void)index; (void)subindex; (void)user;
+
+    /*
+     * Both RPDOs are fully unpacked into the OD backing variables
+     * (m_statusword, m_velocity_act, …) by the stack before this callback
+     * fires.  No explicit read needed — just act on the fresh values.
+     *
+     * RPDO2 carries position and torque; no extra action needed here.
+     * RPDO1 carries the statusword — advance the drive state machine.
+     */
+    if (rpdo_num == 0U) {
+        erob_state_machine_step();
+    }
+}
+
+/* ── TPDO hook: refresh OD before transmission ───────────────────────────── */
+static void on_tpdo_pre_tx(co_node_t *node, uint8_t tpdo_num, void *user)
+{
+    (void)node; (void)tpdo_num; (void)user;
+    /*
+     * m_controlword and m_target_vel are already in the OD backing storage
+     * (pointed to directly by the OD entries).  Nothing extra to do here;
+     * the hook exists as an extension point for future use.
+     */
+}
+
+/* ── NMT Start helper ────────────────────────────────────────────────────── */
+/*
+ * Send NMT "Start Remote Node" to the eRob.
+ * The CANopen NMT frame is: COB-ID 0x000, byte[0]=0x01, byte[1]=node_id.
+ * The stack does not expose an NMT-master API, so we build it via the
+ * hardware send callback directly.
+ */
+static void nmt_start_node(uint8_t node_id)
+{
+    co_can_frame_t f;
+    f.cob_id  = 0x000U;
+    f.len     = 2U;
+    f.data[0] = 0x01U;   /* Start Remote Node */
+    f.data[1] = node_id;
+    (void)canopen_node.iface.send(canopen_node.iface.user, &f);
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
 void app_canopen_init(void)
 {
-    /* 1. Bind the CANopen stack to STM32H7 FDCAN1. */
+    /* 1. Attach to FDCAN1 as master (node 0x7F). */
     co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx,
-                    EROB_NODE_ID, EROB_HEARTBEAT_MS);
+                    MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
 
-    /* 2. Initialise the CiA 402 axis, register all OD entries (0x6040–0x606E),
-     *    then wire the eRob application callbacks. */
-    cia402_init(&axis);
-    cia402_bind_od(&axis, &canopen_node);
-    cia402_set_callbacks(&axis, &g_erob_app);
-
-    /* 3. Set default velocity profile parameters.
-     *    The master may override any of these at runtime via SDO or RPDO2. */
-    axis.mode_of_operation            = CIA402_MODE_PROFILE_VELOCITY;
-    axis.profile_velocity             = EROB_MAX_VEL_RPM;
-    axis.profile_velocity_valid       = true;
-    axis.profile_acceleration         = EROB_DEFAULT_ACCEL;
-    axis.profile_acceleration_valid   = true;
-    axis.profile_deceleration         = EROB_DEFAULT_DECEL;
-    axis.profile_deceleration_valid   = true;
-    axis.quick_stop_deceleration      = EROB_DEFAULT_QS_DECEL;
-    axis.quick_stop_deceleration_valid = true;
-    axis.velocity_window              = EROB_DEFAULT_VEL_WINDOW;
-    axis.velocity_window_time         = EROB_DEFAULT_VEL_WIN_MS;
-    axis.velocity_window_valid        = true;
-
-    /* 4. PDO communication parameters.
+    /* 2. Register OD entries for the master-side PDO objects.
      *
-     * 0x1400/0x1401: RPDO communication — COB-ID and transmission type.
-     * 0x1800/0x1801: TPDO communication — COB-ID and transmission type.
-     *
-     * COB-ID encoding (CiA 301 §7.3.3):
-     *   bit 31 = 0 → PDO valid (enabled)
-     *   bit 30 = 0 → standard 11-bit frame
-     *   bits 0-10  = CAN identifier
-     *
-     * Transmission type 0x01: synchronous, triggered on every SYNC message.
+     *    The OD objects (0x6040, 0x6060, 0x60FF, 0x6083, 0x6084, 0x6041,
+     *    0x6061, 0x606C, 0x6064, 0x6077) live in this master node's OD solely
+     *    so that the PDO mapping mechanism can pack/unpack them.  They are NOT
+     *    the real eRob objects — they are the master's local mirrors.
      */
 
-    /* RPDO1 — COB-ID 0x200 + node_id, sync-triggered (0x1400) */
-    const uint32_t rpdo1_cob_id   = 0x200UL + EROB_NODE_ID;  /* bit31=0: valid */
-    const uint8_t  rpdo1_trans    = 0x01U;
+    /* TPDO1 objects (master transmits → eRob receives) */
+    (void)co_od_add(&canopen_node, 0x6040U, 0x00U,
+                    (uint8_t *)&m_controlword,   sizeof(m_controlword),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x6060U, 0x00U,
+                    (uint8_t *)&m_mode_of_op,    sizeof(m_mode_of_op),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x60FFU, 0x00U,
+                    (uint8_t *)&m_target_vel,    sizeof(m_target_vel),
+                    true, true);
+
+    /* TPDO2 objects */
+    (void)co_od_add(&canopen_node, 0x6083U, 0x00U,
+                    (uint8_t *)&m_profile_accel, sizeof(m_profile_accel),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x6084U, 0x00U,
+                    (uint8_t *)&m_profile_decel, sizeof(m_profile_decel),
+                    true, true);
+
+    /* RPDO1 objects (eRob transmits → master receives) */
+    (void)co_od_add(&canopen_node, 0x6041U, 0x00U,
+                    (uint8_t *)&m_statusword,    sizeof(m_statusword),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x6061U, 0x00U,
+                    (uint8_t *)&m_mode_display,  sizeof(m_mode_display),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x606CU, 0x00U,
+                    (uint8_t *)&m_velocity_act,  sizeof(m_velocity_act),
+                    true, true);
+
+    /* RPDO2 objects */
+    (void)co_od_add(&canopen_node, 0x6064U, 0x00U,
+                    (uint8_t *)&m_position_act,  sizeof(m_position_act),
+                    true, true);
+    (void)co_od_add(&canopen_node, 0x6077U, 0x00U,
+                    (uint8_t *)&m_torque_act,    sizeof(m_torque_act),
+                    true, true);
+
+    /* 3. Register RPDO/TPDO hooks. */
+    co_set_hooks(&canopen_node, on_erob_rpdo_written, on_tpdo_pre_tx, NULL);
+
+    /* 4. RPDO communication parameters (master receives from eRob).
+     *
+     *    RPDO1 listens on 0x181 (eRob's TPDO1).
+     *    RPDO2 listens on 0x281 (eRob's TPDO2).
+     *    Transmission type 0x01: accept data on SYNC-triggered frames.
+     */
+    const uint32_t rpdo1_cob = 0x180UL + EROB_NODE_ID;   /* 0x181 */
+    const uint8_t  rpdo_sync = 0x01U;
     (void)co_od_write(&canopen_node, 0x1400U, 0x01U,
-                      (const uint8_t *)&rpdo1_cob_id, sizeof(rpdo1_cob_id));
-    (void)co_od_write(&canopen_node, 0x1400U, 0x02U, &rpdo1_trans, sizeof(rpdo1_trans));
+                      (const uint8_t *)&rpdo1_cob, sizeof(rpdo1_cob));
+    (void)co_od_write(&canopen_node, 0x1400U, 0x02U, &rpdo_sync, 1U);
 
-    /* RPDO2 — COB-ID 0x300 + node_id, sync-triggered (0x1401) */
-    const uint32_t rpdo2_cob_id   = 0x300UL + EROB_NODE_ID;
-    const uint8_t  rpdo2_trans    = 0x01U;
+    const uint32_t rpdo2_cob = 0x280UL + EROB_NODE_ID;   /* 0x281 */
     (void)co_od_write(&canopen_node, 0x1401U, 0x01U,
-                      (const uint8_t *)&rpdo2_cob_id, sizeof(rpdo2_cob_id));
-    (void)co_od_write(&canopen_node, 0x1401U, 0x02U, &rpdo2_trans, sizeof(rpdo2_trans));
+                      (const uint8_t *)&rpdo2_cob, sizeof(rpdo2_cob));
+    (void)co_od_write(&canopen_node, 0x1401U, 0x02U, &rpdo_sync, 1U);
 
-    /* TPDO1 — COB-ID 0x180 + node_id, every SYNC (0x1800) */
-    const uint32_t tpdo1_cob_id   = 0x180UL + EROB_NODE_ID;
-    const uint8_t  tpdo1_trans    = 0x01U;
-    (void)co_od_write(&canopen_node, 0x1800U, 0x01U,
-                      (const uint8_t *)&tpdo1_cob_id, sizeof(tpdo1_cob_id));
-    (void)co_od_write(&canopen_node, 0x1800U, 0x02U, &tpdo1_trans, sizeof(tpdo1_trans));
-
-    /* TPDO2 — COB-ID 0x280 + node_id, every SYNC (0x1801) */
-    const uint32_t tpdo2_cob_id   = 0x280UL + EROB_NODE_ID;
-    const uint8_t  tpdo2_trans    = 0x01U;
-    (void)co_od_write(&canopen_node, 0x1801U, 0x01U,
-                      (const uint8_t *)&tpdo2_cob_id, sizeof(tpdo2_cob_id));
-    (void)co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo2_trans, sizeof(tpdo2_trans));
-
-    /* 5. PDO mapping.
-     *
-     * Encoding: (index << 16) | (subindex << 8) | bit_length
-     *
-     * RPDO1 (0x1600): Controlword[16] | ModeOfOp[8] | TargetVelocity[32]
-     * RPDO2 (0x1601): ProfileAccel[32] | ProfileDecel[32]
-     * TPDO1 (0x1A00): Statusword[16]  | ModeDisplay[8] | VelocityActual[32]
-     * TPDO2 (0x1A01): PositionActual[32] | TorqueActual[16]
-     *
-     * Write sub 0 to 0 first (disable), set entries, then write sub 0 to count
-     * (enable).  This is the required CiA 301 PDO re-mapping sequence.
-     */
-
-    /* RPDO1 */
-    const uint32_t r1m1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
-    const uint32_t r1m2 = (0x6060UL << 16) | (0x00UL << 8) |  8UL;
-    const uint32_t r1m3 = (0x60FFUL << 16) | (0x00UL << 8) | 32UL;
+    /* 5. RPDO mapping. */
+    const uint32_t r1m1 = (0x6041UL << 16) | (0x00UL << 8) | 16UL;
+    const uint32_t r1m2 = (0x6061UL << 16) | (0x00UL << 8) |  8UL;
+    const uint32_t r1m3 = (0x606CUL << 16) | (0x00UL << 8) | 32UL;
     (void)co_od_write(&canopen_node, 0x1600U, 0x00U, (const uint8_t[]){0U}, 1U);
     (void)co_od_write(&canopen_node, 0x1600U, 0x01U, (const uint8_t *)&r1m1, 4U);
     (void)co_od_write(&canopen_node, 0x1600U, 0x02U, (const uint8_t *)&r1m2, 4U);
     (void)co_od_write(&canopen_node, 0x1600U, 0x03U, (const uint8_t *)&r1m3, 4U);
     (void)co_od_write(&canopen_node, 0x1600U, 0x00U, (const uint8_t[]){3U}, 1U);
 
-    /* RPDO2 — ramp parameters writable at runtime from master */
-    const uint32_t r2m1 = (0x6083UL << 16) | (0x00UL << 8) | 32UL;
-    const uint32_t r2m2 = (0x6084UL << 16) | (0x00UL << 8) | 32UL;
+    const uint32_t r2m1 = (0x6064UL << 16) | (0x00UL << 8) | 32UL;
+    const uint32_t r2m2 = (0x6077UL << 16) | (0x00UL << 8) | 16UL;
     (void)co_od_write(&canopen_node, 0x1601U, 0x00U, (const uint8_t[]){0U}, 1U);
     (void)co_od_write(&canopen_node, 0x1601U, 0x01U, (const uint8_t *)&r2m1, 4U);
     (void)co_od_write(&canopen_node, 0x1601U, 0x02U, (const uint8_t *)&r2m2, 4U);
     (void)co_od_write(&canopen_node, 0x1601U, 0x00U, (const uint8_t[]){2U}, 1U);
 
-    /* TPDO1 */
-    const uint32_t t1m1 = (0x6041UL << 16) | (0x00UL << 8) | 16UL;
-    const uint32_t t1m2 = (0x6061UL << 16) | (0x00UL << 8) |  8UL;
-    const uint32_t t1m3 = (0x606CUL << 16) | (0x00UL << 8) | 32UL;
+    /* 6. TPDO communication parameters (master sends to eRob).
+     *
+     *    TPDO1 transmits on 0x201 (eRob's RPDO1 COB-ID).
+     *    TPDO2 transmits on 0x301 (eRob's RPDO2 COB-ID).
+     *    Transmission type 0x01: send on every SYNC.
+     */
+    const uint32_t tpdo1_cob = 0x200UL + EROB_NODE_ID;   /* 0x201 */
+    const uint8_t  tpdo_sync = 0x01U;
+    (void)co_od_write(&canopen_node, 0x1800U, 0x01U,
+                      (const uint8_t *)&tpdo1_cob, sizeof(tpdo1_cob));
+    (void)co_od_write(&canopen_node, 0x1800U, 0x02U, &tpdo_sync, 1U);
+
+    const uint32_t tpdo2_cob = 0x300UL + EROB_NODE_ID;   /* 0x301 */
+    (void)co_od_write(&canopen_node, 0x1801U, 0x01U,
+                      (const uint8_t *)&tpdo2_cob, sizeof(tpdo2_cob));
+    (void)co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo_sync, 1U);
+
+    /* 7. TPDO mapping. */
+    const uint32_t t1m1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
+    const uint32_t t1m2 = (0x6060UL << 16) | (0x00UL << 8) |  8UL;
+    const uint32_t t1m3 = (0x60FFUL << 16) | (0x00UL << 8) | 32UL;
     (void)co_od_write(&canopen_node, 0x1A00U, 0x00U, (const uint8_t[]){0U}, 1U);
     (void)co_od_write(&canopen_node, 0x1A00U, 0x01U, (const uint8_t *)&t1m1, 4U);
     (void)co_od_write(&canopen_node, 0x1A00U, 0x02U, (const uint8_t *)&t1m2, 4U);
     (void)co_od_write(&canopen_node, 0x1A00U, 0x03U, (const uint8_t *)&t1m3, 4U);
     (void)co_od_write(&canopen_node, 0x1A00U, 0x00U, (const uint8_t[]){3U}, 1U);
 
-    /* TPDO2 */
-    const uint32_t t2m1 = (0x6064UL << 16) | (0x00UL << 8) | 32UL;
-    const uint32_t t2m2 = (0x6077UL << 16) | (0x00UL << 8) | 16UL;
+    const uint32_t t2m1 = (0x6083UL << 16) | (0x00UL << 8) | 32UL;
+    const uint32_t t2m2 = (0x6084UL << 16) | (0x00UL << 8) | 32UL;
     (void)co_od_write(&canopen_node, 0x1A01U, 0x00U, (const uint8_t[]){0U}, 1U);
     (void)co_od_write(&canopen_node, 0x1A01U, 0x01U, (const uint8_t *)&t2m1, 4U);
     (void)co_od_write(&canopen_node, 0x1A01U, 0x02U, (const uint8_t *)&t2m2, 4U);
     (void)co_od_write(&canopen_node, 0x1A01U, 0x00U, (const uint8_t[]){2U}, 1U);
 
-    /* 6. SYNC consumer: receive 0x080 at 1 ms. */
-    const uint32_t sync_cob_id   = 0x00000080UL;
-    const uint32_t sync_cycle_us = EROB_SYNC_PERIOD_US;
+    /* 8. SYNC producer: master generates 0x080 every 1 ms.
+     *    Bit 30 of COB-ID set → this node is the SYNC producer.
+     */
+    const uint32_t sync_cob_id   = 0x40000080UL;  /* bit30=1: producer      */
+    const uint32_t sync_cycle_us = SYNC_PERIOD_US;
     (void)co_od_write(&canopen_node, 0x1005U, 0x00U,
                       (const uint8_t *)&sync_cob_id,   sizeof(sync_cob_id));
     (void)co_od_write(&canopen_node, 0x1006U, 0x00U,
                       (const uint8_t *)&sync_cycle_us, sizeof(sync_cycle_us));
 
-    /* 7. Heartbeat consumer: detect master (0x7F) silence within 1 s. */
-    const uint8_t  hb_count  = 1U;
-    const uint32_t hb_master = ((uint32_t)EROB_MASTER_NODE_ID << 16)
-                               | (uint32_t)EROB_MASTER_HB_TIMEOUT;
-    (void)co_od_write(&canopen_node, 0x1016U, 0x00U, &hb_count,  1U);
+    /* 9. Heartbeat consumer: detect eRob silence within EROB_HB_TIMEOUT_MS. */
+    const uint8_t  hb_count = 1U;
+    const uint32_t hb_erob  = ((uint32_t)EROB_NODE_ID << 16)
+                              | (uint32_t)EROB_HB_TIMEOUT_MS;
+    (void)co_od_write(&canopen_node, 0x1016U, 0x00U, &hb_count, 1U);
     (void)co_od_write(&canopen_node, 0x1016U, 0x01U,
-                      (const uint8_t *)&hb_master, sizeof(hb_master));
+                      (const uint8_t *)&hb_erob, sizeof(hb_erob));
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
 
 /*
- * Runtime velocity change example.
- *
- * g_target_rpm is set by external code (e.g. a higher-level motion planner,
- * UART command parser, or RTOS task) at any time.  The main loop picks it up
- * on every SYNC tick and forwards it to the axis via erob_set_target_velocity().
- *
- * When the axis is driven exclusively by RPDO1 from the CANopen master this
- * variable is not needed — the RPDO write callback updates 0x60FF:00 directly.
- * Both paths share the same OD entry and are therefore interchangeable.
+ * g_target_rpm — set from anywhere (motion planner, UART parser, RTOS task)
+ * to change the eRob velocity at runtime.  Effective only while the drive
+ * is in OPERATION_ENABLED.
  */
-volatile int32_t g_target_rpm = 0;   /* set this from anywhere to change speed */
+volatile int32_t g_target_rpm = 0;
 
 void app_main_loop(void)
 {
+    /* Send NMT Start to the eRob so it enters OPERATIONAL state. */
+    nmt_start_node(EROB_NODE_ID);
+
     for (;;) {
-        /* 1. Drain the FDCAN RX FIFO.  This may set sync_event_pending. */
+        /* 1. Drain FDCAN RX FIFO — unpacks incoming eRob TPDOs into OD,
+         *    fires on_erob_rpdo_written → erob_state_machine_step().       */
         co_stm32_poll_rx(&canopen_node, &hfdcan1);
 
-        /* 2. On each SYNC edge: update target velocity, run the CiA 402 state
-         *    machine, then check for hardware faults.
-         *
-         *    cia402_step() must run before co_process() so that all OD values
-         *    (statusword, velocity actual, position actual) are fresh when
-         *    co_process() auto-transmits the TPDOs on the SYNC event.
-         */
+        /* 2. On each SYNC tick produced by co_process(), forward the
+         *    application target velocity into the TPDO1 OD entry.           */
         if (canopen_node.sync_event_pending) {
             canopen_node.sync_event_pending = false;
-
-            /* Forward the application-side target to the axis.
-             * If the master is also sending RPDO1, whichever write arrived
-             * last wins — both map to the same OD entry 0x60FF:00.          */
             erob_set_target_velocity(g_target_rpm);
-
-            cia402_step(&axis);
-            fault_monitor_step();
-
-            /* When not enabled, zero the inverter output. */
-            if (axis.state != CIA402_OPERATION_ENABLED &&
-                axis.state != CIA402_QUICK_STOP) {
-                g_ramp.commanded_rpm = 0;
-                /* TODO: de-assert motor inverter enable / STO line. */
-            }
         }
 
-        /* 3. Run the CANopen protocol stack: SDO server, heartbeat, TPDO
-         *    auto-transmission (TPDO data is now fresh from cia402_step above),
-         *    NMT processing, SDO timeouts, SYNC production if producer mode. */
+        /* 3. Run the CANopen protocol stack:
+         *      - produces SYNC every 1 ms (triggers TPDO auto-transmit)
+         *      - transmits TPDO1 (command) and TPDO2 (ramp params) on SYNC
+         *      - sends master heartbeat every 100 ms
+         *      - monitors eRob heartbeat timeout                             */
         co_process(&canopen_node);
     }
 }
