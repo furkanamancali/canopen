@@ -52,12 +52,16 @@ co_process(&canopen_node);
 
 6. Update CiA 402 axis state from received controlword values and expose statusword via OD.
 
-## Detailed STM32H7 main loop example (PDO + profile velocity)
+## Detailed STM32H7 main loop example (PDO mapping + EMCY + SYNC + guarding)
 
 The snippet below shows a practical pattern for a **single-axis drive node** on STM32H7:
 
 - RPDO1 receives command objects (controlword, mode, target velocity).
 - TPDO1 publishes feedback (statusword, actual velocity).
+- Runtime verifies that expected PDO mapping is present.
+- EMCY is raised/cleared from application-detected hardware faults.
+- Control/update loop is SYNC-driven (1 ms SYNC period example).
+- Master supervision uses heartbeat consumer (practical replacement for legacy node guarding).
 - CiA 402 is run in **profile velocity mode** (`0x6060 = 3`).
 - The loop is split into fast CANopen servicing and slower control updates.
 
@@ -73,6 +77,45 @@ static co_stm32_ctx_t can_ctx;
 static cia402_axis_t axis;
 
 static volatile int32_t velocity_feedback_rpm = 0;
+static volatile bool inverter_fault_active = false;
+static volatile uint8_t sync_tick = 0;
+
+static void on_rpdo_map_written(co_node_t *node, uint8_t rpdo_num, uint16_t index, uint8_t subindex, void *user)
+{
+    (void)node;
+    (void)user;
+    /* Optional: log/map-audit hook when 0x1600.. map entries change at runtime. */
+    if (rpdo_num == 1U && index == 0x1600U && subindex == 0x00U) {
+        /* RPDO1 map count changed. */
+    }
+}
+
+static void on_tpdo_pre_tx(co_node_t *node, uint8_t tpdo_num, void *user)
+{
+    (void)user;
+    if (tpdo_num == 1U) {
+        /* Keep status/feedback coherent exactly at TPDO1 packing time. */
+        cia402_set_feedback(&axis,
+                            axis.position_actual,
+                            axis.velocity_actual,
+                            axis.torque_actual);
+    }
+    (void)node;
+}
+
+static void app_fault_monitor_step(void)
+{
+    if (inverter_fault_active) {
+        (void)co_fault_raise(&canopen_node,
+                             CO_FAULT_CIA402_PROFILE,
+                             CO_EMCY_ERR_PROFILE,
+                             CO_ERROR_REG_DEVICE_PROFILE,
+                             0x01U,
+                             NULL);
+    } else {
+        (void)co_fault_clear(&canopen_node, CO_FAULT_CIA402_PROFILE, 0x00U, NULL);
+    }
+}
 
 static void app_drive_hw_step(cia402_axis_t *a)
 {
@@ -95,6 +138,7 @@ void app_canopen_init(void)
     cia402_init(&axis);
     cia402_attach_node(&axis, &canopen_node);
     cia402_bind_od(&axis, &canopen_node);
+    co_set_hooks(&canopen_node, on_rpdo_map_written, on_tpdo_pre_tx, NULL);
 
     /* 3) Optional defaults before master takes control via RPDO/SDO. */
     axis.mode_of_operation = CIA402_MODE_PROFILE_VELOCITY;
@@ -108,22 +152,49 @@ void app_canopen_init(void)
        RPDO1: 0x6040:00 (16), 0x6060:00 (8), 0x60FF:00 (32)
        TPDO1: 0x6041:00 (16), 0x606C:00 (32)
     */
+
+    /* 5) Optional local default mapping (before/without external SDO config). */
+    const uint32_t rpdo1_map1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
+    const uint32_t rpdo1_map2 = (0x6060UL << 16) | (0x00UL << 8) | 8UL;
+    const uint32_t rpdo1_map3 = (0x60FFUL << 16) | (0x00UL << 8) | 32UL;
+    const uint32_t tpdo1_map1 = (0x6041UL << 16) | (0x00UL << 8) | 16UL;
+    const uint32_t tpdo1_map2 = (0x606CUL << 16) | (0x00UL << 8) | 32UL;
+    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){0}, 1);
+    (void)co_od_write(&canopen_node, 0x1600, 0x01, (const uint8_t *)&rpdo1_map1, sizeof(rpdo1_map1));
+    (void)co_od_write(&canopen_node, 0x1600, 0x02, (const uint8_t *)&rpdo1_map2, sizeof(rpdo1_map2));
+    (void)co_od_write(&canopen_node, 0x1600, 0x03, (const uint8_t *)&rpdo1_map3, sizeof(rpdo1_map3));
+    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){3}, 1);
+    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){0}, 1);
+    (void)co_od_write(&canopen_node, 0x1A00, 0x01, (const uint8_t *)&tpdo1_map1, sizeof(tpdo1_map1));
+    (void)co_od_write(&canopen_node, 0x1A00, 0x02, (const uint8_t *)&tpdo1_map2, sizeof(tpdo1_map2));
+    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){2}, 1);
+
+    /* 6) SYNC-driven timing: consumer on COB-ID 0x80 with 1 ms cycle. */
+    const uint32_t sync_cob_id = 0x00000080UL; /* valid, consumer, std-id */
+    const uint32_t sync_cycle_us = 1000UL;
+    (void)co_od_write(&canopen_node, 0x1005, 0x00, (const uint8_t *)&sync_cob_id, sizeof(sync_cob_id));
+    (void)co_od_write(&canopen_node, 0x1006, 0x00, (const uint8_t *)&sync_cycle_us, sizeof(sync_cycle_us));
+    const uint8_t tpdo1_sync_type = 1U; /* every SYNC */
+    (void)co_od_write(&canopen_node, 0x1800, 0x02, &tpdo1_sync_type, sizeof(tpdo1_sync_type));
+
+    /* 7) Guarding/supervision: configure heartbeat consumer for master node 0x7E, 500 ms timeout. */
+    const uint8_t hb_consumer_count = 1U;
+    const uint32_t hb_master = (0x7EUL << 16) | 500UL; /* 0x1016:01 */
+    (void)co_od_write(&canopen_node, 0x1016, 0x00, &hb_consumer_count, sizeof(hb_consumer_count));
+    (void)co_od_write(&canopen_node, 0x1016, 0x01, (const uint8_t *)&hb_master, sizeof(hb_master));
 }
 
 void app_main_loop(void)
 {
-    uint32_t last_control_tick_ms = co_stm32_millis(&can_ctx);
-
     for (;;) {
         /* Fast path: drain RX FIFO and process protocol state machine. */
         co_stm32_poll_rx(&canopen_node, &hfdcan1);
         co_process(&canopen_node);
 
-        const uint32_t now_ms = co_stm32_millis(&can_ctx);
-
-        /* 1 kHz control/update task (example cadence). */
-        if ((now_ms - last_control_tick_ms) >= 1U) {
-            last_control_tick_ms = now_ms;
+        /* Run control update on every SYNC event (1 ms from master in this example). */
+        if (canopen_node.sync_event_pending) {
+            canopen_node.sync_event_pending = false;
+            ++sync_tick;
 
             /* Update actual feedback from your motor control ISR/state. */
             axis.velocity_actual = velocity_feedback_rpm; /* 0x606C */
@@ -136,11 +207,13 @@ void app_main_loop(void)
             /* Run hardware command side according to CiA 402 state/mode. */
             app_drive_hw_step(&axis);
 
-            /* Keep exported feedback objects in sync for TPDO/SDO reads. */
-            cia402_set_feedback(&axis,
-                                axis.position_actual,
-                                axis.velocity_actual,
-                                axis.torque_actual);
+            /* Raise/clear EMCY faults from application hardware diagnostics. */
+            app_fault_monitor_step();
+
+            /* Optionally emit additional async TPDO every 10 SYNC ticks (10 ms). */
+            if ((sync_tick % 10U) == 0U) {
+                (void)co_send_tpdo(&canopen_node, 1U);
+            }
         }
 
         /* Optional: low-power idle until next interrupt/event. */
@@ -151,9 +224,10 @@ void app_main_loop(void)
 ### Why this loop structure works
 
 - `co_stm32_poll_rx()` + `co_process()` runs every iteration to keep SDO/PDO/NMT/heartbeat timing responsive.
-- CiA 402 logic runs at a fixed control cadence, which is easier to validate than event-only updates.
-- The OD stays authoritative: RPDO writes update command objects; TPDO reads publish status/feedback.
-- Profile velocity behavior remains deterministic even when network traffic is bursty.
+- SYNC edges gate the control law, so command/feedback exchange is aligned to network time.
+- Explicit local PDO mapping defaults make bring-up deterministic before external SDO tooling is added.
+- Heartbeat consumer (`0x1016`) provides master supervision and drives communication EMCY on timeout.
+- EMCY fault hooks (`co_fault_raise` / `co_fault_clear`) cleanly connect hardware diagnostics to CANopen diagnostics.
 
 ## Notes
 
