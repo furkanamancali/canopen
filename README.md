@@ -62,3 +62,54 @@ co_process(&canopen_node);
   - SYNC-driven PDO timing,
   - node guarding / heartbeat consumer,
   - conformance test coverage.
+
+
+## Host-side deterministic test harness
+
+A host-side harness is provided to exercise `canopen.c` and `cia402.c` without MCU dependencies:
+
+- `tests_host.c` uses:
+  - deterministic fake CAN send callback (captures all transmitted frames in-order),
+  - deterministic fake clock (`millis`) controlled by test code,
+  - reset hook counters for communication/application reset coverage.
+- Build and run:
+
+```sh
+make test
+```
+
+This compiles `tests_host` from `tests_host.c`, `canopen.c`, and `cia402.c`, then executes all tests.
+
+## Minimal conformance checklist (implemented vs gaps)
+
+### Implemented and covered by host tests
+
+- **NMT command handling and node lifecycle**
+  - NMT start/stop/pre-operational command routing (broadcast and node-targeted).
+  - Boot-up frame emission and reset-triggered re-initializing/boot-up flow.
+  - Communication reset vs application reset callback behavior.
+- **SDO server transfer paths**
+  - Expedited upload/download success.
+  - Segmented upload/download success.
+  - Block upload/download success.
+  - Abort paths: unknown object, toggle/sequence mismatch, invalid command handling.
+- **PDO mapping and runtime data exchange**
+  - Mapping validation failures (e.g., unmapped OD object).
+  - RPDO runtime unpack into OD variables.
+  - TPDO runtime pack from OD variables.
+- **Heartbeat + EMCY behavior**
+  - Heartbeat periodic timing against fake clock.
+  - EMCY emit/clear behavior via fault raise/clear.
+- **CiA 402 state and statusword**
+  - Core transition matrix coverage (shutdown/switch on/enable op/quick stop/fault reset).
+  - Statusword low-bit correctness for key states.
+  - Profile-fault to EMCY propagation on unsupported-mode fault path.
+
+### Known gaps (not yet covered or intentionally minimal)
+
+- Full CiA 301 certification profile coverage is not claimed (this is a compact starter stack).
+- SDO block transfer edge cases (CRC variants, retransmit corner cases, malformed-frame fuzzing) are not exhaustively tested.
+- TPDO timing matrix is only partially covered in host tests (no exhaustive SYNC type/inhibit/event combinations).
+- Heartbeat consumer / node guarding behavior is not implemented.
+- Advanced CiA 402 operation-mode semantics (trajectory/profile constraints, hardware interlocks, mode-specific diagnostics) remain application-specific.
+- No automated hardware-in-loop conformance run is included.
