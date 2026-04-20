@@ -275,6 +275,87 @@ static bool cia402_dispatch_mode_handler(cia402_axis_t *axis)
     return true;
 }
 
+static uint32_t cia402_on_write_controlword(co_node_t *node,
+                                            const co_od_entry_t *entry,
+                                            const uint8_t *data,
+                                            size_t size,
+                                            void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user || !data || size != sizeof(uint16_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint16_t controlword = 0U;
+    memcpy(&controlword, data, sizeof(controlword));
+    cia402_apply_controlword(axis, controlword);
+    return 0U;
+}
+
+static uint32_t cia402_on_write_mode_of_operation(co_node_t *node,
+                                                  const co_od_entry_t *entry,
+                                                  const uint8_t *data,
+                                                  size_t size,
+                                                  void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user || !data || size != sizeof(int8_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    axis->mode_of_operation = (int8_t)data[0];
+    return 0U;
+}
+
+static bool cia402_tpdo_maps_feedback(const co_node_t *node, uint8_t tpdo_num)
+{
+    const co_pdo_cfg_t *cfg = &node->tpdo_cfg[tpdo_num];
+    for (uint8_t i = 0; i < cfg->map_count; ++i) {
+        const uint16_t index = cfg->mapping[i].index;
+        if (index == 0x6041U || index == 0x6061U || index == 0x6064U || index == 0x606CU ||
+            index == 0x6077U) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cia402_on_rpdo_mapped_write(co_node_t *node,
+                                        uint8_t rpdo_num,
+                                        uint16_t index,
+                                        uint8_t subindex,
+                                        void *user)
+{
+    (void)node;
+    (void)rpdo_num;
+    if (!user || subindex != 0U) {
+        return;
+    }
+
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    if (index == 0x6040U) {
+        cia402_apply_controlword(axis, axis->controlword);
+    }
+}
+
+static void cia402_on_tpdo_pre_tx(co_node_t *node, uint8_t tpdo_num, void *user)
+{
+    if (!node || !user || tpdo_num >= CO_MAX_TPDO) {
+        return;
+    }
+
+    if (!cia402_tpdo_maps_feedback(node, tpdo_num)) {
+        return;
+    }
+
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    cia402_step(axis);
+}
+
 void cia402_init(cia402_axis_t *axis)
 {
     memset(axis, 0, sizeof(*axis));
@@ -291,6 +372,80 @@ void cia402_attach_node(cia402_axis_t *axis, co_node_t *node)
     }
     axis->node = node;
     cia402_sync_fault_to_canopen(axis);
+}
+
+void cia402_bind_od(cia402_axis_t *axis, co_node_t *node)
+{
+    if (!axis || !node) {
+        return;
+    }
+
+    cia402_attach_node(axis, node);
+    (void)co_od_add_ex(node,
+                       0x6040U,
+                       0x00U,
+                       (uint8_t *)&axis->controlword,
+                       sizeof(axis->controlword),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_controlword,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6041U,
+                       0x00U,
+                       (uint8_t *)&axis->statusword,
+                       sizeof(axis->statusword),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6060U,
+                       0x00U,
+                       (uint8_t *)&axis->mode_of_operation,
+                       sizeof(axis->mode_of_operation),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_mode_of_operation,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6061U,
+                       0x00U,
+                       (uint8_t *)&axis->mode_display,
+                       sizeof(axis->mode_display),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6064U,
+                       0x00U,
+                       (uint8_t *)&axis->position_actual,
+                       sizeof(axis->position_actual),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x606CU,
+                       0x00U,
+                       (uint8_t *)&axis->velocity_actual,
+                       sizeof(axis->velocity_actual),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6077U,
+                       0x00U,
+                       (uint8_t *)&axis->torque_actual,
+                       sizeof(axis->torque_actual),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+
+    co_set_hooks(node, cia402_on_rpdo_mapped_write, cia402_on_tpdo_pre_tx, axis);
 }
 
 void cia402_set_callbacks(cia402_axis_t *axis, const cia402_app_if_t *app)

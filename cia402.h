@@ -83,6 +83,7 @@ struct cia402_axis {
 
 void cia402_init(cia402_axis_t *axis);
 void cia402_attach_node(cia402_axis_t *axis, co_node_t *node);
+void cia402_bind_od(cia402_axis_t *axis, co_node_t *node);
 void cia402_set_callbacks(cia402_axis_t *axis, const cia402_app_if_t *app);
 void cia402_set_feedback(cia402_axis_t *axis, int32_t pos, int32_t vel, int16_t tq);
 void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword);
