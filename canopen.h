@@ -143,6 +143,21 @@ struct co_node {
     co_pdo_data_t tpdo_data[CO_MAX_TPDO];
     co_pdo_cfg_t rpdo_cfg[CO_MAX_RPDO];
     co_pdo_cfg_t tpdo_cfg[CO_MAX_TPDO];
+    uint32_t tpdo_last_tx_ms[CO_MAX_TPDO];
+    uint32_t tpdo_last_event_ms[CO_MAX_TPDO];
+    uint16_t tpdo_sync_tick[CO_MAX_TPDO];
+
+    uint32_t sync_cob_id_raw;
+    uint16_t sync_cob_id;
+    uint32_t sync_cycle_period_us;
+    uint32_t sync_last_timestamp_ms;
+    uint32_t sync_timebase_ms;
+    uint32_t sync_last_produced_ms;
+    uint8_t sync_counter;
+    uint8_t sync_overflow;
+    bool sync_valid;
+    bool sync_producer;
+    bool sync_event_pending;
 
     uint32_t device_type;
     uint8_t error_register;
