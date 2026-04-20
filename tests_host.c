@@ -312,6 +312,109 @@ static int test_sdo_expedited_segmented_block(void)
     return 0;
 }
 
+static int test_sdo_multi_channel_concurrency_and_timeout(void)
+{
+    co_node_t node;
+    test_bus_t bus;
+    setup_node(&node, &bus, 0x05, 0);
+    (void)co_process(&node);
+
+    uint8_t ch0_obj[10] = {0};
+    uint8_t ch1_obj[10] = {0};
+    TEST_ASSERT(co_od_add(&node, 0x2100, 0x00, ch0_obj, sizeof(ch0_obj), true, true) == CO_ERROR_NONE);
+    TEST_ASSERT(co_od_add(&node, 0x2101, 0x00, ch1_obj, sizeof(ch1_obj), true, true) == CO_ERROR_NONE);
+
+    const uint32_t ch1_rx = 0x625U;
+    const uint32_t ch1_tx = 0x5A5U;
+    TEST_ASSERT(co_od_write(&node, 0x1201, 0x01, (const uint8_t *)&ch1_rx, sizeof(ch1_rx)) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1201, 0x02, (const uint8_t *)&ch1_tx, sizeof(ch1_tx)) == 0U);
+
+    co_can_frame_t ch0 = {.cob_id = 0x605U, .len = 8U};
+    co_can_frame_t ch1 = {.cob_id = ch1_rx, .len = 8U};
+
+    /* Start segmented download on both channels. */
+    ch0.data[0] = 0x21U;
+    ch0.data[1] = 0x00U;
+    ch0.data[2] = 0x21U;
+    ch0.data[3] = 0x00U;
+    ch0.data[4] = 10U;
+    ch0.data[5] = ch0.data[6] = ch0.data[7] = 0U;
+    TEST_ASSERT(co_on_can_rx(&node, &ch0) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == 0x585U);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x60U);
+
+    ch1.data[0] = 0x21U;
+    ch1.data[1] = 0x01U;
+    ch1.data[2] = 0x21U;
+    ch1.data[3] = 0x00U;
+    ch1.data[4] = 10U;
+    ch1.data[5] = ch1.data[6] = ch1.data[7] = 0U;
+    TEST_ASSERT(co_on_can_rx(&node, &ch1) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == ch1_tx);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x60U);
+
+    TEST_ASSERT(node.sdo_channels[0].state != 0U);
+    TEST_ASSERT(node.sdo_channels[1].state != 0U);
+
+    /* Channel 0 first segment only (keep pending for timeout). */
+    memset(ch0.data, 0, sizeof(ch0.data));
+    ch0.data[0] = 0x00U;
+    for (unsigned i = 0; i < 7; ++i) {
+        ch0.data[1 + i] = (uint8_t)(i + 1U);
+    }
+    TEST_ASSERT(co_on_can_rx(&node, &ch0) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == 0x585U);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x30U);
+
+    /* Channel 1 complete transfer independently. */
+    memset(ch1.data, 0, sizeof(ch1.data));
+    ch1.data[0] = 0x00U;
+    for (unsigned i = 0; i < 7; ++i) {
+        ch1.data[1 + i] = (uint8_t)(i + 11U);
+    }
+    TEST_ASSERT(co_on_can_rx(&node, &ch1) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == ch1_tx);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x30U);
+
+    memset(ch1.data, 0, sizeof(ch1.data));
+    ch1.data[0] = 0x19U;
+    ch1.data[1] = 18U;
+    ch1.data[2] = 19U;
+    ch1.data[3] = 20U;
+    TEST_ASSERT(co_on_can_rx(&node, &ch1) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == ch1_tx);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x20U);
+    for (unsigned i = 0; i < 10; ++i) {
+        TEST_ASSERT(ch1_obj[i] == (uint8_t)(i + 11U));
+    }
+
+    /* Timeout should abort only channel 0 and use channel-0 TX COB-ID. */
+    bus.now_ms = 1000U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == 0x585U);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x80U);
+    TEST_ASSERT(node.sdo_channels[0].state == 0U);
+    TEST_ASSERT(node.sdo_channels[1].state == 0U);
+
+    /* Start channel 1 upload and timeout channel 1 specifically. */
+    bus.now_ms = 2000U;
+    memset(ch1.data, 0, sizeof(ch1.data));
+    ch1.data[0] = 0x40U;
+    ch1.data[1] = 0x01U;
+    ch1.data[2] = 0x21U;
+    ch1.data[3] = 0x00U;
+    TEST_ASSERT(co_on_can_rx(&node, &ch1) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == ch1_tx);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x41U);
+
+    bus.now_ms = 3000U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(last_tx(&bus)->cob_id == ch1_tx);
+    TEST_ASSERT(last_tx(&bus)->data[0] == 0x80U);
+
+    return 0;
+}
+
 static int test_pdo_remap_and_runtime(void)
 {
     co_node_t node;
@@ -532,6 +635,7 @@ int main(void)
     } tests[] = {
         {"nmt_bootup_reset", test_nmt_bootup_reset},
         {"sdo_expedited_segmented_block", test_sdo_expedited_segmented_block},
+        {"sdo_multi_channel_concurrency_and_timeout", test_sdo_multi_channel_concurrency_and_timeout},
         {"pdo_remap_and_runtime", test_pdo_remap_and_runtime},
         {"heartbeat_and_emcy", test_heartbeat_and_emcy},
         {"heartbeat_consumer_timeout_recovery_and_jitter", test_heartbeat_consumer_timeout_recovery_and_jitter},

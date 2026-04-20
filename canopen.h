@@ -13,7 +13,7 @@ extern "C" {
 #define CO_MAX_RPDO 4U
 #define CO_MAX_TPDO 4U
 #define CO_PDO_MAP_ENTRIES 8U
-#define CO_SDO_CHANNELS 1U
+#define CO_SDO_CHANNELS 2U
 #define CO_SDO_TRANSFER_BUF_SIZE 1024U
 #define CO_EMCY_ERROR_HISTORY_LEN 8U
 #define CO_EMCY_FAULT_SLOTS 16U
@@ -218,9 +218,9 @@ struct co_node {
     } faults[CO_EMCY_FAULT_SLOTS];
     uint8_t identity_sub_count;
     uint32_t identity[4];
-    uint32_t sdo_server_cob_rx;
-    uint32_t sdo_server_cob_tx;
-    uint8_t sdo_server_sub_count;
+    uint32_t sdo_server_cob_rx[CO_SDO_CHANNELS];
+    uint32_t sdo_server_cob_tx[CO_SDO_CHANNELS];
+    uint8_t sdo_server_sub_count[CO_SDO_CHANNELS];
     uint8_t pdo_comm_sub_count[CO_MAX_RPDO + CO_MAX_TPDO];
     uint8_t hb_consumer_sub_count;
     uint32_t hb_consumer_cfg_raw[CO_HEARTBEAT_CONSUMERS_MAX];

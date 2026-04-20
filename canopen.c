@@ -701,9 +701,16 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     node->identity[2] = 0U;
     node->identity[3] = 0U;
 
-    node->sdo_server_sub_count = 2U;
-    node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
-    node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
+    for (size_t ch = 0U; ch < CO_SDO_CHANNELS; ++ch) {
+        node->sdo_server_sub_count[ch] = 2U;
+        if (ch == 0U) {
+            node->sdo_server_cob_rx[ch] = CO_COB_SDO_RX_BASE + node->node_id;
+            node->sdo_server_cob_tx[ch] = CO_COB_SDO_TX_BASE + node->node_id;
+        } else {
+            node->sdo_server_cob_rx[ch] = 0x80000000UL | (CO_COB_SDO_RX_BASE + node->node_id + (uint32_t)ch);
+            node->sdo_server_cob_tx[ch] = 0x80000000UL | (CO_COB_SDO_TX_BASE + node->node_id + (uint32_t)ch);
+        }
+    }
     node->sync_cob_id = CO_COB_SYNC;
     node->sync_cob_id_raw = node->sync_cob_id;
     node->sync_valid = true;
@@ -922,41 +929,44 @@ static co_error_t co_register_builtin_od(co_node_t *node)
         }
     }
 
-    err = co_od_register_internal(node,
-                                  0x1200,
-                                  0x00,
-                                  &node->sdo_server_sub_count,
-                                  sizeof(node->sdo_server_sub_count),
-                                  CO_OD_ACCESS_READ,
-                                  NULL,
-                                  NULL,
-                                  NULL);
-    if (err != CO_ERROR_NONE) {
-        return err;
-    }
-    err = co_od_register_internal(node,
-                                  0x1200,
-                                  0x01,
-                                  (uint8_t *)&node->sdo_server_cob_rx,
-                                  sizeof(node->sdo_server_cob_rx),
-                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
-                                  NULL,
-                                  NULL,
-                                  NULL);
-    if (err != CO_ERROR_NONE) {
-        return err;
-    }
-    err = co_od_register_internal(node,
-                                  0x1200,
-                                  0x02,
-                                  (uint8_t *)&node->sdo_server_cob_tx,
-                                  sizeof(node->sdo_server_cob_tx),
-                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
-                                  NULL,
-                                  NULL,
-                                  NULL);
-    if (err != CO_ERROR_NONE) {
-        return err;
+    for (size_t ch = 0U; ch < CO_SDO_CHANNELS; ++ch) {
+        const uint16_t sdo_idx = (uint16_t)(0x1200U + ch);
+        err = co_od_register_internal(node,
+                                      sdo_idx,
+                                      0x00,
+                                      &node->sdo_server_sub_count[ch],
+                                      sizeof(node->sdo_server_sub_count[ch]),
+                                      CO_OD_ACCESS_READ,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+        err = co_od_register_internal(node,
+                                      sdo_idx,
+                                      0x01,
+                                      (uint8_t *)&node->sdo_server_cob_rx[ch],
+                                      sizeof(node->sdo_server_cob_rx[ch]),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+        err = co_od_register_internal(node,
+                                      sdo_idx,
+                                      0x02,
+                                      (uint8_t *)&node->sdo_server_cob_tx[ch],
+                                      sizeof(node->sdo_server_cob_tx[ch]),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
     }
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
@@ -1180,8 +1190,15 @@ static co_error_t co_send_bootup(co_node_t *node)
 
 static void co_restore_default_comm_objects(co_node_t *node)
 {
-    node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
-    node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
+    for (size_t ch = 0U; ch < CO_SDO_CHANNELS; ++ch) {
+        if (ch == 0U) {
+            node->sdo_server_cob_rx[ch] = CO_COB_SDO_RX_BASE + node->node_id;
+            node->sdo_server_cob_tx[ch] = CO_COB_SDO_TX_BASE + node->node_id;
+        } else {
+            node->sdo_server_cob_rx[ch] = 0x80000000UL | (CO_COB_SDO_RX_BASE + node->node_id + (uint32_t)ch);
+            node->sdo_server_cob_tx[ch] = 0x80000000UL | (CO_COB_SDO_TX_BASE + node->node_id + (uint32_t)ch);
+        }
+    }
     node->emcy_cob_id = CO_COB_EMCY_BASE + node->node_id;
     node->emcy_valid = true;
 
@@ -1255,10 +1272,23 @@ static void co_on_reset(co_node_t *node, co_reset_type_t type)
     }
 }
 
-static co_error_t co_send_sdo_abort(co_node_t *node, uint16_t index, uint8_t subindex, uint32_t abort_code)
+static bool co_sdo_cob_is_valid(uint32_t raw_cob)
+{
+    return (raw_cob & 0x80000000UL) == 0U;
+}
+
+static uint32_t co_sdo_cob_can_id(uint32_t raw_cob)
+{
+    return raw_cob & 0x7FFU;
+}
+
+static co_error_t co_send_sdo_abort(co_node_t *node, size_t ch, uint16_t index, uint8_t subindex, uint32_t abort_code)
 {
     co_can_frame_t tx = {0};
-    tx.cob_id = CO_COB_SDO_TX_BASE + node->node_id;
+    if (ch >= CO_SDO_CHANNELS || !co_sdo_cob_is_valid(node->sdo_server_cob_tx[ch])) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+    tx.cob_id = co_sdo_cob_can_id(node->sdo_server_cob_tx[ch]);
     tx.len = 8;
     tx.data[0] = 0x80;
     tx.data[1] = (uint8_t)(index & 0xFFU);
@@ -1320,13 +1350,13 @@ static co_error_t co_sdo_abort_and_reset(co_node_t *node,
                                          uint32_t abort_code)
 {
     co_sdo_channel_reset(node, ch);
-    return co_send_sdo_abort(node, index, subindex, abort_code);
+    return co_send_sdo_abort(node, ch, index, subindex, abort_code);
 }
 
 static co_error_t co_sdo_send_upload_segment(co_node_t *node, size_t ch)
 {
     co_can_frame_t tx = {0};
-    tx.cob_id = CO_COB_SDO_TX_BASE + node->node_id;
+    tx.cob_id = co_sdo_cob_can_id(node->sdo_server_cob_tx[ch]);
     tx.len = 8U;
 
     const size_t remaining = node->sdo_channels[ch].size - node->sdo_channels[ch].offset;
@@ -1349,7 +1379,7 @@ static co_error_t co_sdo_send_block_upload_data(co_node_t *node, size_t ch)
     uint8_t seq = (uint8_t)(node->sdo_channels[ch].block_last_sent_seq + 1U);
     for (; seq <= node->sdo_channels[ch].block_blksize; ++seq) {
         co_can_frame_t tx = {0};
-        tx.cob_id = CO_COB_SDO_TX_BASE + node->node_id;
+        tx.cob_id = co_sdo_cob_can_id(node->sdo_server_cob_tx[ch]);
         tx.len = 8U;
 
         const size_t remaining = node->sdo_channels[ch].size - node->sdo_channels[ch].offset;
@@ -1378,11 +1408,10 @@ static co_error_t co_sdo_send_block_upload_data(co_node_t *node, size_t ch)
     return CO_ERROR_NONE;
 }
 
-static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
+static co_error_t co_process_sdo(co_node_t *node, size_t ch, const co_can_frame_t *frame)
 {
-    const size_t ch = 0U;
-    if (frame->len != 8U) {
-        return co_send_sdo_abort(node, 0, 0, CO_SDO_ABORT_COMMAND);
+    if (ch >= CO_SDO_CHANNELS || frame->len != 8U) {
+        return co_send_sdo_abort(node, ch, 0, 0, CO_SDO_ABORT_COMMAND);
     }
 
     const uint8_t cmd = frame->data[0] & 0xE0U;
@@ -1390,7 +1419,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
     const uint8_t subindex = frame->data[3];
 
     co_can_frame_t tx = {0};
-    tx.cob_id = CO_COB_SDO_TX_BASE + node->node_id;
+    tx.cob_id = co_sdo_cob_can_id(node->sdo_server_cob_tx[ch]);
     tx.len = 8;
 
     node->sdo_channels[ch].last_activity_ms = node->iface.millis ? node->iface.millis(node->iface.user) : 0U;
@@ -1935,6 +1964,7 @@ co_error_t co_process(co_node_t *node)
         }
         if ((now - node->sdo_channels[ch].last_activity_ms) >= CO_SDO_TIMEOUT_MS) {
             const co_error_t err = co_send_sdo_abort(node,
+                                                     ch,
                                                      node->sdo_channels[ch].index,
                                                      node->sdo_channels[ch].subindex,
                                                      CO_SDO_ABORT_TIMEOUT);
@@ -2118,8 +2148,13 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
         return co_process_nmt(node, frame);
     }
 
-    if (frame->cob_id == (CO_COB_SDO_RX_BASE + node->node_id)) {
-        return co_process_sdo(node, frame);
+    for (size_t ch = 0U; ch < CO_SDO_CHANNELS; ++ch) {
+        if (!co_sdo_cob_is_valid(node->sdo_server_cob_rx[ch])) {
+            continue;
+        }
+        if (frame->cob_id == co_sdo_cob_can_id(node->sdo_server_cob_rx[ch])) {
+            return co_process_sdo(node, ch, frame);
+        }
     }
 
     if (node->sync_valid && !node->sync_producer && frame->cob_id == node->sync_cob_id) {
