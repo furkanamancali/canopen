@@ -21,6 +21,7 @@ This repository contains a compact C implementation intended as a **starting poi
 - `canopen.h`, `canopen.c`: CiA 301 core node stack.
 - `cia402.h`, `cia402.c`: CiA 402 drive profile state logic.
 - `canopen_stm32h7_fdcan.h`, `canopen_stm32h7_fdcan.c`: STM32H7 HAL FDCAN bindings.
+- `example_embedded.c`: reference STM32H7 application loop with PDO mapping, EMCY hooks, SYNC timing, and heartbeat consumer supervision.
 
 ## Quick integration steps
 
@@ -53,6 +54,8 @@ co_process(&canopen_node);
 6. Update CiA 402 axis state from received controlword values and expose statusword via OD.
 
 ## Detailed STM32H7 main loop example (PDO mapping + EMCY + SYNC + guarding)
+
+See `example_embedded.c` for the complete reference implementation.
 
 The snippet below shows a practical pattern for a **single-axis drive node** on STM32H7:
 
@@ -287,6 +290,6 @@ This compiles `tests_host` from `tests_host.c`, `canopen.c`, and `cia402.c`, the
 - Full CiA 301 certification profile coverage is not claimed (this is a compact starter stack).
 - SDO block transfer edge cases (CRC variants, retransmit corner cases, malformed-frame fuzzing) are not exhaustively tested.
 - TPDO timing matrix is only partially covered in host tests (no exhaustive SYNC type/inhibit/event combinations).
-- Heartbeat consumer / node guarding behavior is not implemented.
+- Heartbeat consumer coverage exists, but full node-guarding protocol behavior is intentionally minimal in this starter stack.
 - Advanced CiA 402 operation-mode semantics (trajectory/profile constraints, hardware interlocks, mode-specific diagnostics) remain application-specific.
 - No automated hardware-in-loop conformance run is included.
