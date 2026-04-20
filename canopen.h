@@ -17,7 +17,9 @@ extern "C" {
 #define CO_SDO_TRANSFER_BUF_SIZE 1024U
 #define CO_EMCY_ERROR_HISTORY_LEN 8U
 #define CO_EMCY_FAULT_SLOTS 16U
+#define CO_HEARTBEAT_CONSUMERS_MAX 16U
 #define CO_EMCY_ERR_CAN_TX 0x8110U
+#define CO_EMCY_ERR_HEARTBEAT_CONSUMER 0x8130U
 #define CO_EMCY_ERR_PROFILE 0xFF10U
 
 #define CO_SDO_ABORT_TOGGLE 0x05030000UL
@@ -61,8 +63,28 @@ typedef enum {
 
 typedef enum {
     CO_FAULT_CAN_TX = 0U,
-    CO_FAULT_CIA402_PROFILE = 1U
+    CO_FAULT_CIA402_PROFILE = 1U,
+    CO_FAULT_HEARTBEAT_CONSUMER = 2U
 } co_fault_id_t;
+
+typedef enum {
+    CO_HB_CONSUMER_DISABLED = 0U,
+    CO_HB_CONSUMER_UNKNOWN = 1U,
+    CO_HB_CONSUMER_ACTIVE = 2U,
+    CO_HB_CONSUMER_TIMEOUT = 3U
+} co_hb_consumer_state_t;
+
+typedef struct {
+    uint8_t node_id;
+    uint16_t timeout_ms;
+    bool enabled;
+} co_hb_consumer_cfg_t;
+
+typedef struct {
+    co_hb_consumer_state_t state;
+    co_nmt_state_t remote_state;
+    uint32_t last_rx_ms;
+} co_hb_consumer_runtime_t;
 
 typedef enum {
     CO_OD_ACCESS_READ = 1U << 0,
@@ -200,6 +222,10 @@ struct co_node {
     uint32_t sdo_server_cob_tx;
     uint8_t sdo_server_sub_count;
     uint8_t pdo_comm_sub_count[CO_MAX_RPDO + CO_MAX_TPDO];
+    uint8_t hb_consumer_sub_count;
+    uint32_t hb_consumer_cfg_raw[CO_HEARTBEAT_CONSUMERS_MAX];
+    co_hb_consumer_cfg_t hb_consumers[CO_HEARTBEAT_CONSUMERS_MAX];
+    co_hb_consumer_runtime_t hb_runtime[CO_HEARTBEAT_CONSUMERS_MAX];
     struct {
         uint8_t state;
         uint8_t mode;

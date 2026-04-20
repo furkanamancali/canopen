@@ -575,6 +575,115 @@ static uint32_t co_on_pdo_mapping_count_write(co_node_t *node,
     return 0U;
 }
 
+static void co_hb_consumer_decode_cfg(uint32_t raw, co_hb_consumer_cfg_t *cfg)
+{
+    if (!cfg) {
+        return;
+    }
+
+    cfg->node_id = (uint8_t)((raw >> 16U) & 0x7FU);
+    cfg->timeout_ms = (uint16_t)(raw & 0xFFFFU);
+    cfg->enabled = (cfg->node_id != 0U) && (cfg->timeout_ms != 0U);
+}
+
+static void co_hb_consumer_sync_from_raw(co_node_t *node, uint8_t idx)
+{
+    if (!node || idx >= CO_HEARTBEAT_CONSUMERS_MAX) {
+        return;
+    }
+
+    co_hb_consumer_decode_cfg(node->hb_consumer_cfg_raw[idx], &node->hb_consumers[idx]);
+    if (!node->hb_consumers[idx].enabled) {
+        node->hb_runtime[idx].state = CO_HB_CONSUMER_DISABLED;
+        node->hb_runtime[idx].remote_state = CO_NMT_INITIALIZING;
+        node->hb_runtime[idx].last_rx_ms = 0U;
+    } else if (node->hb_runtime[idx].state == CO_HB_CONSUMER_DISABLED) {
+        node->hb_runtime[idx].state = CO_HB_CONSUMER_UNKNOWN;
+        node->hb_runtime[idx].remote_state = CO_NMT_INITIALIZING;
+        node->hb_runtime[idx].last_rx_ms = 0U;
+    }
+}
+
+static co_error_t co_hb_consumer_recompute_fault(co_node_t *node)
+{
+    bool timed_out = false;
+    uint8_t timed_out_node = 0U;
+    for (uint8_t i = 0U; i < node->hb_consumer_sub_count; ++i) {
+        if (node->hb_runtime[i].state == CO_HB_CONSUMER_TIMEOUT) {
+            timed_out = true;
+            timed_out_node = node->hb_consumers[i].node_id;
+            break;
+        }
+    }
+
+    if (timed_out) {
+        return co_fault_raise(node,
+                              CO_FAULT_HEARTBEAT_CONSUMER,
+                              CO_EMCY_ERR_HEARTBEAT_CONSUMER,
+                              CO_ERROR_REG_COMMUNICATION,
+                              timed_out_node,
+                              NULL);
+    }
+    return co_fault_clear(node, CO_FAULT_HEARTBEAT_CONSUMER, 0U, NULL);
+}
+
+static uint32_t co_on_hb_consumer_subcount_write(co_node_t *node,
+                                                 const co_od_entry_t *entry,
+                                                 const uint8_t *data,
+                                                 size_t size,
+                                                 void *user)
+{
+    (void)entry;
+    (void)user;
+    if (!node || !data || size != sizeof(uint8_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    if (data[0] > CO_HEARTBEAT_CONSUMERS_MAX) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    node->hb_consumer_sub_count = data[0];
+    for (uint8_t i = node->hb_consumer_sub_count; i < CO_HEARTBEAT_CONSUMERS_MAX; ++i) {
+        node->hb_consumer_cfg_raw[i] = 0U;
+        co_hb_consumer_sync_from_raw(node, i);
+    }
+    return 0U;
+}
+
+static uint32_t co_on_hb_consumer_entry_write(co_node_t *node,
+                                              const co_od_entry_t *entry,
+                                              const uint8_t *data,
+                                              size_t size,
+                                              void *user)
+{
+    (void)user;
+    if (!node || !entry || !data || size != sizeof(uint32_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    if (entry->subindex == 0U || entry->subindex > CO_HEARTBEAT_CONSUMERS_MAX) {
+        return CO_SDO_ABORT_NO_SUBINDEX;
+    }
+
+    const uint8_t idx = (uint8_t)(entry->subindex - 1U);
+    if (idx >= node->hb_consumer_sub_count) {
+        return CO_SDO_ABORT_NO_SUBINDEX;
+    }
+
+    uint32_t raw = 0U;
+    memcpy(&raw, data, sizeof(raw));
+    co_hb_consumer_cfg_t cfg = {0};
+    co_hb_consumer_decode_cfg(raw, &cfg);
+
+    if (!cfg.enabled) {
+        raw = 0U;
+    }
+
+    node->hb_consumer_cfg_raw[idx] = raw;
+    co_hb_consumer_sync_from_raw(node, idx);
+    return 0U;
+}
+
 static co_error_t co_register_builtin_od(co_node_t *node)
 {
     co_error_t err = CO_ERROR_NONE;
@@ -602,6 +711,13 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     node->sync_cycle_period_us = 0U;
     node->sync_overflow = 0U;
     node->sync_counter = 0U;
+    node->hb_consumer_sub_count = CO_HEARTBEAT_CONSUMERS_MAX;
+    memset(node->hb_consumer_cfg_raw, 0, sizeof(node->hb_consumer_cfg_raw));
+    memset(node->hb_consumers, 0, sizeof(node->hb_consumers));
+    memset(node->hb_runtime, 0, sizeof(node->hb_runtime));
+    for (uint8_t i = 0U; i < CO_HEARTBEAT_CONSUMERS_MAX; ++i) {
+        node->hb_runtime[i].state = CO_HB_CONSUMER_DISABLED;
+    }
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
         node->pdo_comm_sub_count[i] = CO_PDO_COMM_SUB_COUNT;
@@ -735,6 +851,34 @@ static co_error_t co_register_builtin_od(co_node_t *node)
                                   NULL);
     if (err != CO_ERROR_NONE) {
         return err;
+    }
+
+    err = co_od_register_internal(node,
+                                  0x1016,
+                                  0x00,
+                                  &node->hb_consumer_sub_count,
+                                  sizeof(node->hb_consumer_sub_count),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  co_on_hb_consumer_subcount_write,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    for (uint8_t sub = 1U; sub <= CO_HEARTBEAT_CONSUMERS_MAX; ++sub) {
+        err = co_od_register_internal(node,
+                                      0x1016,
+                                      sub,
+                                      (uint8_t *)&node->hb_consumer_cfg_raw[sub - 1U],
+                                      sizeof(uint32_t),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      co_on_hb_consumer_entry_write,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
     }
 
     err = co_od_register_internal(node,
@@ -1070,6 +1214,9 @@ static void co_schedule_bootup(co_node_t *node)
     memset(node->tpdo_sync_tick, 0, sizeof(node->tpdo_sync_tick));
     memset(node->tpdo_last_tx_ms, 0, sizeof(node->tpdo_last_tx_ms));
     memset(node->tpdo_last_event_ms, 0, sizeof(node->tpdo_last_event_ms));
+    for (uint8_t i = 0U; i < CO_HEARTBEAT_CONSUMERS_MAX; ++i) {
+        co_hb_consumer_sync_from_raw(node, i);
+    }
 }
 
 static void co_on_reset_communication(co_node_t *node)
@@ -1798,6 +1945,22 @@ co_error_t co_process(co_node_t *node)
         }
     }
 
+    for (uint8_t i = 0U; i < node->hb_consumer_sub_count; ++i) {
+        const co_hb_consumer_cfg_t *cfg = &node->hb_consumers[i];
+        co_hb_consumer_runtime_t *rt = &node->hb_runtime[i];
+        if (!cfg->enabled || rt->last_rx_ms == 0U) {
+            continue;
+        }
+        if ((now - rt->last_rx_ms) > cfg->timeout_ms) {
+            rt->state = CO_HB_CONSUMER_TIMEOUT;
+        }
+    }
+
+    const co_error_t hb_fault_err = co_hb_consumer_recompute_fault(node);
+    if (hb_fault_err != CO_ERROR_NONE) {
+        return hb_fault_err;
+    }
+
     if (node->nmt_state == CO_NMT_INITIALIZING && node->bootup_pending) {
         const co_error_t err = co_send_bootup(node);
         if (err != CO_ERROR_NONE) {
@@ -1980,6 +2143,23 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
         node->sync_last_timestamp_ms = now;
         node->sync_event_pending = true;
         return CO_ERROR_NONE;
+    }
+
+    if (frame->cob_id >= CO_COB_HEARTBEAT_BASE && frame->cob_id < (CO_COB_HEARTBEAT_BASE + 0x80U) && frame->len == 1U) {
+        const uint8_t remote_node_id = (uint8_t)(frame->cob_id - CO_COB_HEARTBEAT_BASE);
+        const uint8_t state_raw = frame->data[0];
+        const co_nmt_state_t remote_state = (co_nmt_state_t)(state_raw & 0x7FU);
+        const uint32_t now = node->iface.millis ? node->iface.millis(node->iface.user) : 0U;
+
+        for (uint8_t i = 0U; i < node->hb_consumer_sub_count; ++i) {
+            if (!node->hb_consumers[i].enabled || node->hb_consumers[i].node_id != remote_node_id) {
+                continue;
+            }
+            node->hb_runtime[i].last_rx_ms = now;
+            node->hb_runtime[i].remote_state = remote_state;
+            node->hb_runtime[i].state = CO_HB_CONSUMER_ACTIVE;
+        }
+        return co_hb_consumer_recompute_fault(node);
     }
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
