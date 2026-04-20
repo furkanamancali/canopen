@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define CO_MAX_OD_ENTRIES 128U
+#define CO_MAX_OD_ENTRIES 192U
 #define CO_MAX_RPDO 4U
 #define CO_MAX_TPDO 4U
 #define CO_PDO_MAP_ENTRIES 8U
