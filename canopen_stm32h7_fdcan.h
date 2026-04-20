@@ -4,6 +4,10 @@
 #include "canopen.h"
 #include "stm32h7xx_hal.h"
 
+/* Maximum frames processed per co_stm32_poll_rx() call.
+ * Caps the worst-case execution time of a single poll under bus overload. */
+#define CO_STM32_RX_MAX_PER_POLL 32U
+
 typedef struct {
     FDCAN_HandleTypeDef *hfdcan;
 } co_stm32_ctx_t;

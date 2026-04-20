@@ -1897,7 +1897,7 @@ co_error_t co_od_add(co_node_t *node,
                      uint16_t index,
                      uint8_t subindex,
                      uint8_t *data,
-                     uint8_t size,
+                     size_t size,
                      bool readable,
                      bool writable)
 {
@@ -1988,7 +1988,11 @@ co_error_t co_process(co_node_t *node)
             continue;
         }
         if ((now - rt->last_rx_ms) > cfg->timeout_ms) {
+            const bool was_active = (rt->state != CO_HB_CONSUMER_TIMEOUT);
             rt->state = CO_HB_CONSUMER_TIMEOUT;
+            if (was_active && node->hooks.on_hb_event) {
+                node->hooks.on_hb_event(node, cfg->node_id, CO_HB_EVENT_TIMEOUT, node->hooks.user);
+            }
         }
     }
 
@@ -2099,6 +2103,13 @@ static uint32_t co_rpdo_unpack_to_od(co_node_t *node, uint8_t rpdo_num, const co
         }
         bit_offset += map->bit_length;
     }
+
+    /* Fire per-frame callback once all objects in this RPDO have been written.
+     * Prefer this over on_rpdo_map_written when reading multiple mapped objects,
+     * as all OD data is coherent (fully updated) at this point.              */
+    if (node->hooks.on_rpdo_frame_written) {
+        node->hooks.on_rpdo_frame_written(node, rpdo_num, node->hooks.user);
+    }
     return 0U;
 }
 
@@ -2199,9 +2210,13 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
             if (!node->hb_consumers[i].enabled || node->hb_consumers[i].node_id != remote_node_id) {
                 continue;
             }
+            const bool was_timeout = (node->hb_runtime[i].state == CO_HB_CONSUMER_TIMEOUT);
             node->hb_runtime[i].last_rx_ms = now;
             node->hb_runtime[i].remote_state = remote_state;
             node->hb_runtime[i].state = CO_HB_CONSUMER_ACTIVE;
+            if (was_timeout && node->hooks.on_hb_event) {
+                node->hooks.on_hb_event(node, remote_node_id, CO_HB_EVENT_RECOVERED, node->hooks.user);
+            }
         }
         return co_hb_consumer_recompute_fault(node);
     }
@@ -2258,4 +2273,43 @@ void co_set_hooks(co_node_t *node,
     node->hooks.on_rpdo_map_written = on_rpdo_map_written;
     node->hooks.on_tpdo_pre_tx = on_tpdo_pre_tx;
     node->hooks.user = user;
+}
+
+void co_set_rpdo_frame_hook(co_node_t *node, co_rpdo_frame_written_cb_t on_rpdo_frame_written, void *user)
+{
+    if (!node) {
+        return;
+    }
+    node->hooks.on_rpdo_frame_written = on_rpdo_frame_written;
+    node->hooks.user = user;
+}
+
+void co_set_hb_event_hook(co_node_t *node, co_hb_consumer_event_cb_t on_hb_event, void *user)
+{
+    if (!node) {
+        return;
+    }
+    node->hooks.on_hb_event = on_hb_event;
+    node->hooks.user = user;
+}
+
+void co_nmt_set_state(co_node_t *node, co_nmt_state_t state)
+{
+    if (!node) {
+        return;
+    }
+    node->nmt_state = state;
+}
+
+co_error_t co_nmt_master_send(co_node_t *node, uint8_t command, uint8_t target_node_id)
+{
+    if (!node) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+    co_can_frame_t frame = {0};
+    frame.cob_id  = CO_COB_NMT;
+    frame.len     = 2U;
+    frame.data[0] = command;
+    frame.data[1] = target_node_id;
+    return co_send_frame(node, &frame);
 }
