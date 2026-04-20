@@ -21,6 +21,7 @@
 #define CO_PDO_MAX_BITS 64U
 #define CO_SYNC_COB_ID_PRODUCER_BIT 0x40000000UL
 #define CO_SYNC_COB_ID_INVALID_BIT 0x80000000UL
+#define CO_EMCY_COB_ID_INVALID_BIT 0x80000000UL
 
 typedef enum {
     CO_SDO_STATE_IDLE = 0,
@@ -204,6 +205,70 @@ static bool co_pdo_mapping_is_valid(co_node_t *node, const co_pdo_cfg_t *cfg, ui
     return true;
 }
 
+static void co_error_register_recompute(co_node_t *node)
+{
+    uint8_t reg = 0U;
+    for (uint8_t i = 0U; i < CO_EMCY_FAULT_SLOTS; ++i) {
+        if (node->faults[i].active) {
+            reg = (uint8_t)(reg | node->faults[i].reg_bits);
+        }
+    }
+    node->error_register = reg;
+}
+
+static void co_predef_error_push(co_node_t *node, uint16_t emcy_code, uint8_t msef)
+{
+    for (uint8_t i = CO_EMCY_ERROR_HISTORY_LEN - 1U; i > 0U; --i) {
+        node->predef_error_field[i] = node->predef_error_field[i - 1U];
+    }
+
+    node->predef_error_field[0] = (uint32_t)emcy_code | ((uint32_t)node->error_register << 16U) |
+                                  ((uint32_t)msef << 24U);
+
+    if (node->predef_error_count < CO_EMCY_ERROR_HISTORY_LEN) {
+        node->predef_error_count++;
+    }
+}
+
+static co_error_t co_send_emcy(co_node_t *node, uint16_t emcy_code, uint8_t msef, const uint8_t mfg_data[5])
+{
+    if (!node || !node->iface.send || !node->emcy_valid) {
+        return CO_ERROR_NONE;
+    }
+
+    co_can_frame_t frame = {0};
+    frame.cob_id = node->emcy_cob_id;
+    frame.len = 8U;
+    frame.data[0] = (uint8_t)(emcy_code & 0xFFU);
+    frame.data[1] = (uint8_t)(emcy_code >> 8U);
+    frame.data[2] = node->error_register;
+    frame.data[3] = msef;
+    if (mfg_data) {
+        memcpy(&frame.data[4], mfg_data, 4U);
+    }
+    return node->iface.send(node->iface.user, &frame);
+}
+
+static co_error_t co_send_frame(co_node_t *node, const co_can_frame_t *frame)
+{
+    if (!node || !frame || !node->iface.send) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+
+    const co_error_t err = node->iface.send(node->iface.user, frame);
+    if (err != CO_ERROR_NONE) {
+        (void)co_fault_raise(node,
+                             CO_FAULT_CAN_TX,
+                             CO_EMCY_ERR_CAN_TX,
+                             CO_ERROR_REG_COMMUNICATION,
+                             0U,
+                             NULL);
+    } else {
+        (void)co_fault_clear(node, CO_FAULT_CAN_TX, 0U, NULL);
+    }
+    return err;
+}
+
 uint32_t co_od_read(co_node_t *node,
                     uint16_t index,
                     uint8_t subindex,
@@ -291,6 +356,49 @@ static uint32_t co_on_hb_write(co_node_t *node,
     memcpy(&hb_ms, data, sizeof(hb_ms));
     node->heartbeat_ms = hb_ms;
     return 0;
+}
+
+static uint32_t co_on_predef_error_count_write(co_node_t *node,
+                                               const co_od_entry_t *entry,
+                                               const uint8_t *data,
+                                               size_t size,
+                                               void *user)
+{
+    (void)entry;
+    (void)user;
+    if (size != sizeof(uint8_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    if (data[0] != 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    node->predef_error_count = 0U;
+    memset(node->predef_error_field, 0, sizeof(node->predef_error_field));
+    return 0U;
+}
+
+static uint32_t co_on_emcy_cob_id_write(co_node_t *node,
+                                        const co_od_entry_t *entry,
+                                        const uint8_t *data,
+                                        size_t size,
+                                        void *user)
+{
+    (void)entry;
+    (void)user;
+    if (size != sizeof(uint32_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    uint32_t raw = 0U;
+    memcpy(&raw, data, sizeof(raw));
+    if ((raw & 0x3FFFF800UL) != 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    node->emcy_cob_id = raw & 0x7FFU;
+    node->emcy_valid = (raw & CO_EMCY_COB_ID_INVALID_BIT) == 0U;
+    return 0U;
 }
 
 static uint32_t co_on_sync_cob_id_write(co_node_t *node,
@@ -473,6 +581,11 @@ static co_error_t co_register_builtin_od(co_node_t *node)
 
     node->device_type = 0U;
     node->error_register = 0U;
+    node->predef_error_count = 0U;
+    memset(node->predef_error_field, 0, sizeof(node->predef_error_field));
+    node->emcy_cob_id = CO_COB_EMCY_BASE + node->node_id;
+    node->emcy_valid = true;
+    memset(node->faults, 0, sizeof(node->faults));
     node->identity_sub_count = 4U;
     node->identity[0] = 0U;
     node->identity[1] = 0U;
@@ -532,6 +645,34 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     }
 
     err = co_od_register_internal(node,
+                                  0x1003,
+                                  0x00,
+                                  &node->predef_error_count,
+                                  sizeof(node->predef_error_count),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  co_on_predef_error_count_write,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    for (uint8_t sub = 1U; sub <= CO_EMCY_ERROR_HISTORY_LEN; ++sub) {
+        err = co_od_register_internal(node,
+                                      0x1003,
+                                      sub,
+                                      (uint8_t *)&node->predef_error_field[sub - 1U],
+                                      sizeof(uint32_t),
+                                      CO_OD_ACCESS_READ,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+    }
+
+    err = co_od_register_internal(node,
                                   0x1001,
                                   0x00,
                                   &node->error_register,
@@ -539,6 +680,19 @@ static co_error_t co_register_builtin_od(co_node_t *node)
                                   CO_OD_ACCESS_READ,
                                   NULL,
                                   NULL,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    err = co_od_register_internal(node,
+                                  0x1014,
+                                  0x00,
+                                  (uint8_t *)&node->emcy_cob_id,
+                                  sizeof(node->emcy_cob_id),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  co_on_emcy_cob_id_write,
                                   NULL);
     if (err != CO_ERROR_NONE) {
         return err;
@@ -867,7 +1021,7 @@ static co_error_t co_send_heartbeat(co_node_t *node)
         .len = 1U,
         .data = {(uint8_t)node->nmt_state}
     };
-    return node->iface.send(node->iface.user, &frame);
+    return co_send_frame(node, &frame);
 }
 
 static co_error_t co_send_bootup(co_node_t *node)
@@ -877,13 +1031,15 @@ static co_error_t co_send_bootup(co_node_t *node)
         .len = 1U,
         .data = {0x00U}
     };
-    return node->iface.send(node->iface.user, &frame);
+    return co_send_frame(node, &frame);
 }
 
 static void co_restore_default_comm_objects(co_node_t *node)
 {
     node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
     node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
+    node->emcy_cob_id = CO_COB_EMCY_BASE + node->node_id;
+    node->emcy_valid = true;
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
         node->rpdo_cfg[i].cob_id.can_id = (CO_COB_RPDO1_BASE + ((uint32_t)i * 0x100U) + node->node_id);
@@ -965,7 +1121,7 @@ static co_error_t co_send_sdo_abort(co_node_t *node, uint16_t index, uint8_t sub
     tx.data[5] = (uint8_t)((abort_code >> 8U) & 0xFFU);
     tx.data[6] = (uint8_t)((abort_code >> 16U) & 0xFFU);
     tx.data[7] = (uint8_t)((abort_code >> 24U) & 0xFFU);
-    return node->iface.send(node->iface.user, &tx);
+    return co_send_frame(node, &tx);
 }
 
 static void co_sdo_channel_reset(co_node_t *node, size_t ch)
@@ -1038,7 +1194,7 @@ static co_error_t co_sdo_send_upload_segment(co_node_t *node, size_t ch)
     if (is_last) {
         co_sdo_channel_reset(node, ch);
     }
-    return node->iface.send(node->iface.user, &tx);
+    return co_send_frame(node, &tx);
 }
 
 static co_error_t co_sdo_send_block_upload_data(co_node_t *node, size_t ch)
@@ -1061,7 +1217,7 @@ static co_error_t co_sdo_send_block_upload_data(co_node_t *node, size_t ch)
             node->sdo_channels[ch].block_finished = 1U;
         }
 
-        const co_error_t err = node->iface.send(node->iface.user, &tx);
+        const co_error_t err = co_send_frame(node, &tx);
         if (err != CO_ERROR_NONE) {
             return err;
         }
@@ -1119,7 +1275,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[3] = frame->data[3];
             memcpy(&tx.data[4], entry->data, entry->size);
             co_sdo_channel_reset(node, ch);
-            return node->iface.send(node->iface.user, &tx);
+            return co_send_frame(node, &tx);
         }
 
         if (entry->size > CO_SDO_TRANSFER_BUF_SIZE) {
@@ -1143,7 +1299,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
         tx.data[5] = (uint8_t)((entry->size >> 8U) & 0xFFU);
         tx.data[6] = (uint8_t)((entry->size >> 16U) & 0xFFU);
         tx.data[7] = (uint8_t)((entry->size >> 24U) & 0xFFU);
-        return node->iface.send(node->iface.user, &tx);
+        return co_send_frame(node, &tx);
     }
 
     if (cmd == 0x20U) {
@@ -1176,7 +1332,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[2] = frame->data[2];
             tx.data[3] = frame->data[3];
             co_sdo_channel_reset(node, ch);
-            return node->iface.send(node->iface.user, &tx);
+            return co_send_frame(node, &tx);
         }
 
         if (!expedited && size_indicated) {
@@ -1194,7 +1350,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[1] = frame->data[1];
             tx.data[2] = frame->data[2];
             tx.data[3] = frame->data[3];
-            return node->iface.send(node->iface.user, &tx);
+            return co_send_frame(node, &tx);
         }
 
         return co_sdo_abort_and_reset(node, ch, index, subindex, CO_SDO_ABORT_PARAM_LENGTH);
@@ -1256,7 +1412,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[0] = 0x20U;
             co_sdo_channel_reset(node, ch);
         }
-        return node->iface.send(node->iface.user, &tx);
+        return co_send_frame(node, &tx);
     }
 
     if (cmd == 0x60U && node->sdo_channels[ch].state == CO_SDO_STATE_SEG_UPLOAD) {
@@ -1291,7 +1447,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[2] = frame->data[2];
             tx.data[3] = frame->data[3];
             tx.data[4] = node->sdo_channels[ch].block_blksize;
-            return node->iface.send(node->iface.user, &tx);
+            return co_send_frame(node, &tx);
         }
     }
 
@@ -1331,7 +1487,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[5] = 0x01U;
             tx.data[6] = (uint8_t)(entry->size & 0xFFU);
             tx.data[7] = (uint8_t)((entry->size >> 8U) & 0xFFU);
-            const co_error_t err = node->iface.send(node->iface.user, &tx);
+            const co_error_t err = co_send_frame(node, &tx);
             if (err != CO_ERROR_NONE) {
                 return err;
             }
@@ -1365,7 +1521,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
             tx.data[1] = node->sdo_channels[ch].block_seq;
             tx.data[2] = node->sdo_channels[ch].block_blksize;
             node->sdo_channels[ch].block_seq = 0U;
-            const co_error_t err = node->iface.send(node->iface.user, &tx);
+            const co_error_t err = co_send_frame(node, &tx);
             if (err != CO_ERROR_NONE) {
                 return err;
             }
@@ -1418,7 +1574,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
         memcpy(entry->data, node->sdo_channels[ch].buffer, node->sdo_channels[ch].offset);
         tx.data[0] = 0xA1U;
         co_sdo_channel_reset(node, ch);
-        return node->iface.send(node->iface.user, &tx);
+        return co_send_frame(node, &tx);
     }
 
     if (node->sdo_channels[ch].state == CO_SDO_STATE_BLK_UPLOAD_WAIT_ACK && (frame->data[0] & 0xE0U) == 0xA0U) {
@@ -1440,7 +1596,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
         const uint8_t n = (rem == 0U) ? 0U : (uint8_t)(7U - rem);
         tx.data[0] = (uint8_t)(0xC1U | (n << 2U));
         co_sdo_channel_reset(node, ch);
-        return node->iface.send(node->iface.user, &tx);
+        return co_send_frame(node, &tx);
     }
 
     return co_sdo_abort_and_reset(node, ch, index, subindex, CO_SDO_ABORT_COMMAND);
@@ -1485,6 +1641,67 @@ static co_error_t co_process_nmt(co_node_t *node, const co_can_frame_t *frame)
             return CO_ERROR_INVALID_ARGS;
     }
     return CO_ERROR_NONE;
+}
+
+co_error_t co_fault_raise(co_node_t *node,
+                          uint8_t fault_id,
+                          uint16_t emcy_code,
+                          uint8_t error_register_bits,
+                          uint8_t msef,
+                          const uint8_t mfg_data[5])
+{
+    if (!node || fault_id >= CO_EMCY_FAULT_SLOTS || emcy_code == 0U) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+
+    const bool was_active = node->faults[fault_id].active;
+    node->faults[fault_id].active = true;
+    node->faults[fault_id].reg_bits = error_register_bits;
+    node->faults[fault_id].emcy_code = emcy_code;
+    node->faults[fault_id].msef = msef;
+    memset(node->faults[fault_id].mfg_data, 0, sizeof(node->faults[fault_id].mfg_data));
+    if (mfg_data) {
+        memcpy(node->faults[fault_id].mfg_data, mfg_data, sizeof(node->faults[fault_id].mfg_data));
+    }
+
+    co_error_register_recompute(node);
+    if (!was_active) {
+        co_predef_error_push(node, emcy_code, msef);
+        return co_send_emcy(node, emcy_code, msef, node->faults[fault_id].mfg_data);
+    }
+
+    return CO_ERROR_NONE;
+}
+
+co_error_t co_fault_clear(co_node_t *node,
+                          uint8_t fault_id,
+                          uint8_t msef,
+                          const uint8_t mfg_data[5])
+{
+    if (!node || fault_id >= CO_EMCY_FAULT_SLOTS) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+
+    if (!node->faults[fault_id].active) {
+        return CO_ERROR_NONE;
+    }
+
+    node->faults[fault_id].active = false;
+    co_error_register_recompute(node);
+    return co_send_emcy(node, 0x0000U, msef, mfg_data);
+}
+
+void co_fault_clear_all(co_node_t *node)
+{
+    if (!node) {
+        return;
+    }
+
+    for (uint8_t i = 0U; i < CO_EMCY_FAULT_SLOTS; ++i) {
+        node->faults[i].active = false;
+    }
+    co_error_register_recompute(node);
+    (void)co_send_emcy(node, 0x0000U, 0U, NULL);
 }
 
 void co_init(co_node_t *node, const co_if_t *iface, uint8_t node_id, uint16_t heartbeat_ms)
@@ -1553,7 +1770,7 @@ co_error_t co_process(co_node_t *node)
                 sync_frame.len = 1U;
                 sync_frame.data[0] = node->sync_counter;
             }
-            const co_error_t err = node->iface.send(node->iface.user, &sync_frame);
+            const co_error_t err = co_send_frame(node, &sync_frame);
             if (err != CO_ERROR_NONE) {
                 return err;
             }
@@ -1792,5 +2009,5 @@ co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num)
     }
     node->tpdo_data[tpdo_num].len = frame.len;
     memcpy(node->tpdo_data[tpdo_num].data, frame.data, frame.len);
-    return node->iface.send(node->iface.user, &frame);
+    return co_send_frame(node, &frame);
 }

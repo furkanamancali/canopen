@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+struct co_node;
+typedef struct co_node co_node_t;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,9 +33,11 @@ typedef struct {
     int32_t position_actual;
     int32_t velocity_actual;
     int16_t torque_actual;
+    co_node_t *node;
 } cia402_axis_t;
 
 void cia402_init(cia402_axis_t *axis);
+void cia402_attach_node(cia402_axis_t *axis, co_node_t *node);
 void cia402_set_feedback(cia402_axis_t *axis, int32_t pos, int32_t vel, int16_t tq);
 void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword);
 void cia402_step(cia402_axis_t *axis);

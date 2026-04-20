@@ -15,6 +15,10 @@ extern "C" {
 #define CO_PDO_MAP_ENTRIES 8U
 #define CO_SDO_CHANNELS 1U
 #define CO_SDO_TRANSFER_BUF_SIZE 1024U
+#define CO_EMCY_ERROR_HISTORY_LEN 8U
+#define CO_EMCY_FAULT_SLOTS 16U
+#define CO_EMCY_ERR_CAN_TX 0x8110U
+#define CO_EMCY_ERR_PROFILE 0xFF10U
 
 #define CO_SDO_ABORT_TOGGLE 0x05030000UL
 #define CO_SDO_ABORT_COMMAND 0x05040001UL
@@ -43,6 +47,22 @@ typedef enum {
     CO_ERROR_SDO_ABORT,
     CO_ERROR_HW
 } co_error_t;
+
+typedef enum {
+    CO_ERROR_REG_GENERIC = 0x01U,
+    CO_ERROR_REG_CURRENT = 0x02U,
+    CO_ERROR_REG_VOLTAGE = 0x04U,
+    CO_ERROR_REG_TEMPERATURE = 0x08U,
+    CO_ERROR_REG_COMMUNICATION = 0x10U,
+    CO_ERROR_REG_DEVICE_PROFILE = 0x20U,
+    CO_ERROR_REG_RESERVED = 0x40U,
+    CO_ERROR_REG_MANUFACTURER = 0x80U
+} co_error_reg_bits_t;
+
+typedef enum {
+    CO_FAULT_CAN_TX = 0U,
+    CO_FAULT_CIA402_PROFILE = 1U
+} co_fault_id_t;
 
 typedef enum {
     CO_OD_ACCESS_READ = 1U << 0,
@@ -161,6 +181,17 @@ struct co_node {
 
     uint32_t device_type;
     uint8_t error_register;
+    uint8_t predef_error_count;
+    uint32_t predef_error_field[CO_EMCY_ERROR_HISTORY_LEN];
+    uint32_t emcy_cob_id;
+    bool emcy_valid;
+    struct {
+        bool active;
+        uint8_t reg_bits;
+        uint16_t emcy_code;
+        uint8_t msef;
+        uint8_t mfg_data[5];
+    } faults[CO_EMCY_FAULT_SLOTS];
     uint8_t identity_sub_count;
     uint32_t identity[4];
     uint32_t sdo_server_cob_rx;
@@ -215,6 +246,17 @@ uint32_t co_od_write(co_node_t *node,
 co_error_t co_process(co_node_t *node);
 co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame);
 co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num);
+co_error_t co_fault_raise(co_node_t *node,
+                          uint8_t fault_id,
+                          uint16_t emcy_code,
+                          uint8_t error_register_bits,
+                          uint8_t msef,
+                          const uint8_t mfg_data[5]);
+co_error_t co_fault_clear(co_node_t *node,
+                          uint8_t fault_id,
+                          uint8_t msef,
+                          const uint8_t mfg_data[5]);
+void co_fault_clear_all(co_node_t *node);
 
 #ifdef __cplusplus
 }

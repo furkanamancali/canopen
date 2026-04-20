@@ -1,5 +1,7 @@
 #include "cia402.h"
 
+#include "canopen.h"
+
 #include <string.h>
 
 static void cia402_update_statusword(cia402_axis_t *axis)
@@ -37,11 +39,38 @@ static void cia402_update_statusword(cia402_axis_t *axis)
     axis->mode_display = axis->mode_of_operation;
 }
 
+static void cia402_sync_fault_to_canopen(cia402_axis_t *axis)
+{
+    if (!axis || !axis->node) {
+        return;
+    }
+
+    if (axis->state == CIA402_FAULT || axis->state == CIA402_FAULT_REACTION_ACTIVE) {
+        (void)co_fault_raise(axis->node,
+                             CO_FAULT_CIA402_PROFILE,
+                             CO_EMCY_ERR_PROFILE,
+                             CO_ERROR_REG_DEVICE_PROFILE,
+                             0U,
+                             NULL);
+    } else {
+        (void)co_fault_clear(axis->node, CO_FAULT_CIA402_PROFILE, 0U, NULL);
+    }
+}
+
 void cia402_init(cia402_axis_t *axis)
 {
     memset(axis, 0, sizeof(*axis));
     axis->state = CIA402_SWITCH_ON_DISABLED;
     cia402_update_statusword(axis);
+}
+
+void cia402_attach_node(cia402_axis_t *axis, co_node_t *node)
+{
+    if (!axis) {
+        return;
+    }
+    axis->node = node;
+    cia402_sync_fault_to_canopen(axis);
 }
 
 void cia402_set_feedback(cia402_axis_t *axis, int32_t pos, int32_t vel, int16_t tq)
@@ -100,6 +129,7 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
     }
 
     cia402_update_statusword(axis);
+    cia402_sync_fault_to_canopen(axis);
 }
 
 void cia402_step(cia402_axis_t *axis)
@@ -107,5 +137,6 @@ void cia402_step(cia402_axis_t *axis)
     if (axis->state == CIA402_FAULT_REACTION_ACTIVE) {
         axis->state = CIA402_FAULT;
         cia402_update_statusword(axis);
+        cia402_sync_fault_to_canopen(axis);
     }
 }
