@@ -4,6 +4,7 @@ This repository contains a compact C implementation intended as a **starting poi
 
 - CiA 301 essentials:
   - NMT state handling
+  - NMT boot-up/reset lifecycle (including communication vs application reset hooks)
   - Heartbeat production
   - Expedited SDO server (upload/download)
   - RPDO receive / TPDO transmit buffers

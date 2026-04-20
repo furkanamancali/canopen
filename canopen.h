@@ -94,6 +94,8 @@ typedef struct {
     void *user;
     co_error_t (*send)(void *user, const co_can_frame_t *frame);
     uint32_t (*millis)(void *user);
+    void (*on_reset_communication)(void *user);
+    void (*on_reset_application)(void *user);
     void (*on_reset)(void *user, co_reset_type_t type);
 } co_if_t;
 
