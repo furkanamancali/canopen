@@ -552,14 +552,15 @@ static uint16_t expected_statusword(cia402_state_t state)
     uint16_t sw = 0U;
     const int ready = (state == CIA402_READY_TO_SWITCH_ON || state == CIA402_SWITCHED_ON ||
                        state == CIA402_OPERATION_ENABLED || state == CIA402_QUICK_STOP);
-    const int switched_on = (state == CIA402_SWITCHED_ON || state == CIA402_OPERATION_ENABLED || state == CIA402_QUICK_STOP);
+    const int switched_on = (state == CIA402_SWITCHED_ON || state == CIA402_OPERATION_ENABLED);
     const int op_enabled = (state == CIA402_OPERATION_ENABLED);
     const int fault = (state == CIA402_FAULT || state == CIA402_FAULT_REACTION_ACTIVE);
     const int voltage_enabled = (state == CIA402_READY_TO_SWITCH_ON || state == CIA402_SWITCHED_ON ||
                                  state == CIA402_OPERATION_ENABLED || state == CIA402_QUICK_STOP ||
                                  state == CIA402_FAULT_REACTION_ACTIVE);
     const int quick_stop = (state == CIA402_OPERATION_ENABLED || state == CIA402_SWITCHED_ON ||
-                            state == CIA402_READY_TO_SWITCH_ON);
+                            state == CIA402_READY_TO_SWITCH_ON ||
+                            state == CIA402_FAULT_REACTION_ACTIVE);
     const int switch_on_disabled = (state == CIA402_SWITCH_ON_DISABLED);
 
     sw |= (uint16_t)(ready ? (1U << 0) : 0U);
@@ -575,6 +576,10 @@ static uint16_t expected_statusword(cia402_state_t state)
 
 typedef struct {
     unsigned profile_velocity_calls;
+    unsigned quick_stop_reaction_checks;
+    unsigned fault_reaction_checks;
+    bool quick_stop_done;
+    bool fault_reaction_done;
     int32_t seen_target_velocity;
     uint32_t seen_profile_velocity;
     uint32_t seen_profile_acceleration;
@@ -593,6 +598,22 @@ static bool test_on_profile_velocity(cia402_axis_t *axis, void *user)
     return true;
 }
 
+static bool test_on_quick_stop_reaction_check(cia402_axis_t *axis, void *user)
+{
+    (void)axis;
+    cia402_test_app_ctx_t *ctx = (cia402_test_app_ctx_t *)user;
+    ctx->quick_stop_reaction_checks++;
+    return ctx->quick_stop_done;
+}
+
+static bool test_on_fault_reaction_check(cia402_axis_t *axis, void *user)
+{
+    (void)axis;
+    cia402_test_app_ctx_t *ctx = (cia402_test_app_ctx_t *)user;
+    ctx->fault_reaction_checks++;
+    return ctx->fault_reaction_done;
+}
+
 static int test_cia402_transition_matrix_and_statusword(void)
 {
     co_node_t node;
@@ -603,6 +624,14 @@ static int test_cia402_transition_matrix_and_statusword(void)
     cia402_axis_t axis;
     cia402_init(&axis);
     cia402_bind_od(&axis, &node);
+    cia402_test_app_ctx_t app_ctx = {0};
+    const cia402_app_if_t app = {
+        .user = &app_ctx,
+        .supported_modes = 0U,
+        .on_quick_stop_reaction_check = test_on_quick_stop_reaction_check,
+        .on_fault_reaction_check = test_on_fault_reaction_check,
+    };
+    cia402_set_callbacks(&axis, &app);
 
     TEST_ASSERT(axis.state == CIA402_SWITCH_ON_DISABLED);
     TEST_ASSERT(axis.statusword == expected_statusword(axis.state));
@@ -623,6 +652,17 @@ static int test_cia402_transition_matrix_and_statusword(void)
     cia402_apply_controlword(&axis, 0x0002U);
     TEST_ASSERT(axis.state == CIA402_QUICK_STOP);
     TEST_ASSERT(axis.statusword == expected_statusword(axis.state));
+    TEST_ASSERT(app_ctx.quick_stop_reaction_checks == 1U);
+
+    cia402_apply_controlword(&axis, 0x000FU);
+    TEST_ASSERT(axis.state == CIA402_QUICK_STOP);
+
+    app_ctx.quick_stop_done = true;
+    cia402_step(&axis);
+    TEST_ASSERT(axis.state == CIA402_QUICK_STOP);
+    TEST_ASSERT(app_ctx.quick_stop_reaction_checks >= 2U);
+    cia402_apply_controlword(&axis, 0x000FU);
+    TEST_ASSERT(axis.state == CIA402_OPERATION_ENABLED);
 
     axis.quick_stop_option_code = 2U;
     cia402_apply_controlword(&axis, 0x0000U);
@@ -634,6 +674,12 @@ static int test_cia402_transition_matrix_and_statusword(void)
     cia402_apply_controlword(&axis, 0x0007U);
     cia402_apply_controlword(&axis, 0x000FU);
     axis.mode_of_operation = CIA402_MODE_NONE;
+    app_ctx.fault_reaction_done = false;
+    cia402_step(&axis);
+    TEST_ASSERT(axis.state == CIA402_FAULT_REACTION_ACTIVE);
+    TEST_ASSERT((axis.statusword & 0x007FU) == (expected_statusword(axis.state) & 0x007FU));
+    TEST_ASSERT(app_ctx.fault_reaction_checks == 1U);
+    app_ctx.fault_reaction_done = true;
     cia402_step(&axis);
     TEST_ASSERT(axis.state == CIA402_FAULT);
     TEST_ASSERT((axis.statusword & (1U << 3)) != 0U);
@@ -663,6 +709,7 @@ static int test_cia402_rpdo_commands_and_preconditions(void)
         .user = &app_ctx,
         .supported_modes = CIA402_MODE_BIT(CIA402_MODE_PROFILE_VELOCITY),
         .on_profile_velocity = test_on_profile_velocity,
+        .on_fault_reaction_check = test_on_fault_reaction_check,
     };
     cia402_set_callbacks(&axis, &app);
 
@@ -726,6 +773,7 @@ static int test_cia402_rpdo_commands_and_preconditions(void)
     cia402_apply_controlword(&axis, 0x0006U);
     cia402_apply_controlword(&axis, 0x0007U);
     cia402_apply_controlword(&axis, 0x000FU);
+    app_ctx.fault_reaction_done = true;
     cia402_step(&axis);
     TEST_ASSERT(axis.state == CIA402_FAULT);
     TEST_ASSERT((axis.statusword & (1U << 3)) != 0U);
