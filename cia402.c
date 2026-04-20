@@ -92,9 +92,9 @@ static cia402_command_t cia402_decode_command(uint16_t controlword)
     return CIA402_CMD_NONE;
 }
 
-static bool cia402_quick_stop_complete_to_switch_on_disabled(const cia402_axis_t *axis)
+static bool cia402_quick_stop_option_disables_drive(uint16_t option_code)
 {
-    switch (axis->quick_stop_option_code) {
+    switch (option_code) {
         case 0U:
         case 1U:
         case 2U:
@@ -112,7 +112,16 @@ static void cia402_apply_quick_stop_rules(cia402_axis_t *axis, cia402_command_t 
         return;
     }
 
-    if (cia402_quick_stop_complete_to_switch_on_disabled(axis)) {
+    if (command == CIA402_CMD_DISABLE_VOLTAGE) {
+        axis->state = CIA402_SWITCH_ON_DISABLED;
+        return;
+    }
+
+    if (!axis->quick_stop_reaction_complete) {
+        return;
+    }
+
+    if (cia402_quick_stop_option_disables_drive(axis->quick_stop_option_code)) {
         axis->state = CIA402_SWITCH_ON_DISABLED;
         return;
     }
@@ -132,8 +141,7 @@ static void cia402_update_statusword(cia402_axis_t *axis)
 
     const bool switched_on =
         (axis->state == CIA402_SWITCHED_ON) ||
-        (axis->state == CIA402_OPERATION_ENABLED) ||
-        (axis->state == CIA402_QUICK_STOP);
+        (axis->state == CIA402_OPERATION_ENABLED);
 
     const bool operation_enabled = (axis->state == CIA402_OPERATION_ENABLED);
     const bool fault = (axis->state == CIA402_FAULT) || (axis->state == CIA402_FAULT_REACTION_ACTIVE);
@@ -145,9 +153,10 @@ static void cia402_update_statusword(cia402_axis_t *axis)
         (axis->state == CIA402_FAULT_REACTION_ACTIVE);
 
     const bool quick_stop =
-        (axis->state == CIA402_OPERATION_ENABLED) ||
+        (axis->state == CIA402_READY_TO_SWITCH_ON) ||
         (axis->state == CIA402_SWITCHED_ON) ||
-        (axis->state == CIA402_READY_TO_SWITCH_ON);
+        (axis->state == CIA402_OPERATION_ENABLED) ||
+        (axis->state == CIA402_FAULT_REACTION_ACTIVE);
 
     const bool switch_on_disabled = (axis->state == CIA402_SWITCH_ON_DISABLED);
 
@@ -226,7 +235,7 @@ static void cia402_enter_mode_fault(cia402_axis_t *axis, uint8_t msef)
     axis->fault_msef = msef;
     axis->fault_code = (uint16_t)(0xFF00U | (uint16_t)msef);
     axis->state = CIA402_FAULT_REACTION_ACTIVE;
-    axis->fault_reaction_complete = true;
+    axis->fault_reaction_complete = false;
 }
 
 static bool cia402_check_mode_preconditions(cia402_axis_t *axis)
@@ -855,6 +864,7 @@ void cia402_set_feedback(cia402_axis_t *axis, int32_t pos, int32_t vel, int16_t 
 void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
 {
     axis->controlword = controlword;
+    const cia402_state_t previous_state = axis->state;
 
     const cia402_command_t command = cia402_decode_command(controlword);
 
@@ -866,13 +876,31 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
         }
     }
 
+    if ((axis->state == CIA402_QUICK_STOP) && !axis->quick_stop_reaction_complete) {
+        if (axis->app && axis->app->on_quick_stop_reaction_check) {
+            axis->quick_stop_reaction_complete =
+                axis->app->on_quick_stop_reaction_check(axis, axis->app->user);
+        } else {
+            axis->quick_stop_reaction_complete = true;
+        }
+    }
+
+    if ((previous_state == CIA402_QUICK_STOP) && (command == CIA402_CMD_ENABLE_OPERATION) &&
+        !axis->quick_stop_reaction_complete) {
+        axis->state = CIA402_QUICK_STOP;
+    }
+
     cia402_apply_quick_stop_rules(axis, command);
+    if (axis->state != CIA402_QUICK_STOP) {
+        axis->quick_stop_reaction_complete = false;
+    }
     if ((command == CIA402_CMD_FAULT_RESET) && (axis->state == CIA402_SWITCH_ON_DISABLED)) {
         axis->fault_msef = 0U;
         axis->fault_code = 0U;
         axis->warning = false;
         axis->internal_limit_active = false;
         axis->diag_precondition_mask = 0U;
+        axis->fault_reaction_complete = false;
     }
 
     cia402_update_statusword(axis);
@@ -887,9 +915,31 @@ void cia402_step(cia402_axis_t *axis)
 
     (void)cia402_dispatch_mode_handler(axis);
 
+    if ((axis->state == CIA402_QUICK_STOP) && !axis->quick_stop_reaction_complete) {
+        if (axis->app && axis->app->on_quick_stop_reaction_check) {
+            axis->quick_stop_reaction_complete =
+                axis->app->on_quick_stop_reaction_check(axis, axis->app->user);
+        } else {
+            axis->quick_stop_reaction_complete = true;
+        }
+    }
+
+    if (axis->state == CIA402_QUICK_STOP && axis->quick_stop_reaction_complete &&
+        cia402_quick_stop_option_disables_drive(axis->quick_stop_option_code)) {
+        axis->state = CIA402_SWITCH_ON_DISABLED;
+        axis->quick_stop_reaction_complete = false;
+    }
+
     if (axis->state == CIA402_FAULT_REACTION_ACTIVE) {
+        if (!axis->fault_reaction_complete) {
+            if (axis->app && axis->app->on_fault_reaction_check) {
+                axis->fault_reaction_complete =
+                    axis->app->on_fault_reaction_check(axis, axis->app->user);
+            }
+        }
         if (axis->fault_reaction_complete) {
             axis->state = CIA402_FAULT;
+            axis->fault_reaction_complete = false;
         }
         cia402_update_statusword(axis);
         cia402_sync_fault_to_canopen(axis);

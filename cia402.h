@@ -40,6 +40,7 @@ typedef struct cia402_axis cia402_axis_t;
 
 typedef void (*cia402_feedback_cb_t)(cia402_axis_t *axis, int8_t mode, void *user);
 typedef bool (*cia402_mode_command_cb_t)(cia402_axis_t *axis, void *user);
+typedef bool (*cia402_reaction_check_cb_t)(cia402_axis_t *axis, void *user);
 
 typedef struct {
     void *user;
@@ -54,6 +55,8 @@ typedef struct {
     cia402_mode_command_cb_t on_cyclic_sync_position;
     cia402_mode_command_cb_t on_cyclic_sync_velocity;
     cia402_mode_command_cb_t on_cyclic_sync_torque;
+    cia402_reaction_check_cb_t on_quick_stop_reaction_check;
+    cia402_reaction_check_cb_t on_fault_reaction_check;
 } cia402_app_if_t;
 
 #define CIA402_MODE_BIT(mode) (1UL << (uint32_t)(mode))
@@ -79,6 +82,7 @@ struct cia402_axis {
     bool remote;
     bool target_reached;
     bool internal_limit_active;
+    bool quick_stop_reaction_complete;
     bool fault_reaction_complete;
     bool target_position_valid;
     bool target_velocity_valid;
