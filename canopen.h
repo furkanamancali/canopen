@@ -77,6 +77,30 @@ typedef struct {
 } co_pdo_data_t;
 
 typedef struct {
+    uint16_t index;
+    uint8_t subindex;
+    uint8_t bit_length;
+} co_pdo_map_entry_t;
+
+typedef struct {
+    uint32_t can_id;
+    bool valid;
+    bool rtr_allowed;
+    bool extended;
+} co_pdo_cob_id_cfg_t;
+
+typedef struct {
+    uint32_t cob_id_raw;
+    co_pdo_cob_id_cfg_t cob_id;
+    uint8_t transmission_type;
+    uint16_t inhibit_time_100us;
+    uint16_t event_timer_ms;
+    uint8_t map_count;
+    uint32_t mapping_raw[CO_PDO_MAP_ENTRIES];
+    co_pdo_map_entry_t mapping[CO_PDO_MAP_ENTRIES];
+} co_pdo_cfg_t;
+
+typedef struct {
     uint8_t command;
     uint16_t index;
     uint8_t subindex;
@@ -115,10 +139,10 @@ struct co_node {
     co_od_entry_t od[CO_MAX_OD_ENTRIES];
     size_t od_count;
 
-    uint32_t rpdo_map[CO_MAX_RPDO];
-    uint32_t tpdo_map[CO_MAX_TPDO];
     co_pdo_data_t rpdo_data[CO_MAX_RPDO];
     co_pdo_data_t tpdo_data[CO_MAX_TPDO];
+    co_pdo_cfg_t rpdo_cfg[CO_MAX_RPDO];
+    co_pdo_cfg_t tpdo_cfg[CO_MAX_TPDO];
 
     uint32_t device_type;
     uint8_t error_register;
@@ -128,11 +152,6 @@ struct co_node {
     uint32_t sdo_server_cob_tx;
     uint8_t sdo_server_sub_count;
     uint8_t pdo_comm_sub_count[CO_MAX_RPDO + CO_MAX_TPDO];
-    uint8_t pdo_map_count[CO_MAX_RPDO + CO_MAX_TPDO];
-    uint32_t rpdo_transmission_type[CO_MAX_RPDO];
-    uint32_t tpdo_transmission_type[CO_MAX_TPDO];
-    uint32_t rpdo_mapping[CO_MAX_RPDO][CO_PDO_MAP_ENTRIES];
-    uint32_t tpdo_mapping[CO_MAX_TPDO][CO_PDO_MAP_ENTRIES];
     struct {
         uint8_t state;
         uint8_t mode;

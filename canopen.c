@@ -17,6 +17,8 @@
 #define CO_COB_SDO_RX_BASE 0x600U
 #define CO_COB_HEARTBEAT_BASE 0x700U
 #define CO_SDO_TIMEOUT_MS 1000U
+#define CO_PDO_COMM_SUB_COUNT 5U
+#define CO_PDO_MAX_BITS 64U
 
 typedef enum {
     CO_SDO_STATE_IDLE = 0,
@@ -94,6 +96,110 @@ static uint32_t co_od_abort_from_length(size_t provided, size_t expected)
         return 0;
     }
     return (provided > expected) ? CO_SDO_ABORT_PARAM_TOO_HIGH : CO_SDO_ABORT_PARAM_TOO_LOW;
+}
+
+static bool co_decode_pdo_mapping(uint32_t raw, co_pdo_map_entry_t *decoded)
+{
+    if (!decoded) {
+        return false;
+    }
+
+    decoded->index = (uint16_t)((raw >> 16U) & 0xFFFFU);
+    decoded->subindex = (uint8_t)((raw >> 8U) & 0xFFU);
+    decoded->bit_length = (uint8_t)(raw & 0xFFU);
+    return true;
+}
+
+static bool co_decode_pdo_cob_id(uint32_t raw, co_pdo_cob_id_cfg_t *decoded)
+{
+    if (!decoded) {
+        return false;
+    }
+
+    decoded->valid = (raw & 0x80000000UL) == 0U;
+    decoded->rtr_allowed = (raw & 0x40000000UL) == 0U;
+    decoded->extended = (raw & 0x20000000UL) != 0U;
+    decoded->can_id = decoded->extended ? (raw & 0x1FFFFFFFUL) : (raw & 0x7FFUL);
+    return true;
+}
+
+static uint32_t co_encode_pdo_cob_id(const co_pdo_cob_id_cfg_t *cfg)
+{
+    uint32_t raw = cfg->can_id & (cfg->extended ? 0x1FFFFFFFUL : 0x7FFUL);
+    if (!cfg->valid) {
+        raw |= 0x80000000UL;
+    }
+    if (!cfg->rtr_allowed) {
+        raw |= 0x40000000UL;
+    }
+    if (cfg->extended) {
+        raw |= 0x20000000UL;
+    }
+    return raw;
+}
+
+static bool co_copy_bits(uint8_t *dst,
+                         size_t dst_bits,
+                         size_t dst_offset_bits,
+                         const uint8_t *src,
+                         size_t src_bits,
+                         size_t src_offset_bits,
+                         size_t bit_count)
+{
+    if (!dst || !src) {
+        return false;
+    }
+    if ((dst_offset_bits + bit_count) > dst_bits || (src_offset_bits + bit_count) > src_bits) {
+        return false;
+    }
+
+    for (size_t bit = 0; bit < bit_count; ++bit) {
+        const size_t src_bit = src_offset_bits + bit;
+        const uint8_t src_val = (uint8_t)((src[src_bit / 8U] >> (src_bit % 8U)) & 0x01U);
+        const size_t dst_bit = dst_offset_bits + bit;
+        uint8_t *dst_byte = &dst[dst_bit / 8U];
+        const uint8_t dst_mask = (uint8_t)(1U << (dst_bit % 8U));
+        if (src_val != 0U) {
+            *dst_byte |= dst_mask;
+        } else {
+            *dst_byte = (uint8_t)(*dst_byte & (uint8_t)~dst_mask);
+        }
+    }
+    return true;
+}
+
+static bool co_pdo_mapping_is_valid(co_node_t *node, const co_pdo_cfg_t *cfg, uint32_t *total_bits_out)
+{
+    if (!node || !cfg) {
+        return false;
+    }
+
+    uint32_t total_bits = 0U;
+    for (uint8_t i = 0; i < cfg->map_count; ++i) {
+        co_pdo_map_entry_t mapped = {0};
+        if (!co_decode_pdo_mapping(cfg->mapping_raw[i], &mapped)) {
+            return false;
+        }
+        if (mapped.index == 0U || mapped.bit_length == 0U) {
+            return false;
+        }
+        co_od_entry_t *entry = co_od_find(node, mapped.index, mapped.subindex);
+        if (!entry) {
+            return false;
+        }
+        if (mapped.bit_length > (entry->size * 8U)) {
+            return false;
+        }
+        total_bits += mapped.bit_length;
+        if (total_bits > CO_PDO_MAX_BITS) {
+            return false;
+        }
+    }
+
+    if (total_bits_out) {
+        *total_bits_out = total_bits;
+    }
+    return true;
 }
 
 uint32_t co_od_read(co_node_t *node,
@@ -185,6 +291,137 @@ static uint32_t co_on_hb_write(co_node_t *node,
     return 0;
 }
 
+static co_pdo_cfg_t *co_get_pdo_cfg(co_node_t *node, uint16_t index)
+{
+    if (index >= 0x1400U && index < (0x1400U + CO_MAX_RPDO)) {
+        return &node->rpdo_cfg[index - 0x1400U];
+    }
+    if (index >= 0x1600U && index < (0x1600U + CO_MAX_RPDO)) {
+        return &node->rpdo_cfg[index - 0x1600U];
+    }
+    if (index >= 0x1800U && index < (0x1800U + CO_MAX_TPDO)) {
+        return &node->tpdo_cfg[index - 0x1800U];
+    }
+    if (index >= 0x1A00U && index < (0x1A00U + CO_MAX_TPDO)) {
+        return &node->tpdo_cfg[index - 0x1A00U];
+    }
+    return NULL;
+}
+
+static uint32_t co_on_pdo_comm_cob_id_write(co_node_t *node,
+                                            const co_od_entry_t *entry,
+                                            const uint8_t *data,
+                                            size_t size,
+                                            void *user)
+{
+    (void)user;
+    if (size != sizeof(uint32_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    co_pdo_cfg_t *cfg = co_get_pdo_cfg(node, entry->index);
+    if (!cfg) {
+        return CO_SDO_ABORT_NO_OBJECT;
+    }
+
+    uint32_t raw = 0U;
+    memcpy(&raw, data, sizeof(raw));
+    co_pdo_cob_id_cfg_t parsed = {0};
+    if (!co_decode_pdo_cob_id(raw, &parsed)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    if ((!parsed.extended && parsed.can_id > 0x7FFU) || (parsed.extended && parsed.can_id > 0x1FFFFFFFUL)) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    cfg->cob_id_raw = raw;
+    cfg->cob_id = parsed;
+    return 0U;
+}
+
+static uint32_t co_on_pdo_mapping_entry_write(co_node_t *node,
+                                              const co_od_entry_t *entry,
+                                              const uint8_t *data,
+                                              size_t size,
+                                              void *user)
+{
+    (void)user;
+    if (size != sizeof(uint32_t) || entry->subindex == 0U || entry->subindex > CO_PDO_MAP_ENTRIES) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    co_pdo_cfg_t *cfg = co_get_pdo_cfg(node, entry->index);
+    if (!cfg) {
+        return CO_SDO_ABORT_NO_OBJECT;
+    }
+
+    uint32_t raw = 0U;
+    memcpy(&raw, data, sizeof(raw));
+    co_pdo_map_entry_t mapped = {0};
+    if (!co_decode_pdo_mapping(raw, &mapped)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    if (mapped.bit_length > 0U) {
+        co_od_entry_t *mapped_entry = co_od_find(node, mapped.index, mapped.subindex);
+        if (!mapped_entry) {
+            return CO_SDO_ABORT_NO_OBJECT;
+        }
+        if ((entry->index >= 0x1600U && entry->index < (0x1600U + CO_MAX_RPDO) &&
+             (mapped_entry->access & CO_OD_ACCESS_WRITE) == 0U) ||
+            (entry->index >= 0x1A00U && entry->index < (0x1A00U + CO_MAX_TPDO) &&
+             (mapped_entry->access & CO_OD_ACCESS_READ) == 0U)) {
+            return CO_SDO_ABORT_READONLY;
+        }
+        if (mapped.bit_length > (mapped_entry->size * 8U)) {
+            return CO_SDO_ABORT_PARAM_TOO_HIGH;
+        }
+    }
+
+    const uint8_t map_slot = (uint8_t)(entry->subindex - 1U);
+    const uint32_t prev_raw = cfg->mapping_raw[map_slot];
+    cfg->mapping_raw[map_slot] = raw;
+    uint32_t total_bits = 0U;
+    if (!co_pdo_mapping_is_valid(node, cfg, &total_bits)) {
+        cfg->mapping_raw[map_slot] = prev_raw;
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    cfg->mapping[map_slot] = mapped;
+
+    return 0U;
+}
+
+static uint32_t co_on_pdo_mapping_count_write(co_node_t *node,
+                                              const co_od_entry_t *entry,
+                                              const uint8_t *data,
+                                              size_t size,
+                                              void *user)
+{
+    (void)user;
+    if (size != sizeof(uint8_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    const uint8_t count = data[0];
+    if (count > CO_PDO_MAP_ENTRIES) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    co_pdo_cfg_t *cfg = co_get_pdo_cfg(node, entry->index);
+    if (!cfg) {
+        return CO_SDO_ABORT_NO_OBJECT;
+    }
+
+    const uint8_t prev_count = cfg->map_count;
+    cfg->map_count = count;
+    uint32_t total_bits = 0U;
+    if (!co_pdo_mapping_is_valid(node, cfg, &total_bits)) {
+        cfg->map_count = prev_count;
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    return 0U;
+}
+
 static co_error_t co_register_builtin_od(co_node_t *node)
 {
     co_error_t err = CO_ERROR_NONE;
@@ -202,15 +439,31 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
-        node->pdo_comm_sub_count[i] = 2U;
-        node->pdo_map_count[i] = 0U;
-        node->rpdo_transmission_type[i] = 255U;
+        node->pdo_comm_sub_count[i] = CO_PDO_COMM_SUB_COUNT;
+        node->rpdo_cfg[i].cob_id.valid = true;
+        node->rpdo_cfg[i].cob_id.rtr_allowed = false;
+        node->rpdo_cfg[i].cob_id.extended = false;
+        node->rpdo_cfg[i].transmission_type = 255U;
+        node->rpdo_cfg[i].inhibit_time_100us = 0U;
+        node->rpdo_cfg[i].event_timer_ms = 0U;
+        node->rpdo_cfg[i].map_count = 0U;
+        memset(node->rpdo_cfg[i].mapping_raw, 0, sizeof(node->rpdo_cfg[i].mapping_raw));
+        memset(node->rpdo_cfg[i].mapping, 0, sizeof(node->rpdo_cfg[i].mapping));
+        node->rpdo_cfg[i].cob_id_raw = co_encode_pdo_cob_id(&node->rpdo_cfg[i].cob_id);
     }
 
     for (uint8_t i = 0; i < CO_MAX_TPDO; ++i) {
-        node->pdo_comm_sub_count[CO_MAX_RPDO + i] = 2U;
-        node->pdo_map_count[CO_MAX_RPDO + i] = 0U;
-        node->tpdo_transmission_type[i] = 255U;
+        node->pdo_comm_sub_count[CO_MAX_RPDO + i] = CO_PDO_COMM_SUB_COUNT;
+        node->tpdo_cfg[i].cob_id.valid = true;
+        node->tpdo_cfg[i].cob_id.rtr_allowed = false;
+        node->tpdo_cfg[i].cob_id.extended = false;
+        node->tpdo_cfg[i].transmission_type = 255U;
+        node->tpdo_cfg[i].inhibit_time_100us = 0U;
+        node->tpdo_cfg[i].event_timer_ms = 0U;
+        node->tpdo_cfg[i].map_count = 0U;
+        memset(node->tpdo_cfg[i].mapping_raw, 0, sizeof(node->tpdo_cfg[i].mapping_raw));
+        memset(node->tpdo_cfg[i].mapping, 0, sizeof(node->tpdo_cfg[i].mapping));
+        node->tpdo_cfg[i].cob_id_raw = co_encode_pdo_cob_id(&node->tpdo_cfg[i].cob_id);
     }
 
     err = co_od_register_internal(node,
@@ -337,8 +590,21 @@ static co_error_t co_register_builtin_od(co_node_t *node)
         err = co_od_register_internal(node,
                                       comm_idx,
                                       0x01,
-                                      (uint8_t *)&node->rpdo_map[i],
-                                      sizeof(node->rpdo_map[i]),
+                                      (uint8_t *)&node->rpdo_cfg[i].cob_id_raw,
+                                      sizeof(uint32_t),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      co_on_pdo_comm_cob_id_write,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+
+        err = co_od_register_internal(node,
+                                      comm_idx,
+                                      0x02,
+                                      &node->rpdo_cfg[i].transmission_type,
+                                      sizeof(node->rpdo_cfg[i].transmission_type),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
                                       NULL,
@@ -349,9 +615,22 @@ static co_error_t co_register_builtin_od(co_node_t *node)
 
         err = co_od_register_internal(node,
                                       comm_idx,
-                                      0x02,
-                                      (uint8_t *)&node->rpdo_transmission_type[i],
-                                      sizeof(node->rpdo_transmission_type[i]),
+                                      0x03,
+                                      (uint8_t *)&node->rpdo_cfg[i].inhibit_time_100us,
+                                      sizeof(node->rpdo_cfg[i].inhibit_time_100us),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+
+        err = co_od_register_internal(node,
+                                      comm_idx,
+                                      0x05,
+                                      (uint8_t *)&node->rpdo_cfg[i].event_timer_ms,
+                                      sizeof(node->rpdo_cfg[i].event_timer_ms),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
                                       NULL,
@@ -363,11 +642,11 @@ static co_error_t co_register_builtin_od(co_node_t *node)
         err = co_od_register_internal(node,
                                       map_idx,
                                       0x00,
-                                      &node->pdo_map_count[i],
-                                      sizeof(node->pdo_map_count[i]),
+                                      &node->rpdo_cfg[i].map_count,
+                                      sizeof(node->rpdo_cfg[i].map_count),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
-                                      NULL,
+                                      co_on_pdo_mapping_count_write,
                                       NULL);
         if (err != CO_ERROR_NONE) {
             return err;
@@ -377,11 +656,11 @@ static co_error_t co_register_builtin_od(co_node_t *node)
             err = co_od_register_internal(node,
                                           map_idx,
                                           sub,
-                                          (uint8_t *)&node->rpdo_mapping[i][sub - 1U],
+                                          (uint8_t *)&node->rpdo_cfg[i].mapping_raw[sub - 1U],
                                           sizeof(uint32_t),
                                           CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                           NULL,
-                                          NULL,
+                                          co_on_pdo_mapping_entry_write,
                                           NULL);
             if (err != CO_ERROR_NONE) {
                 return err;
@@ -392,13 +671,12 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     for (uint8_t i = 0; i < CO_MAX_TPDO; ++i) {
         const uint16_t comm_idx = (uint16_t)(0x1800U + i);
         const uint16_t map_idx = (uint16_t)(0x1A00U + i);
-        const uint8_t slot = (uint8_t)(CO_MAX_RPDO + i);
 
         err = co_od_register_internal(node,
                                       comm_idx,
                                       0x00,
-                                      &node->pdo_comm_sub_count[slot],
-                                      sizeof(node->pdo_comm_sub_count[slot]),
+                                      &node->pdo_comm_sub_count[CO_MAX_RPDO + i],
+                                      sizeof(node->pdo_comm_sub_count[CO_MAX_RPDO + i]),
                                       CO_OD_ACCESS_READ,
                                       NULL,
                                       NULL,
@@ -410,8 +688,21 @@ static co_error_t co_register_builtin_od(co_node_t *node)
         err = co_od_register_internal(node,
                                       comm_idx,
                                       0x01,
-                                      (uint8_t *)&node->tpdo_map[i],
-                                      sizeof(node->tpdo_map[i]),
+                                      (uint8_t *)&node->tpdo_cfg[i].cob_id_raw,
+                                      sizeof(uint32_t),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      co_on_pdo_comm_cob_id_write,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+
+        err = co_od_register_internal(node,
+                                      comm_idx,
+                                      0x02,
+                                      &node->tpdo_cfg[i].transmission_type,
+                                      sizeof(node->tpdo_cfg[i].transmission_type),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
                                       NULL,
@@ -422,9 +713,22 @@ static co_error_t co_register_builtin_od(co_node_t *node)
 
         err = co_od_register_internal(node,
                                       comm_idx,
-                                      0x02,
-                                      (uint8_t *)&node->tpdo_transmission_type[i],
-                                      sizeof(node->tpdo_transmission_type[i]),
+                                      0x03,
+                                      (uint8_t *)&node->tpdo_cfg[i].inhibit_time_100us,
+                                      sizeof(node->tpdo_cfg[i].inhibit_time_100us),
+                                      CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                      NULL,
+                                      NULL,
+                                      NULL);
+        if (err != CO_ERROR_NONE) {
+            return err;
+        }
+
+        err = co_od_register_internal(node,
+                                      comm_idx,
+                                      0x05,
+                                      (uint8_t *)&node->tpdo_cfg[i].event_timer_ms,
+                                      sizeof(node->tpdo_cfg[i].event_timer_ms),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
                                       NULL,
@@ -436,11 +740,11 @@ static co_error_t co_register_builtin_od(co_node_t *node)
         err = co_od_register_internal(node,
                                       map_idx,
                                       0x00,
-                                      &node->pdo_map_count[slot],
-                                      sizeof(node->pdo_map_count[slot]),
+                                      &node->tpdo_cfg[i].map_count,
+                                      sizeof(node->tpdo_cfg[i].map_count),
                                       CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                       NULL,
-                                      NULL,
+                                      co_on_pdo_mapping_count_write,
                                       NULL);
         if (err != CO_ERROR_NONE) {
             return err;
@@ -450,11 +754,11 @@ static co_error_t co_register_builtin_od(co_node_t *node)
             err = co_od_register_internal(node,
                                           map_idx,
                                           sub,
-                                          (uint8_t *)&node->tpdo_mapping[i][sub - 1U],
+                                          (uint8_t *)&node->tpdo_cfg[i].mapping_raw[sub - 1U],
                                           sizeof(uint32_t),
                                           CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
                                           NULL,
-                                          NULL,
+                                          co_on_pdo_mapping_entry_write,
                                           NULL);
             if (err != CO_ERROR_NONE) {
                 return err;
@@ -490,14 +794,20 @@ static void co_restore_default_comm_objects(co_node_t *node)
     node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
     node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
 
-    node->rpdo_map[0] = CO_COB_RPDO1_BASE + node->node_id;
-    node->rpdo_map[1] = CO_COB_RPDO2_BASE + node->node_id;
-    node->rpdo_map[2] = CO_COB_RPDO3_BASE + node->node_id;
-    node->rpdo_map[3] = CO_COB_RPDO4_BASE + node->node_id;
-    node->tpdo_map[0] = CO_COB_TPDO1_BASE + node->node_id;
-    node->tpdo_map[1] = CO_COB_TPDO2_BASE + node->node_id;
-    node->tpdo_map[2] = CO_COB_TPDO3_BASE + node->node_id;
-    node->tpdo_map[3] = CO_COB_TPDO4_BASE + node->node_id;
+    for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
+        node->rpdo_cfg[i].cob_id.can_id = (CO_COB_RPDO1_BASE + ((uint32_t)i * 0x100U) + node->node_id);
+        node->rpdo_cfg[i].cob_id.valid = true;
+        node->rpdo_cfg[i].cob_id.rtr_allowed = false;
+        node->rpdo_cfg[i].cob_id.extended = false;
+        node->rpdo_cfg[i].cob_id_raw = co_encode_pdo_cob_id(&node->rpdo_cfg[i].cob_id);
+    }
+    for (uint8_t i = 0; i < CO_MAX_TPDO; ++i) {
+        node->tpdo_cfg[i].cob_id.can_id = (CO_COB_TPDO1_BASE + ((uint32_t)i * 0x100U) + node->node_id);
+        node->tpdo_cfg[i].cob_id.valid = true;
+        node->tpdo_cfg[i].cob_id.rtr_allowed = false;
+        node->tpdo_cfg[i].cob_id.extended = false;
+        node->tpdo_cfg[i].cob_id_raw = co_encode_pdo_cob_id(&node->tpdo_cfg[i].cob_id);
+    }
 }
 
 static void co_schedule_bootup(co_node_t *node)
@@ -1167,9 +1477,96 @@ co_error_t co_process(co_node_t *node)
     return CO_ERROR_NONE;
 }
 
+static uint32_t co_rpdo_unpack_to_od(co_node_t *node, uint8_t rpdo_num, const co_can_frame_t *frame)
+{
+    if (!node || !frame || rpdo_num >= CO_MAX_RPDO) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+
+    co_pdo_cfg_t *cfg = &node->rpdo_cfg[rpdo_num];
+    uint32_t bit_offset = 0U;
+    for (uint8_t i = 0; i < cfg->map_count; ++i) {
+        const co_pdo_map_entry_t *map = &cfg->mapping[i];
+        if (map->bit_length == 0U) {
+            continue;
+        }
+
+        co_od_entry_t *entry = co_od_find(node, map->index, map->subindex);
+        if (!entry || (entry->access & CO_OD_ACCESS_WRITE) == 0U) {
+            return CO_SDO_ABORT_NO_OBJECT;
+        }
+
+        uint8_t temp[CO_SDO_TRANSFER_BUF_SIZE] = {0};
+        if (entry->size > sizeof(temp)) {
+            return CO_SDO_ABORT_OUT_OF_MEMORY;
+        }
+        memcpy(temp, entry->data, entry->size);
+
+        if (!co_copy_bits(temp,
+                          entry->size * 8U,
+                          0U,
+                          frame->data,
+                          frame->len * 8U,
+                          bit_offset,
+                          map->bit_length)) {
+            return CO_SDO_ABORT_PARAM_LENGTH;
+        }
+
+        const uint32_t write_abort = co_od_write(node, map->index, map->subindex, temp, entry->size);
+        if (write_abort != 0U) {
+            return write_abort;
+        }
+        bit_offset += map->bit_length;
+    }
+    return 0U;
+}
+
+static uint32_t co_tpdo_pack_from_od(co_node_t *node, uint8_t tpdo_num, co_can_frame_t *frame)
+{
+    if (!node || !frame || tpdo_num >= CO_MAX_TPDO) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+
+    co_pdo_cfg_t *cfg = &node->tpdo_cfg[tpdo_num];
+    memset(frame->data, 0, sizeof(frame->data));
+
+    uint32_t bit_offset = 0U;
+    for (uint8_t i = 0; i < cfg->map_count; ++i) {
+        const co_pdo_map_entry_t *map = &cfg->mapping[i];
+        if (map->bit_length == 0U) {
+            continue;
+        }
+
+        uint8_t temp[CO_SDO_TRANSFER_BUF_SIZE] = {0};
+        size_t temp_size = 0U;
+        const uint32_t read_abort =
+            co_od_read(node, map->index, map->subindex, temp, sizeof(temp), &temp_size);
+        if (read_abort != 0U) {
+            return read_abort;
+        }
+
+        if (!co_copy_bits(frame->data,
+                          sizeof(frame->data) * 8U,
+                          bit_offset,
+                          temp,
+                          temp_size * 8U,
+                          0U,
+                          map->bit_length)) {
+            return CO_SDO_ABORT_PARAM_LENGTH;
+        }
+        bit_offset += map->bit_length;
+    }
+
+    frame->len = (uint8_t)((bit_offset + 7U) / 8U);
+    return 0U;
+}
+
 co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
 {
     if (!node || !frame) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+    if (frame->len > 8U) {
         return CO_ERROR_INVALID_ARGS;
     }
 
@@ -1182,10 +1579,12 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
     }
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
-        if (frame->cob_id == node->rpdo_map[i]) {
+        const co_pdo_cfg_t *cfg = &node->rpdo_cfg[i];
+        if (cfg->cob_id.valid && !cfg->cob_id.extended && frame->cob_id == cfg->cob_id.can_id) {
             node->rpdo_data[i].len = frame->len;
             memcpy(node->rpdo_data[i].data, frame->data, frame->len);
-            return CO_ERROR_NONE;
+            const uint32_t abort_code = co_rpdo_unpack_to_od(node, i, frame);
+            return (abort_code == 0U) ? CO_ERROR_NONE : CO_ERROR_SDO_ABORT;
         }
     }
 
@@ -1198,11 +1597,16 @@ co_error_t co_send_tpdo(co_node_t *node, uint8_t tpdo_num)
         return CO_ERROR_INVALID_ARGS;
     }
 
-    co_can_frame_t frame = {
-        .cob_id = node->tpdo_map[tpdo_num],
-        .len = node->tpdo_data[tpdo_num].len
-    };
+    if (!node->tpdo_cfg[tpdo_num].cob_id.valid || node->tpdo_cfg[tpdo_num].cob_id.extended) {
+        return CO_ERROR_INVALID_ARGS;
+    }
 
-    memcpy(frame.data, node->tpdo_data[tpdo_num].data, frame.len);
+    co_can_frame_t frame = {.cob_id = node->tpdo_cfg[tpdo_num].cob_id.can_id, .len = 0U};
+    const uint32_t abort_code = co_tpdo_pack_from_od(node, tpdo_num, &frame);
+    if (abort_code != 0U) {
+        return CO_ERROR_SDO_ABORT;
+    }
+    node->tpdo_data[tpdo_num].len = frame.len;
+    memcpy(node->tpdo_data[tpdo_num].data, frame.data, frame.len);
     return node->iface.send(node->iface.user, &frame);
 }
