@@ -19,6 +19,8 @@
 #define CO_SDO_TIMEOUT_MS 1000U
 #define CO_PDO_COMM_SUB_COUNT 5U
 #define CO_PDO_MAX_BITS 64U
+#define CO_SYNC_COB_ID_PRODUCER_BIT 0x40000000UL
+#define CO_SYNC_COB_ID_INVALID_BIT 0x80000000UL
 
 typedef enum {
     CO_SDO_STATE_IDLE = 0,
@@ -291,6 +293,49 @@ static uint32_t co_on_hb_write(co_node_t *node,
     return 0;
 }
 
+static uint32_t co_on_sync_cob_id_write(co_node_t *node,
+                                        const co_od_entry_t *entry,
+                                        const uint8_t *data,
+                                        size_t size,
+                                        void *user)
+{
+    (void)entry;
+    (void)user;
+    if (size != sizeof(uint32_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+
+    uint32_t raw = 0U;
+    memcpy(&raw, data, sizeof(raw));
+    if ((raw & 0x3FFFF800UL) != 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+
+    node->sync_cob_id_raw = raw;
+    node->sync_cob_id = (uint16_t)(raw & 0x7FFU);
+    node->sync_valid = (raw & CO_SYNC_COB_ID_INVALID_BIT) == 0U;
+    node->sync_producer = (raw & CO_SYNC_COB_ID_PRODUCER_BIT) != 0U;
+    return 0U;
+}
+
+static uint32_t co_on_sync_overflow_write(co_node_t *node,
+                                          const co_od_entry_t *entry,
+                                          const uint8_t *data,
+                                          size_t size,
+                                          void *user)
+{
+    (void)entry;
+    (void)user;
+    if (size != sizeof(uint8_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    node->sync_overflow = data[0];
+    if (node->sync_overflow > 0U && node->sync_counter > node->sync_overflow) {
+        node->sync_counter = 1U;
+    }
+    return 0U;
+}
+
 static co_pdo_cfg_t *co_get_pdo_cfg(co_node_t *node, uint16_t index)
 {
     if (index >= 0x1400U && index < (0x1400U + CO_MAX_RPDO)) {
@@ -437,6 +482,13 @@ static co_error_t co_register_builtin_od(co_node_t *node)
     node->sdo_server_sub_count = 2U;
     node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
     node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
+    node->sync_cob_id = CO_COB_SYNC;
+    node->sync_cob_id_raw = node->sync_cob_id;
+    node->sync_valid = true;
+    node->sync_producer = false;
+    node->sync_cycle_period_us = 0U;
+    node->sync_overflow = 0U;
+    node->sync_counter = 0U;
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
         node->pdo_comm_sub_count[i] = CO_PDO_COMM_SUB_COUNT;
@@ -487,6 +539,45 @@ static co_error_t co_register_builtin_od(co_node_t *node)
                                   CO_OD_ACCESS_READ,
                                   NULL,
                                   NULL,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    err = co_od_register_internal(node,
+                                  0x1005,
+                                  0x00,
+                                  (uint8_t *)&node->sync_cob_id_raw,
+                                  sizeof(node->sync_cob_id_raw),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  co_on_sync_cob_id_write,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    err = co_od_register_internal(node,
+                                  0x1006,
+                                  0x00,
+                                  (uint8_t *)&node->sync_cycle_period_us,
+                                  sizeof(node->sync_cycle_period_us),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  NULL,
+                                  NULL);
+    if (err != CO_ERROR_NONE) {
+        return err;
+    }
+
+    err = co_od_register_internal(node,
+                                  0x1019,
+                                  0x00,
+                                  &node->sync_overflow,
+                                  sizeof(node->sync_overflow),
+                                  CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE,
+                                  NULL,
+                                  co_on_sync_overflow_write,
                                   NULL);
     if (err != CO_ERROR_NONE) {
         return err;
@@ -815,6 +906,14 @@ static void co_schedule_bootup(co_node_t *node)
     node->nmt_state = CO_NMT_INITIALIZING;
     node->bootup_pending = true;
     node->last_heartbeat_ms = 0U;
+    node->sync_event_pending = false;
+    node->sync_last_timestamp_ms = 0U;
+    node->sync_timebase_ms = 0U;
+    node->sync_last_produced_ms = 0U;
+    node->sync_counter = 0U;
+    memset(node->tpdo_sync_tick, 0, sizeof(node->tpdo_sync_tick));
+    memset(node->tpdo_last_tx_ms, 0, sizeof(node->tpdo_last_tx_ms));
+    memset(node->tpdo_last_event_ms, 0, sizeof(node->tpdo_last_event_ms));
 }
 
 static void co_on_reset_communication(co_node_t *node)
@@ -1439,6 +1538,33 @@ co_error_t co_process(co_node_t *node)
     }
 
     const uint32_t now = node->iface.millis(node->iface.user);
+    bool sync_event = node->sync_event_pending;
+    node->sync_event_pending = false;
+
+    if (node->sync_valid && node->sync_producer && node->sync_cycle_period_us > 0U) {
+        const uint32_t sync_period_ms = (node->sync_cycle_period_us + 999U) / 1000U;
+        if ((now - node->sync_last_produced_ms) >= sync_period_ms) {
+            co_can_frame_t sync_frame = {.cob_id = node->sync_cob_id, .len = 0U};
+            if (node->sync_overflow > 0U) {
+                node->sync_counter = (uint8_t)(node->sync_counter + 1U);
+                if (node->sync_counter == 0U || node->sync_counter > node->sync_overflow) {
+                    node->sync_counter = 1U;
+                }
+                sync_frame.len = 1U;
+                sync_frame.data[0] = node->sync_counter;
+            }
+            const co_error_t err = node->iface.send(node->iface.user, &sync_frame);
+            if (err != CO_ERROR_NONE) {
+                return err;
+            }
+            if (node->sync_last_timestamp_ms != 0U) {
+                node->sync_timebase_ms = now - node->sync_last_timestamp_ms;
+            }
+            node->sync_last_timestamp_ms = now;
+            node->sync_last_produced_ms = now;
+            sync_event = true;
+        }
+    }
     for (size_t ch = 0; ch < CO_SDO_CHANNELS; ++ch) {
         if (node->sdo_channels[ch].state == CO_SDO_STATE_IDLE) {
             continue;
@@ -1464,6 +1590,41 @@ co_error_t co_process(co_node_t *node)
         node->bootup_pending = false;
         node->last_heartbeat_ms = now;
         return CO_ERROR_NONE;
+    }
+
+    if (node->nmt_state == CO_NMT_OPERATIONAL) {
+        for (uint8_t i = 0; i < CO_MAX_TPDO; ++i) {
+            co_pdo_cfg_t *cfg = &node->tpdo_cfg[i];
+            if (!cfg->cob_id.valid || cfg->cob_id.extended || cfg->map_count == 0U) {
+                continue;
+            }
+
+            const uint32_t inhibit_ms = (uint32_t)((cfg->inhibit_time_100us + 9U) / 10U);
+            const bool inhibit_elapsed = (cfg->inhibit_time_100us == 0U) ||
+                                         ((now - node->tpdo_last_tx_ms[i]) >= inhibit_ms);
+            bool send_tpdo = false;
+
+            if (sync_event && cfg->transmission_type > 0U && cfg->transmission_type <= 240U) {
+                node->tpdo_sync_tick[i] = (uint16_t)(node->tpdo_sync_tick[i] + 1U);
+                if (node->tpdo_sync_tick[i] >= cfg->transmission_type) {
+                    node->tpdo_sync_tick[i] = 0U;
+                    send_tpdo = true;
+                }
+            } else if (cfg->transmission_type >= 254U && cfg->event_timer_ms > 0U) {
+                if ((now - node->tpdo_last_event_ms[i]) >= cfg->event_timer_ms) {
+                    node->tpdo_last_event_ms[i] = now;
+                    send_tpdo = true;
+                }
+            }
+
+            if (send_tpdo && inhibit_elapsed) {
+                const co_error_t err = co_send_tpdo(node, i);
+                if (err != CO_ERROR_NONE) {
+                    return err;
+                }
+                node->tpdo_last_tx_ms[i] = now;
+            }
+        }
     }
 
     if (node->heartbeat_ms == 0U) {
@@ -1576,6 +1737,29 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
 
     if (frame->cob_id == (CO_COB_SDO_RX_BASE + node->node_id)) {
         return co_process_sdo(node, frame);
+    }
+
+    if (node->sync_valid && !node->sync_producer && frame->cob_id == node->sync_cob_id) {
+        const uint32_t now = node->iface.millis ? node->iface.millis(node->iface.user) : 0U;
+        if (frame->len > 1U) {
+            return CO_ERROR_INVALID_ARGS;
+        }
+
+        if (frame->len == 1U) {
+            node->sync_counter = frame->data[0];
+        } else {
+            node->sync_counter = (uint8_t)(node->sync_counter + 1U);
+            if (node->sync_overflow > 0U && (node->sync_counter == 0U || node->sync_counter > node->sync_overflow)) {
+                node->sync_counter = 1U;
+            }
+        }
+
+        if (node->sync_last_timestamp_ms != 0U) {
+            node->sync_timebase_ms = now - node->sync_last_timestamp_ms;
+        }
+        node->sync_last_timestamp_ms = now;
+        node->sync_event_pending = true;
+        return CO_ERROR_NONE;
     }
 
     for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
