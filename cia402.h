@@ -1,6 +1,7 @@
 #ifndef CIA402_H
 #define CIA402_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct co_node;
@@ -33,6 +34,12 @@ typedef struct {
     int32_t position_actual;
     int32_t velocity_actual;
     int16_t torque_actual;
+    uint16_t quick_stop_option_code;
+    bool warning;
+    bool remote;
+    bool target_reached;
+    bool internal_limit_active;
+    bool fault_reaction_complete;
     co_node_t *node;
 } cia402_axis_t;
 
