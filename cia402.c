@@ -609,6 +609,70 @@ static uint32_t cia402_on_write_quick_stop_deceleration(co_node_t *node,
     return 0U;
 }
 
+static uint32_t cia402_on_write_quick_stop_option_code(co_node_t *node,
+                                                       const co_od_entry_t *entry,
+                                                       const uint8_t *data,
+                                                       size_t size,
+                                                       void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user || !data || size != sizeof(uint16_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    uint16_t value = 0U;
+    memcpy(&value, data, sizeof(value));
+    /* CiA 402 valid quick-stop option codes: 0, 1, 2, 5, 6 */
+    if (value != 0U && value != 1U && value != 2U && value != 5U && value != 6U) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    axis->quick_stop_option_code = value;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_velocity_window(co_node_t *node,
+                                                const co_od_entry_t *entry,
+                                                const uint8_t *data,
+                                                size_t size,
+                                                void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint32_t value = 0U;
+    uint32_t abort_code = cia402_parse_u32(data, size, &value);
+    if (abort_code != 0U) {
+        return abort_code;
+    }
+    axis->velocity_window = value;
+    axis->velocity_window_valid = true;
+    axis->velocity_window_entered_ms = 0U;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_velocity_window_time(co_node_t *node,
+                                                     const co_od_entry_t *entry,
+                                                     const uint8_t *data,
+                                                     size_t size,
+                                                     void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user || !data || size != sizeof(uint16_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    uint16_t value = 0U;
+    memcpy(&value, data, sizeof(value));
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    axis->velocity_window_time = value;
+    axis->velocity_window_entered_ms = 0U;
+    return 0U;
+}
+
 static bool cia402_tpdo_maps_feedback(const co_node_t *node, uint8_t tpdo_num)
 {
     const co_pdo_cfg_t *cfg = &node->tpdo_cfg[tpdo_num];
@@ -842,6 +906,39 @@ void cia402_bind_od(cia402_axis_t *axis, co_node_t *node)
                        NULL,
                        axis);
 
+    /* 0x605A Quick Stop Option Code (R/W) */
+    (void)co_od_add_ex(node,
+                       0x605AU,
+                       0x00U,
+                       (uint8_t *)&axis->quick_stop_option_code,
+                       sizeof(axis->quick_stop_option_code),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_quick_stop_option_code,
+                       axis);
+
+    /* 0x606D Velocity Window (R/W) — for target-reached detection */
+    (void)co_od_add_ex(node,
+                       0x606DU,
+                       0x00U,
+                       (uint8_t *)&axis->velocity_window,
+                       sizeof(axis->velocity_window),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_velocity_window,
+                       axis);
+
+    /* 0x606E Velocity Window Time (R/W, ms) */
+    (void)co_od_add_ex(node,
+                       0x606EU,
+                       0x00U,
+                       (uint8_t *)&axis->velocity_window_time,
+                       sizeof(axis->velocity_window_time),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_velocity_window_time,
+                       axis);
+
     co_set_hooks(node, cia402_on_rpdo_mapped_write, cia402_on_tpdo_pre_tx, axis);
 }
 
@@ -901,10 +998,42 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
         axis->internal_limit_active = false;
         axis->diag_precondition_mask = 0U;
         axis->fault_reaction_complete = false;
+        axis->target_reached = false;
+        axis->velocity_window_entered_ms = 0U;
     }
 
     cia402_update_statusword(axis);
     cia402_sync_fault_to_canopen(axis);
+}
+
+/* Update target_reached for Profile Velocity mode via velocity window (0x606D/E). */
+static void cia402_update_velocity_target_reached(cia402_axis_t *axis)
+{
+    if (axis->state != CIA402_OPERATION_ENABLED) {
+        return;
+    }
+    if ((cia402_mode_t)axis->mode_of_operation != CIA402_MODE_PROFILE_VELOCITY) {
+        return;
+    }
+    if (!axis->velocity_window_valid) {
+        return;
+    }
+
+    int32_t error = axis->velocity_actual - axis->target_velocity;
+    uint32_t abs_error = (error < 0) ? (uint32_t)(-error) : (uint32_t)error;
+
+    if (abs_error <= axis->velocity_window) {
+        uint32_t now_ms = (axis->node && axis->node->iface.millis)
+                          ? axis->node->iface.millis(axis->node->iface.user) : 0U;
+        if (axis->velocity_window_entered_ms == 0U) {
+            axis->velocity_window_entered_ms = now_ms;
+        } else if ((now_ms - axis->velocity_window_entered_ms) >= axis->velocity_window_time) {
+            axis->target_reached = true;
+        }
+    } else {
+        axis->velocity_window_entered_ms = 0U;
+        axis->target_reached = false;
+    }
 }
 
 void cia402_step(cia402_axis_t *axis)
@@ -914,6 +1043,8 @@ void cia402_step(cia402_axis_t *axis)
     }
 
     (void)cia402_dispatch_mode_handler(axis);
+
+    cia402_update_velocity_target_reached(axis);
 
     if ((axis->state == CIA402_QUICK_STOP) && !axis->quick_stop_reaction_complete) {
         if (axis->app && axis->app->on_quick_stop_reaction_check) {

@@ -82,6 +82,9 @@ struct cia402_axis {
     bool remote;
     bool target_reached;
     bool internal_limit_active;
+    uint32_t velocity_window;           /* 0x606D: window for target-reached (same unit as velocity) */
+    uint16_t velocity_window_time;      /* 0x606E: time velocity must stay in window (ms) */
+    uint32_t velocity_window_entered_ms;/* internal: timestamp when window was entered */
     bool quick_stop_reaction_complete;
     bool fault_reaction_complete;
     bool target_position_valid;
@@ -91,6 +94,7 @@ struct cia402_axis {
     bool profile_acceleration_valid;
     bool profile_deceleration_valid;
     bool quick_stop_deceleration_valid;
+    bool velocity_window_valid;
     co_node_t *node;
     uint8_t fault_msef;
     uint16_t fault_code;
