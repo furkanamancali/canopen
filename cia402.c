@@ -10,8 +10,7 @@ typedef enum {
     CIA402_CMD_NONE = 0,
     CIA402_CMD_DISABLE_VOLTAGE,
     CIA402_CMD_SHUTDOWN,
-    CIA402_CMD_SWITCH_ON,
-    CIA402_CMD_DISABLE_OPERATION,
+    CIA402_CMD_SWITCH_ON,   /* also decoded for "Disable operation" (same bit pattern 0x0007) */
     CIA402_CMD_ENABLE_OPERATION,
     CIA402_CMD_QUICK_STOP,
     CIA402_CMD_FAULT_RESET
@@ -32,7 +31,7 @@ static const cia402_transition_t g_cia402_transitions[] = {
     { CIA402_SWITCHED_ON, CIA402_CMD_DISABLE_VOLTAGE, CIA402_SWITCH_ON_DISABLED },
     { CIA402_SWITCHED_ON, CIA402_CMD_ENABLE_OPERATION, CIA402_OPERATION_ENABLED },
     { CIA402_SWITCHED_ON, CIA402_CMD_QUICK_STOP, CIA402_SWITCH_ON_DISABLED },
-    { CIA402_OPERATION_ENABLED, CIA402_CMD_DISABLE_OPERATION, CIA402_SWITCHED_ON },
+    { CIA402_OPERATION_ENABLED, CIA402_CMD_SWITCH_ON, CIA402_SWITCHED_ON },
     { CIA402_OPERATION_ENABLED, CIA402_CMD_SHUTDOWN, CIA402_READY_TO_SWITCH_ON },
     { CIA402_OPERATION_ENABLED, CIA402_CMD_DISABLE_VOLTAGE, CIA402_SWITCH_ON_DISABLED },
     { CIA402_OPERATION_ENABLED, CIA402_CMD_QUICK_STOP, CIA402_QUICK_STOP },
@@ -54,7 +53,6 @@ enum {
     CIA402_DIAG_REQ_PROFILE_VELOCITY = 1UL << 3,
     CIA402_DIAG_REQ_PROFILE_ACCEL = 1UL << 4,
     CIA402_DIAG_REQ_PROFILE_DECEL = 1UL << 5,
-    CIA402_DIAG_REQ_QUICK_STOP_DECEL = 1UL << 6,
     CIA402_DIAG_RANGE_TARGET_VELOCITY = 1UL << 16,
     CIA402_DIAG_RANGE_PROFILE_ACCEL = 1UL << 17,
     CIA402_DIAG_RANGE_PROFILE_DECEL = 1UL << 18,
@@ -308,9 +306,11 @@ static bool cia402_check_mode_preconditions(cia402_axis_t *axis)
         issues |= CIA402_DIAG_RANGE_QUICK_STOP_DECEL;
     }
 
-    if ((axis->state == CIA402_QUICK_STOP) && !axis->quick_stop_deceleration_valid) {
-        issues |= CIA402_DIAG_REQ_QUICK_STOP_DECEL;
-    }
+    /* Note: CIA402_DIAG_REQ_QUICK_STOP_DECEL is intentionally not checked here.
+     * This function is only called from cia402_dispatch_mode_handler(), which
+     * returns early unless state == OPERATION_ENABLED, so the QUICK_STOP branch
+     * could never be reached.  Quick-stop deceleration is validated in
+     * cia402_step() via on_quick_stop_reaction_check. */
 
     axis->diag_precondition_mask = issues;
     return (issues == 0U);
@@ -518,7 +518,7 @@ static uint32_t cia402_on_write_profile_velocity(co_node_t *node,
         return abort_code;
     }
     if (value == 0U) {
-        return CO_SDO_ABORT_PARAM_TOO_LOW;
+        return CO_SDO_ABORT_VALUE_TOO_LOW;
     }
     axis->profile_velocity = value;
     axis->profile_velocity_valid = true;
@@ -543,10 +543,10 @@ static uint32_t cia402_on_write_profile_acceleration(co_node_t *node,
         return abort_code;
     }
     if (value == 0U) {
-        return CO_SDO_ABORT_PARAM_TOO_LOW;
+        return CO_SDO_ABORT_VALUE_TOO_LOW;
     }
     if (value > CIA402_MAX_ACCEL_DECEL) {
-        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+        return CO_SDO_ABORT_VALUE_TOO_HIGH;
     }
     axis->profile_acceleration = value;
     axis->profile_acceleration_valid = true;
@@ -571,10 +571,10 @@ static uint32_t cia402_on_write_profile_deceleration(co_node_t *node,
         return abort_code;
     }
     if (value == 0U) {
-        return CO_SDO_ABORT_PARAM_TOO_LOW;
+        return CO_SDO_ABORT_VALUE_TOO_LOW;
     }
     if (value > CIA402_MAX_ACCEL_DECEL) {
-        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+        return CO_SDO_ABORT_VALUE_TOO_HIGH;
     }
     axis->profile_deceleration = value;
     axis->profile_deceleration_valid = true;
@@ -599,10 +599,10 @@ static uint32_t cia402_on_write_quick_stop_deceleration(co_node_t *node,
         return abort_code;
     }
     if (value == 0U) {
-        return CO_SDO_ABORT_PARAM_TOO_LOW;
+        return CO_SDO_ABORT_VALUE_TOO_LOW;
     }
     if (value > CIA402_MAX_ACCEL_DECEL) {
-        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+        return CO_SDO_ABORT_VALUE_TOO_HIGH;
     }
     axis->quick_stop_deceleration = value;
     axis->quick_stop_deceleration_valid = true;
@@ -650,7 +650,7 @@ static uint32_t cia402_on_write_velocity_window(co_node_t *node,
     }
     axis->velocity_window = value;
     axis->velocity_window_valid = true;
-    axis->velocity_window_entered_ms = 0U;
+    axis->velocity_window_active = false;
     return 0U;
 }
 
@@ -669,7 +669,7 @@ static uint32_t cia402_on_write_velocity_window_time(co_node_t *node,
     memcpy(&value, data, sizeof(value));
     cia402_axis_t *axis = (cia402_axis_t *)user;
     axis->velocity_window_time = value;
-    axis->velocity_window_entered_ms = 0U;
+    axis->velocity_window_active = false;
     return 0U;
 }
 
@@ -714,8 +714,16 @@ static void cia402_on_tpdo_pre_tx(co_node_t *node, uint8_t tpdo_num, void *user)
         return;
     }
 
+    /* Refresh feedback snapshot and recompute statusword so the TPDO carries
+     * the latest data.  Do NOT call cia402_step() here — that would run the
+     * mode handler as a hidden side-effect of TPDO transmission and could
+     * double-step the state machine when the application's sync handler also
+     * calls cia402_step(). */
     cia402_axis_t *axis = (cia402_axis_t *)user;
-    cia402_step(axis);
+    if (axis->app && axis->app->on_feedback) {
+        axis->app->on_feedback(axis, axis->mode_of_operation, axis->app->user);
+    }
+    cia402_update_statusword(axis);
 }
 
 void cia402_init(cia402_axis_t *axis)
@@ -991,6 +999,15 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
     if (axis->state != CIA402_QUICK_STOP) {
         axis->quick_stop_reaction_complete = false;
     }
+
+    /* Clear target_reached and velocity-window state whenever the drive leaves
+     * OPERATION_ENABLED, so stale bits do not persist in the statusword. */
+    if ((previous_state == CIA402_OPERATION_ENABLED) &&
+        (axis->state != CIA402_OPERATION_ENABLED)) {
+        axis->target_reached = false;
+        axis->velocity_window_active = false;
+    }
+
     if ((command == CIA402_CMD_FAULT_RESET) && (axis->state == CIA402_SWITCH_ON_DISABLED)) {
         axis->fault_msef = 0U;
         axis->fault_code = 0U;
@@ -999,7 +1016,7 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
         axis->diag_precondition_mask = 0U;
         axis->fault_reaction_complete = false;
         axis->target_reached = false;
-        axis->velocity_window_entered_ms = 0U;
+        axis->velocity_window_active = false;
     }
 
     cia402_update_statusword(axis);
@@ -1023,15 +1040,21 @@ static void cia402_update_velocity_target_reached(cia402_axis_t *axis)
     uint32_t abs_error = (error < 0) ? (uint32_t)(-error) : (uint32_t)error;
 
     if (abs_error <= axis->velocity_window) {
-        uint32_t now_ms = (axis->node && axis->node->iface.millis)
-                          ? axis->node->iface.millis(axis->node->iface.user) : 0U;
-        if (axis->velocity_window_entered_ms == 0U) {
-            axis->velocity_window_entered_ms = now_ms;
-        } else if ((now_ms - axis->velocity_window_entered_ms) >= axis->velocity_window_time) {
-            axis->target_reached = true;
+        if (!axis->velocity_window_active) {
+            /* Just entered the window — record timestamp and start settle timer. */
+            axis->velocity_window_active = true;
+            axis->velocity_window_entered_ms = (axis->node && axis->node->iface.millis)
+                                               ? axis->node->iface.millis(axis->node->iface.user)
+                                               : 0U;
+        } else {
+            uint32_t now_ms = (axis->node && axis->node->iface.millis)
+                              ? axis->node->iface.millis(axis->node->iface.user) : 0U;
+            if ((now_ms - axis->velocity_window_entered_ms) >= axis->velocity_window_time) {
+                axis->target_reached = true;
+            }
         }
     } else {
-        axis->velocity_window_entered_ms = 0U;
+        axis->velocity_window_active = false;
         axis->target_reached = false;
     }
 }
@@ -1042,7 +1065,16 @@ void cia402_step(cia402_axis_t *axis)
         axis->app->on_feedback(axis, axis->mode_of_operation, axis->app->user);
     }
 
+    const cia402_state_t state_before_dispatch = axis->state;
     (void)cia402_dispatch_mode_handler(axis);
+
+    /* cia402_dispatch_mode_handler() can enter FAULT_REACTION_ACTIVE on a
+     * precondition failure.  Clear target status if we just left OPERATION_ENABLED. */
+    if ((state_before_dispatch == CIA402_OPERATION_ENABLED) &&
+        (axis->state != CIA402_OPERATION_ENABLED)) {
+        axis->target_reached = false;
+        axis->velocity_window_active = false;
+    }
 
     cia402_update_velocity_target_reached(axis);
 

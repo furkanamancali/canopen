@@ -314,37 +314,35 @@ void app_canopen_init(void)
 void app_main_loop(void)
 {
     for (;;) {
-        /* Keep SDO / NMT / heartbeat protocol responsive on every iteration. */
+        /* 1. Drain the FDCAN RX FIFO.  This may set sync_event_pending. */
         co_stm32_poll_rx(&canopen_node, &hfdcan1);
-        co_process(&canopen_node);
 
-        /* Control update is locked to the 1 ms SYNC edge. */
-        if (!canopen_node.sync_event_pending) {
-            continue;
-        }
-        canopen_node.sync_event_pending = false;
-
-        /*
-         * cia402_step() internally calls:
-         *   1. erob_on_feedback   — snapshot position/velocity/torque from hw
-         *   2. cia402_dispatch_mode_handler → erob_on_profile_velocity (ramp step)
-         *   3. cia402_update_velocity_target_reached — set target_reached bit
-         *   4. cia402_update_statusword + cia402_sync_fault_to_canopen
+        /* 2. On each SYNC edge: run the CiA 402 state machine BEFORE
+         *    co_process() so that all OD values (statusword, velocity actual,
+         *    position actual) are up-to-date when co_process() auto-transmits
+         *    the TPDOs.
          *
-         * Controlword transitions are handled automatically via RPDO hook
-         * (cia402_on_rpdo_mapped_write) when RPDO1 arrives, so no explicit
-         * cia402_apply_controlword() call is needed in the loop.
+         *    Controlword transitions are handled automatically via the RPDO
+         *    hook (cia402_on_rpdo_mapped_write) when RPDO1 arrives, so no
+         *    explicit cia402_apply_controlword() call is needed here.
          */
-        cia402_step(&axis);
+        if (canopen_node.sync_event_pending) {
+            canopen_node.sync_event_pending = false;
 
-        /* Propagate hardware inverter faults to the CANopen EMCY service. */
-        fault_monitor_step();
+            cia402_step(&axis);
+            fault_monitor_step();
 
-        /* When not enabled, ensure the inverter output is zeroed. */
-        if (axis.state != CIA402_OPERATION_ENABLED &&
-            axis.state != CIA402_QUICK_STOP) {
-            g_ramp.commanded_rpm = 0;
-            /* TODO: de-assert motor inverter enable / STO line. */
+            /* When not enabled, zero the inverter output. */
+            if (axis.state != CIA402_OPERATION_ENABLED &&
+                axis.state != CIA402_QUICK_STOP) {
+                g_ramp.commanded_rpm = 0;
+                /* TODO: de-assert motor inverter enable / STO line. */
+            }
         }
+
+        /* 3. Run the CANopen protocol stack: SDO server, heartbeat, TPDO
+         *    auto-transmission (TPDO data is now fresh from cia402_step above),
+         *    NMT processing, SDO timeouts, SYNC production if producer mode. */
+        co_process(&canopen_node);
     }
 }

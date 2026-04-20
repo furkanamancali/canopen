@@ -30,9 +30,14 @@ extern "C" {
 #define CO_SDO_ABORT_WRITEONLY 0x06010001UL
 #define CO_SDO_ABORT_NO_OBJECT 0x06020000UL
 #define CO_SDO_ABORT_NO_SUBINDEX 0x06090011UL
+/* Data-type / length mismatch codes (0x0607xxxx) */
 #define CO_SDO_ABORT_PARAM_LENGTH 0x06070010UL
 #define CO_SDO_ABORT_PARAM_TOO_HIGH 0x06070012UL
 #define CO_SDO_ABORT_PARAM_TOO_LOW 0x06070013UL
+/* Value-range codes (0x0609xxxx) — use these for out-of-range parameter values */
+#define CO_SDO_ABORT_VALUE_RANGE    0x06090030UL
+#define CO_SDO_ABORT_VALUE_TOO_HIGH 0x06090031UL
+#define CO_SDO_ABORT_VALUE_TOO_LOW  0x06090032UL
 
 typedef enum {
     CO_NMT_INITIALIZING = 0,
@@ -201,7 +206,8 @@ struct co_node {
     uint8_t sync_overflow;
     bool sync_valid;
     bool sync_producer;
-    bool sync_event_pending;
+    bool sync_event_pending;   /* sticky flag for application — cleared by caller */
+    bool sync_tpdo_pending;    /* internal: cleared by co_process() after TPDO scheduling */
 
     uint32_t device_type;
     uint8_t error_register;
@@ -214,7 +220,7 @@ struct co_node {
         uint8_t reg_bits;
         uint16_t emcy_code;
         uint8_t msef;
-        uint8_t mfg_data[5];
+        uint8_t mfg_data[4];   /* bytes 4-7 of EMCY frame; msef occupies byte 3 */
     } faults[CO_EMCY_FAULT_SLOTS];
     uint8_t identity_sub_count;
     uint32_t identity[4];
@@ -289,11 +295,11 @@ co_error_t co_fault_raise(co_node_t *node,
                           uint16_t emcy_code,
                           uint8_t error_register_bits,
                           uint8_t msef,
-                          const uint8_t mfg_data[5]);
+                          const uint8_t mfg_data[4]);
 co_error_t co_fault_clear(co_node_t *node,
                           uint8_t fault_id,
                           uint8_t msef,
-                          const uint8_t mfg_data[5]);
+                          const uint8_t mfg_data[4]);
 void co_fault_clear_all(co_node_t *node);
 
 #ifdef __cplusplus

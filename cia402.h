@@ -82,9 +82,10 @@ struct cia402_axis {
     bool remote;
     bool target_reached;
     bool internal_limit_active;
-    uint32_t velocity_window;           /* 0x606D: window for target-reached (same unit as velocity) */
-    uint16_t velocity_window_time;      /* 0x606E: time velocity must stay in window (ms) */
-    uint32_t velocity_window_entered_ms;/* internal: timestamp when window was entered */
+    uint32_t velocity_window;            /* 0x606D: window for target-reached (same unit as velocity) */
+    uint16_t velocity_window_time;       /* 0x606E: time velocity must stay in window (ms) */
+    uint32_t velocity_window_entered_ms; /* internal: millis() timestamp when window was entered */
+    bool velocity_window_active;         /* true while velocity is inside the window */
     bool quick_stop_reaction_complete;
     bool fault_reaction_complete;
     bool target_position_valid;

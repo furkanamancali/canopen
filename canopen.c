@@ -230,7 +230,7 @@ static void co_predef_error_push(co_node_t *node, uint16_t emcy_code, uint8_t ms
     }
 }
 
-static co_error_t co_send_emcy(co_node_t *node, uint16_t emcy_code, uint8_t msef, const uint8_t mfg_data[5])
+static co_error_t co_send_emcy(co_node_t *node, uint16_t emcy_code, uint8_t msef, const uint8_t mfg_data[4])
 {
     if (!node || !node->iface.send || !node->emcy_valid) {
         return CO_ERROR_NONE;
@@ -244,7 +244,7 @@ static co_error_t co_send_emcy(co_node_t *node, uint16_t emcy_code, uint8_t msef
     frame.data[2] = node->error_register;
     frame.data[3] = msef;
     if (mfg_data) {
-        memcpy(&frame.data[4], mfg_data, 4U);
+        memcpy(&frame.data[4], mfg_data, sizeof(node->faults[0].mfg_data));
     }
     return node->iface.send(node->iface.user, &frame);
 }
@@ -1224,6 +1224,7 @@ static void co_schedule_bootup(co_node_t *node)
     node->bootup_pending = true;
     node->last_heartbeat_ms = 0U;
     node->sync_event_pending = false;
+    node->sync_tpdo_pending = false;
     node->sync_last_timestamp_ms = 0U;
     node->sync_timebase_ms = 0U;
     node->sync_last_produced_ms = 0U;
@@ -1824,7 +1825,7 @@ co_error_t co_fault_raise(co_node_t *node,
                           uint16_t emcy_code,
                           uint8_t error_register_bits,
                           uint8_t msef,
-                          const uint8_t mfg_data[5])
+                          const uint8_t mfg_data[4])
 {
     if (!node || fault_id >= CO_EMCY_FAULT_SLOTS || emcy_code == 0U) {
         return CO_ERROR_INVALID_ARGS;
@@ -1852,7 +1853,7 @@ co_error_t co_fault_raise(co_node_t *node,
 co_error_t co_fault_clear(co_node_t *node,
                           uint8_t fault_id,
                           uint8_t msef,
-                          const uint8_t mfg_data[5])
+                          const uint8_t mfg_data[4])
 {
     if (!node || fault_id >= CO_EMCY_FAULT_SLOTS) {
         return CO_ERROR_INVALID_ARGS;
@@ -1931,8 +1932,12 @@ co_error_t co_process(co_node_t *node)
     }
 
     const uint32_t now = node->iface.millis(node->iface.user);
-    bool sync_event = node->sync_event_pending;
-    node->sync_event_pending = false;
+
+    /* sync_tpdo_pending is the internal one-shot flag consumed here for TPDO
+     * scheduling.  sync_event_pending is the sticky application-visible flag
+     * that the caller is responsible for clearing. */
+    bool sync_event = node->sync_tpdo_pending;
+    node->sync_tpdo_pending = false;
 
     if (node->sync_valid && node->sync_producer && node->sync_cycle_period_us > 0U) {
         const uint32_t sync_period_ms = (node->sync_cycle_period_us + 999U) / 1000U;
@@ -1956,6 +1961,7 @@ co_error_t co_process(co_node_t *node)
             node->sync_last_timestamp_ms = now;
             node->sync_last_produced_ms = now;
             sync_event = true;
+            node->sync_event_pending = true;  /* notify application */
         }
     }
     for (size_t ch = 0; ch < CO_SDO_CHANNELS; ++ch) {
@@ -2067,7 +2073,8 @@ static uint32_t co_rpdo_unpack_to_od(co_node_t *node, uint8_t rpdo_num, const co
             return CO_SDO_ABORT_NO_OBJECT;
         }
 
-        uint8_t temp[CO_SDO_TRANSFER_BUF_SIZE] = {0};
+        /* PDO entries are at most CO_PDO_MAX_BITS (64) bits = 8 bytes. */
+        uint8_t temp[CO_PDO_MAX_BITS / 8U] = {0};
         if (entry->size > sizeof(temp)) {
             return CO_SDO_ABORT_OUT_OF_MEMORY;
         }
@@ -2111,7 +2118,8 @@ static uint32_t co_tpdo_pack_from_od(co_node_t *node, uint8_t tpdo_num, co_can_f
             continue;
         }
 
-        uint8_t temp[CO_SDO_TRANSFER_BUF_SIZE] = {0};
+        /* PDO entries are at most CO_PDO_MAX_BITS (64) bits = 8 bytes. */
+        uint8_t temp[CO_PDO_MAX_BITS / 8U] = {0};
         size_t temp_size = 0U;
         const uint32_t read_abort =
             co_od_read(node, map->index, map->subindex, temp, sizeof(temp), &temp_size);
@@ -2176,7 +2184,8 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
             node->sync_timebase_ms = now - node->sync_last_timestamp_ms;
         }
         node->sync_last_timestamp_ms = now;
-        node->sync_event_pending = true;
+        node->sync_event_pending = true;   /* application-visible sticky flag */
+        node->sync_tpdo_pending = true;    /* internal one-shot for TPDO scheduling */
         return CO_ERROR_NONE;
     }
 
@@ -2197,13 +2206,16 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
         return co_hb_consumer_recompute_fault(node);
     }
 
-    for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
-        const co_pdo_cfg_t *cfg = &node->rpdo_cfg[i];
-        if (cfg->cob_id.valid && !cfg->cob_id.extended && frame->cob_id == cfg->cob_id.can_id) {
-            node->rpdo_data[i].len = frame->len;
-            memcpy(node->rpdo_data[i].data, frame->data, frame->len);
-            const uint32_t abort_code = co_rpdo_unpack_to_od(node, i, frame);
-            return (abort_code == 0U) ? CO_ERROR_NONE : CO_ERROR_SDO_ABORT;
+    /* CiA 301 §7.5.2: PDOs shall only be processed in NMT OPERATIONAL state. */
+    if (node->nmt_state == CO_NMT_OPERATIONAL) {
+        for (uint8_t i = 0; i < CO_MAX_RPDO; ++i) {
+            const co_pdo_cfg_t *cfg = &node->rpdo_cfg[i];
+            if (cfg->cob_id.valid && !cfg->cob_id.extended && frame->cob_id == cfg->cob_id.can_id) {
+                node->rpdo_data[i].len = frame->len;
+                memcpy(node->rpdo_data[i].data, frame->data, frame->len);
+                const uint32_t abort_code = co_rpdo_unpack_to_od(node, i, frame);
+                return (abort_code == 0U) ? CO_ERROR_NONE : CO_ERROR_SDO_ABORT;
+            }
         }
     }
 
