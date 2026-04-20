@@ -278,6 +278,6 @@ This compiles `tests_host` from `tests_host.c`, `canopen.c`, and `cia402.c`, the
 - Full CiA 301 certification profile coverage is not claimed (this is a compact starter stack).
 - SDO block transfer edge cases (CRC variants, retransmit corner cases, malformed-frame fuzzing) are not exhaustively tested.
 - TPDO timing matrix is only partially covered in host tests (no exhaustive SYNC type/inhibit/event combinations).
-- Heartbeat consumer / node guarding behavior is not implemented.
+- Heartbeat consumer is implemented, but legacy RTR-based node guarding protocol is not implemented.
 - Advanced CiA 402 operation-mode semantics (trajectory/profile constraints, hardware interlocks, mode-specific diagnostics) remain application-specific.
 - No automated hardware-in-loop conformance run is included.
