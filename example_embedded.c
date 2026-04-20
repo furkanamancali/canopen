@@ -6,27 +6,32 @@
  *
  * PDO layout (eRob profile):
  *
- *   RPDO1  COB-ID 0x200+node_id  (56 bits, SYNC-driven)
+ *   RPDO1  COB-ID 0x200+node_id  (56 bits, SYNC-driven, 0x1400/0x1600)
  *     Bytes 0-1  : Controlword          0x6040:00  16 bits
  *     Byte  2    : Modes of Operation   0x6060:00   8 bits
  *     Bytes 3-6  : Target Velocity      0x60FF:00  32 bits  [RPM, signed]
  *
- *   RPDO2  COB-ID 0x300+node_id  (64 bits, SYNC-driven)
+ *   RPDO2  COB-ID 0x300+node_id  (64 bits, SYNC-driven, 0x1401/0x1601)
  *     Bytes 0-3  : Profile Acceleration 0x6083:00  32 bits  [RPM/s]
  *     Bytes 4-7  : Profile Deceleration 0x6084:00  32 bits  [RPM/s]
  *
- *   TPDO1  COB-ID 0x180+node_id  (56 bits, every SYNC)
+ *   TPDO1  COB-ID 0x180+node_id  (56 bits, every SYNC, 0x1800/0x1A00)
  *     Bytes 0-1  : Statusword           0x6041:00  16 bits
  *     Byte  2    : Mode Display         0x6061:00   8 bits
  *     Bytes 3-6  : Velocity Actual      0x606C:00  32 bits  [RPM, signed]
  *
- *   TPDO2  COB-ID 0x280+node_id  (48 bits, every SYNC)
+ *   TPDO2  COB-ID 0x280+node_id  (48 bits, every SYNC, 0x1801/0x1A01)
  *     Bytes 0-3  : Position Actual      0x6064:00  32 bits  [encoder counts]
  *     Bytes 4-5  : Torque Actual        0x6077:00  16 bits  [0.1 % rated]
  *
  * SYNC period : 1 ms  (producer COB-ID 0x080)
  * Heartbeat   : 100 ms producer; consumer monitors master at node 0x7F, 1 s timeout
  * Node ID     : 0x01  (change EROB_NODE_ID below to match hardware DIP/EEP setting)
+ *
+ * Runtime velocity change:
+ *   Call erob_set_target_velocity(rpm) from any task context to update the
+ *   target velocity on the fly.  The new value takes effect on the next
+ *   cia402_step() — no SDO or RPDO required.
  */
 
 #include "canopen.h"
@@ -51,7 +56,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_DEFAULT_VEL_WIN_MS  50U     /* window settle time [ms]           */
 
 /* ── CANopen stack instances ──────────────────────────────────────────────── */
-static co_node_t    canopen_node;
+static co_node_t      canopen_node;
 static co_stm32_ctx_t can_ctx;
 static cia402_axis_t  axis;
 
@@ -216,6 +221,24 @@ static void fault_monitor_step(void)
     }
 }
 
+/* ── Runtime velocity setter ─────────────────────────────────────────────── */
+
+/*
+ * erob_set_target_velocity() — change the commanded velocity at any time.
+ *
+ * Writes directly to OD entry 0x60FF:00 (Target Velocity), which is the same
+ * object that RPDO1 maps.  The new value is clamped to ±EROB_MAX_VEL_RPM by
+ * erob_on_profile_velocity() on the next cia402_step().
+ *
+ * Safe to call from the main task; not ISR-safe (co_od_write is not
+ * re-entrant with co_on_can_rx).
+ */
+void erob_set_target_velocity(int32_t rpm)
+{
+    (void)co_od_write(&canopen_node, 0x60FFU, 0x00U,
+                      (const uint8_t *)&rpm, sizeof(rpm));
+}
+
 /* ── Initialization ──────────────────────────────────────────────────────── */
 void app_canopen_init(void)
 {
@@ -244,7 +267,48 @@ void app_canopen_init(void)
     axis.velocity_window_time         = EROB_DEFAULT_VEL_WIN_MS;
     axis.velocity_window_valid        = true;
 
-    /* 4. PDO mapping — eRob profile layout.
+    /* 4. PDO communication parameters.
+     *
+     * 0x1400/0x1401: RPDO communication — COB-ID and transmission type.
+     * 0x1800/0x1801: TPDO communication — COB-ID and transmission type.
+     *
+     * COB-ID encoding (CiA 301 §7.3.3):
+     *   bit 31 = 0 → PDO valid (enabled)
+     *   bit 30 = 0 → standard 11-bit frame
+     *   bits 0-10  = CAN identifier
+     *
+     * Transmission type 0x01: synchronous, triggered on every SYNC message.
+     */
+
+    /* RPDO1 — COB-ID 0x200 + node_id, sync-triggered (0x1400) */
+    const uint32_t rpdo1_cob_id   = 0x200UL + EROB_NODE_ID;  /* bit31=0: valid */
+    const uint8_t  rpdo1_trans    = 0x01U;
+    (void)co_od_write(&canopen_node, 0x1400U, 0x01U,
+                      (const uint8_t *)&rpdo1_cob_id, sizeof(rpdo1_cob_id));
+    (void)co_od_write(&canopen_node, 0x1400U, 0x02U, &rpdo1_trans, sizeof(rpdo1_trans));
+
+    /* RPDO2 — COB-ID 0x300 + node_id, sync-triggered (0x1401) */
+    const uint32_t rpdo2_cob_id   = 0x300UL + EROB_NODE_ID;
+    const uint8_t  rpdo2_trans    = 0x01U;
+    (void)co_od_write(&canopen_node, 0x1401U, 0x01U,
+                      (const uint8_t *)&rpdo2_cob_id, sizeof(rpdo2_cob_id));
+    (void)co_od_write(&canopen_node, 0x1401U, 0x02U, &rpdo2_trans, sizeof(rpdo2_trans));
+
+    /* TPDO1 — COB-ID 0x180 + node_id, every SYNC (0x1800) */
+    const uint32_t tpdo1_cob_id   = 0x180UL + EROB_NODE_ID;
+    const uint8_t  tpdo1_trans    = 0x01U;
+    (void)co_od_write(&canopen_node, 0x1800U, 0x01U,
+                      (const uint8_t *)&tpdo1_cob_id, sizeof(tpdo1_cob_id));
+    (void)co_od_write(&canopen_node, 0x1800U, 0x02U, &tpdo1_trans, sizeof(tpdo1_trans));
+
+    /* TPDO2 — COB-ID 0x280 + node_id, every SYNC (0x1801) */
+    const uint32_t tpdo2_cob_id   = 0x280UL + EROB_NODE_ID;
+    const uint8_t  tpdo2_trans    = 0x01U;
+    (void)co_od_write(&canopen_node, 0x1801U, 0x01U,
+                      (const uint8_t *)&tpdo2_cob_id, sizeof(tpdo2_cob_id));
+    (void)co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo2_trans, sizeof(tpdo2_trans));
+
+    /* 5. PDO mapping.
      *
      * Encoding: (index << 16) | (subindex << 8) | bit_length
      *
@@ -252,82 +316,99 @@ void app_canopen_init(void)
      * RPDO2 (0x1601): ProfileAccel[32] | ProfileDecel[32]
      * TPDO1 (0x1A00): Statusword[16]  | ModeDisplay[8] | VelocityActual[32]
      * TPDO2 (0x1A01): PositionActual[32] | TorqueActual[16]
+     *
+     * Write sub 0 to 0 first (disable), set entries, then write sub 0 to count
+     * (enable).  This is the required CiA 301 PDO re-mapping sequence.
      */
 
     /* RPDO1 */
     const uint32_t r1m1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
     const uint32_t r1m2 = (0x6060UL << 16) | (0x00UL << 8) |  8UL;
     const uint32_t r1m3 = (0x60FFUL << 16) | (0x00UL << 8) | 32UL;
-    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){0U}, 1U);
-    (void)co_od_write(&canopen_node, 0x1600, 0x01, (const uint8_t *)&r1m1, 4U);
-    (void)co_od_write(&canopen_node, 0x1600, 0x02, (const uint8_t *)&r1m2, 4U);
-    (void)co_od_write(&canopen_node, 0x1600, 0x03, (const uint8_t *)&r1m3, 4U);
-    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){3U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1600U, 0x00U, (const uint8_t[]){0U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1600U, 0x01U, (const uint8_t *)&r1m1, 4U);
+    (void)co_od_write(&canopen_node, 0x1600U, 0x02U, (const uint8_t *)&r1m2, 4U);
+    (void)co_od_write(&canopen_node, 0x1600U, 0x03U, (const uint8_t *)&r1m3, 4U);
+    (void)co_od_write(&canopen_node, 0x1600U, 0x00U, (const uint8_t[]){3U}, 1U);
 
     /* RPDO2 — ramp parameters writable at runtime from master */
     const uint32_t r2m1 = (0x6083UL << 16) | (0x00UL << 8) | 32UL;
     const uint32_t r2m2 = (0x6084UL << 16) | (0x00UL << 8) | 32UL;
-    (void)co_od_write(&canopen_node, 0x1601, 0x00, (const uint8_t[]){0U}, 1U);
-    (void)co_od_write(&canopen_node, 0x1601, 0x01, (const uint8_t *)&r2m1, 4U);
-    (void)co_od_write(&canopen_node, 0x1601, 0x02, (const uint8_t *)&r2m2, 4U);
-    (void)co_od_write(&canopen_node, 0x1601, 0x00, (const uint8_t[]){2U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1601U, 0x00U, (const uint8_t[]){0U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1601U, 0x01U, (const uint8_t *)&r2m1, 4U);
+    (void)co_od_write(&canopen_node, 0x1601U, 0x02U, (const uint8_t *)&r2m2, 4U);
+    (void)co_od_write(&canopen_node, 0x1601U, 0x00U, (const uint8_t[]){2U}, 1U);
 
     /* TPDO1 */
     const uint32_t t1m1 = (0x6041UL << 16) | (0x00UL << 8) | 16UL;
     const uint32_t t1m2 = (0x6061UL << 16) | (0x00UL << 8) |  8UL;
     const uint32_t t1m3 = (0x606CUL << 16) | (0x00UL << 8) | 32UL;
-    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){0U}, 1U);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x01, (const uint8_t *)&t1m1, 4U);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x02, (const uint8_t *)&t1m2, 4U);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x03, (const uint8_t *)&t1m3, 4U);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){3U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1A00U, 0x00U, (const uint8_t[]){0U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1A00U, 0x01U, (const uint8_t *)&t1m1, 4U);
+    (void)co_od_write(&canopen_node, 0x1A00U, 0x02U, (const uint8_t *)&t1m2, 4U);
+    (void)co_od_write(&canopen_node, 0x1A00U, 0x03U, (const uint8_t *)&t1m3, 4U);
+    (void)co_od_write(&canopen_node, 0x1A00U, 0x00U, (const uint8_t[]){3U}, 1U);
 
     /* TPDO2 */
     const uint32_t t2m1 = (0x6064UL << 16) | (0x00UL << 8) | 32UL;
     const uint32_t t2m2 = (0x6077UL << 16) | (0x00UL << 8) | 16UL;
-    (void)co_od_write(&canopen_node, 0x1A01, 0x00, (const uint8_t[]){0U}, 1U);
-    (void)co_od_write(&canopen_node, 0x1A01, 0x01, (const uint8_t *)&t2m1, 4U);
-    (void)co_od_write(&canopen_node, 0x1A01, 0x02, (const uint8_t *)&t2m2, 4U);
-    (void)co_od_write(&canopen_node, 0x1A01, 0x00, (const uint8_t[]){2U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1A01U, 0x00U, (const uint8_t[]){0U}, 1U);
+    (void)co_od_write(&canopen_node, 0x1A01U, 0x01U, (const uint8_t *)&t2m1, 4U);
+    (void)co_od_write(&canopen_node, 0x1A01U, 0x02U, (const uint8_t *)&t2m2, 4U);
+    (void)co_od_write(&canopen_node, 0x1A01U, 0x00U, (const uint8_t[]){2U}, 1U);
 
-    /* 5. SYNC consumer: receive 0x080 at 1 ms; both TPDOs transmit on every SYNC. */
+    /* 6. SYNC consumer: receive 0x080 at 1 ms. */
     const uint32_t sync_cob_id   = 0x00000080UL;
     const uint32_t sync_cycle_us = EROB_SYNC_PERIOD_US;
-    const uint8_t  sync_type     = 1U;  /* transmit on every SYNC event */
-    (void)co_od_write(&canopen_node, 0x1005, 0x00,
+    (void)co_od_write(&canopen_node, 0x1005U, 0x00U,
                       (const uint8_t *)&sync_cob_id,   sizeof(sync_cob_id));
-    (void)co_od_write(&canopen_node, 0x1006, 0x00,
+    (void)co_od_write(&canopen_node, 0x1006U, 0x00U,
                       (const uint8_t *)&sync_cycle_us, sizeof(sync_cycle_us));
-    (void)co_od_write(&canopen_node, 0x1800, 0x02, &sync_type, 1U);  /* TPDO1 */
-    (void)co_od_write(&canopen_node, 0x1801, 0x02, &sync_type, 1U);  /* TPDO2 */
 
-    /* 6. Heartbeat consumer: detect master (0x7F) silence within 1 s. */
+    /* 7. Heartbeat consumer: detect master (0x7F) silence within 1 s. */
     const uint8_t  hb_count  = 1U;
     const uint32_t hb_master = ((uint32_t)EROB_MASTER_NODE_ID << 16)
                                | (uint32_t)EROB_MASTER_HB_TIMEOUT;
-    (void)co_od_write(&canopen_node, 0x1016, 0x00, &hb_count,  1U);
-    (void)co_od_write(&canopen_node, 0x1016, 0x01,
+    (void)co_od_write(&canopen_node, 0x1016U, 0x00U, &hb_count,  1U);
+    (void)co_od_write(&canopen_node, 0x1016U, 0x01U,
                       (const uint8_t *)&hb_master, sizeof(hb_master));
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
+
+/*
+ * Runtime velocity change example.
+ *
+ * g_target_rpm is set by external code (e.g. a higher-level motion planner,
+ * UART command parser, or RTOS task) at any time.  The main loop picks it up
+ * on every SYNC tick and forwards it to the axis via erob_set_target_velocity().
+ *
+ * When the axis is driven exclusively by RPDO1 from the CANopen master this
+ * variable is not needed — the RPDO write callback updates 0x60FF:00 directly.
+ * Both paths share the same OD entry and are therefore interchangeable.
+ */
+volatile int32_t g_target_rpm = 0;   /* set this from anywhere to change speed */
+
 void app_main_loop(void)
 {
     for (;;) {
         /* 1. Drain the FDCAN RX FIFO.  This may set sync_event_pending. */
         co_stm32_poll_rx(&canopen_node, &hfdcan1);
 
-        /* 2. On each SYNC edge: run the CiA 402 state machine BEFORE
-         *    co_process() so that all OD values (statusword, velocity actual,
-         *    position actual) are up-to-date when co_process() auto-transmits
-         *    the TPDOs.
+        /* 2. On each SYNC edge: update target velocity, run the CiA 402 state
+         *    machine, then check for hardware faults.
          *
-         *    Controlword transitions are handled automatically via the RPDO
-         *    hook (cia402_on_rpdo_mapped_write) when RPDO1 arrives, so no
-         *    explicit cia402_apply_controlword() call is needed here.
+         *    cia402_step() must run before co_process() so that all OD values
+         *    (statusword, velocity actual, position actual) are fresh when
+         *    co_process() auto-transmits the TPDOs on the SYNC event.
          */
         if (canopen_node.sync_event_pending) {
             canopen_node.sync_event_pending = false;
+
+            /* Forward the application-side target to the axis.
+             * If the master is also sending RPDO1, whichever write arrived
+             * last wins — both map to the same OD entry 0x60FF:00.          */
+            erob_set_target_velocity(g_target_rpm);
 
             cia402_step(&axis);
             fault_monitor_step();
