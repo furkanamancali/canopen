@@ -13,9 +13,13 @@ extern "C" {
 #define CO_MAX_RPDO 4U
 #define CO_MAX_TPDO 4U
 #define CO_PDO_MAP_ENTRIES 8U
+#define CO_SDO_CHANNELS 1U
+#define CO_SDO_TRANSFER_BUF_SIZE 1024U
 
 #define CO_SDO_ABORT_TOGGLE 0x05030000UL
 #define CO_SDO_ABORT_COMMAND 0x05040001UL
+#define CO_SDO_ABORT_TIMEOUT 0x05040000UL
+#define CO_SDO_ABORT_OUT_OF_MEMORY 0x05040005UL
 #define CO_SDO_ABORT_READONLY 0x06010002UL
 #define CO_SDO_ABORT_WRITEONLY 0x06010001UL
 #define CO_SDO_ABORT_NO_OBJECT 0x06020000UL
@@ -129,6 +133,21 @@ struct co_node {
     uint32_t tpdo_transmission_type[CO_MAX_TPDO];
     uint32_t rpdo_mapping[CO_MAX_RPDO][CO_PDO_MAP_ENTRIES];
     uint32_t tpdo_mapping[CO_MAX_TPDO][CO_PDO_MAP_ENTRIES];
+    struct {
+        uint8_t state;
+        uint8_t mode;
+        uint8_t toggle;
+        uint8_t block_seq;
+        uint8_t block_blksize;
+        uint8_t block_last_sent_seq;
+        uint8_t block_finished;
+        uint16_t index;
+        uint8_t subindex;
+        size_t offset;
+        size_t size;
+        uint32_t last_activity_ms;
+        uint8_t buffer[CO_SDO_TRANSFER_BUF_SIZE];
+    } sdo_channels[CO_SDO_CHANNELS];
 };
 
 void co_init(co_node_t *node, const co_if_t *iface, uint8_t node_id, uint16_t heartbeat_ms);
