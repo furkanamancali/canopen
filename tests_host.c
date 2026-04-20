@@ -573,6 +573,26 @@ static uint16_t expected_statusword(cia402_state_t state)
     return sw;
 }
 
+typedef struct {
+    unsigned profile_velocity_calls;
+    int32_t seen_target_velocity;
+    uint32_t seen_profile_velocity;
+    uint32_t seen_profile_acceleration;
+    uint32_t seen_profile_deceleration;
+} cia402_test_app_ctx_t;
+
+static bool test_on_profile_velocity(cia402_axis_t *axis, void *user)
+{
+    cia402_test_app_ctx_t *ctx = (cia402_test_app_ctx_t *)user;
+    ctx->profile_velocity_calls++;
+    ctx->seen_target_velocity = axis->target_velocity;
+    ctx->seen_profile_velocity = axis->profile_velocity;
+    ctx->seen_profile_acceleration = axis->profile_acceleration;
+    ctx->seen_profile_deceleration = axis->profile_deceleration;
+    axis->target_reached = true;
+    return true;
+}
+
 static int test_cia402_transition_matrix_and_statusword(void)
 {
     co_node_t node;
@@ -627,6 +647,94 @@ static int test_cia402_transition_matrix_and_statusword(void)
     return 0;
 }
 
+static int test_cia402_rpdo_commands_and_preconditions(void)
+{
+    co_node_t node;
+    test_bus_t bus;
+    setup_node(&node, &bus, 0x05, 0);
+    (void)co_process(&node);
+
+    cia402_axis_t axis;
+    cia402_init(&axis);
+    cia402_bind_od(&axis, &node);
+
+    cia402_test_app_ctx_t app_ctx = {0};
+    const cia402_app_if_t app = {
+        .user = &app_ctx,
+        .supported_modes = CIA402_MODE_BIT(CIA402_MODE_PROFILE_VELOCITY),
+        .on_profile_velocity = test_on_profile_velocity,
+    };
+    cia402_set_callbacks(&axis, &app);
+
+    TEST_ASSERT(co_od_write(&node, 0x1600, 0x00, &(uint8_t){0}, 1U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1601, 0x00, &(uint8_t){0}, 1U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1602, 0x00, &(uint8_t){0}, 1U) == 0U);
+
+    const uint32_t rpdo0_cw = (0x6040UL << 16U) | 0x0010UL;
+    const uint32_t rpdo0_mode = (0x6060UL << 16U) | 0x0008UL;
+    const uint32_t rpdo0_tvel = (0x60FFUL << 16U) | 0x0020UL;
+    TEST_ASSERT(co_od_write(&node, 0x1600, 0x01, (const uint8_t *)&rpdo0_cw, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1600, 0x02, (const uint8_t *)&rpdo0_mode, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1600, 0x03, (const uint8_t *)&rpdo0_tvel, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1600, 0x00, &(uint8_t){3}, 1U) == 0U);
+
+    const uint32_t rpdo1_pvel = (0x6081UL << 16U) | 0x0020UL;
+    const uint32_t rpdo1_pacc = (0x6083UL << 16U) | 0x0020UL;
+    TEST_ASSERT(co_od_write(&node, 0x1601, 0x01, (const uint8_t *)&rpdo1_pvel, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1601, 0x02, (const uint8_t *)&rpdo1_pacc, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1601, 0x00, &(uint8_t){2}, 1U) == 0U);
+
+    const uint32_t rpdo2_pdec = (0x6084UL << 16U) | 0x0020UL;
+    TEST_ASSERT(co_od_write(&node, 0x1602, 0x01, (const uint8_t *)&rpdo2_pdec, 4U) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1602, 0x00, &(uint8_t){1}, 1U) == 0U);
+
+    co_can_frame_t rpdo1 = {.cob_id = node.rpdo_cfg[1].cob_id.can_id, .len = 8U};
+    const uint32_t pvel = 6000U;
+    const uint32_t pacc = 1200U;
+    memcpy(&rpdo1.data[0], &pvel, sizeof(pvel));
+    memcpy(&rpdo1.data[4], &pacc, sizeof(pacc));
+    TEST_ASSERT(co_on_can_rx(&node, &rpdo1) == CO_ERROR_NONE);
+
+    co_can_frame_t rpdo2 = {.cob_id = node.rpdo_cfg[2].cob_id.can_id, .len = 4U};
+    const uint32_t pdec = 900U;
+    memcpy(&rpdo2.data[0], &pdec, sizeof(pdec));
+    TEST_ASSERT(co_on_can_rx(&node, &rpdo2) == CO_ERROR_NONE);
+
+    co_can_frame_t rpdo0 = {.cob_id = node.rpdo_cfg[0].cob_id.can_id, .len = 7U};
+    const int8_t mode = CIA402_MODE_PROFILE_VELOCITY;
+    const int32_t tvel = 5000;
+    const uint16_t cws[] = {0x0006U, 0x0007U, 0x000FU};
+    for (size_t i = 0; i < ARRAY_LEN(cws); ++i) {
+        memcpy(&rpdo0.data[0], &cws[i], sizeof(uint16_t));
+        memcpy(&rpdo0.data[2], &mode, sizeof(mode));
+        memcpy(&rpdo0.data[3], &tvel, sizeof(tvel));
+        TEST_ASSERT(co_on_can_rx(&node, &rpdo0) == CO_ERROR_NONE);
+    }
+
+    TEST_ASSERT(axis.state == CIA402_OPERATION_ENABLED);
+    cia402_step(&axis);
+    TEST_ASSERT(app_ctx.profile_velocity_calls == 1U);
+    TEST_ASSERT(app_ctx.seen_target_velocity == tvel);
+    TEST_ASSERT(app_ctx.seen_profile_velocity == pvel);
+    TEST_ASSERT(app_ctx.seen_profile_acceleration == pacc);
+    TEST_ASSERT(app_ctx.seen_profile_deceleration == pdec);
+    TEST_ASSERT((axis.statusword & (1U << 10)) != 0U);
+
+    axis.profile_velocity_valid = false;
+    axis.profile_acceleration_valid = false;
+    axis.profile_deceleration_valid = false;
+    cia402_apply_controlword(&axis, 0x0006U);
+    cia402_apply_controlword(&axis, 0x0007U);
+    cia402_apply_controlword(&axis, 0x000FU);
+    cia402_step(&axis);
+    TEST_ASSERT(axis.state == CIA402_FAULT);
+    TEST_ASSERT((axis.statusword & (1U << 3)) != 0U);
+    TEST_ASSERT(axis.fault_msef == 3U);
+    TEST_ASSERT(axis.diag_precondition_mask != 0U);
+
+    return 0;
+}
+
 int main(void)
 {
     struct {
@@ -640,6 +748,7 @@ int main(void)
         {"heartbeat_and_emcy", test_heartbeat_and_emcy},
         {"heartbeat_consumer_timeout_recovery_and_jitter", test_heartbeat_consumer_timeout_recovery_and_jitter},
         {"cia402_transition_matrix_and_statusword", test_cia402_transition_matrix_and_statusword},
+        {"cia402_rpdo_commands_and_preconditions", test_cia402_rpdo_commands_and_preconditions},
     };
 
     int failures = 0;

@@ -2,6 +2,7 @@
 
 #include "canopen.h"
 
+#include <limits.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -42,8 +43,25 @@ static const cia402_transition_t g_cia402_transitions[] = {
 
 enum {
     CIA402_MSEF_UNSUPPORTED_MODE = 1U,
-    CIA402_MSEF_MODE_HANDLER = 2U
+    CIA402_MSEF_MODE_HANDLER = 2U,
+    CIA402_MSEF_PRECONDITION = 3U
 };
+
+enum {
+    CIA402_DIAG_REQ_TARGET_POSITION = 1UL << 0,
+    CIA402_DIAG_REQ_TARGET_VELOCITY = 1UL << 1,
+    CIA402_DIAG_REQ_TARGET_TORQUE = 1UL << 2,
+    CIA402_DIAG_REQ_PROFILE_VELOCITY = 1UL << 3,
+    CIA402_DIAG_REQ_PROFILE_ACCEL = 1UL << 4,
+    CIA402_DIAG_REQ_PROFILE_DECEL = 1UL << 5,
+    CIA402_DIAG_REQ_QUICK_STOP_DECEL = 1UL << 6,
+    CIA402_DIAG_RANGE_TARGET_VELOCITY = 1UL << 16,
+    CIA402_DIAG_RANGE_PROFILE_ACCEL = 1UL << 17,
+    CIA402_DIAG_RANGE_PROFILE_DECEL = 1UL << 18,
+    CIA402_DIAG_RANGE_QUICK_STOP_DECEL = 1UL << 19
+};
+
+#define CIA402_MAX_ACCEL_DECEL 1000000000UL
 
 static cia402_command_t cia402_decode_command(uint16_t controlword)
 {
@@ -206,8 +224,87 @@ static void cia402_enter_mode_fault(cia402_axis_t *axis, uint8_t msef)
     axis->target_reached = false;
     axis->internal_limit_active = true;
     axis->fault_msef = msef;
+    axis->fault_code = (uint16_t)(0xFF00U | (uint16_t)msef);
     axis->state = CIA402_FAULT_REACTION_ACTIVE;
     axis->fault_reaction_complete = true;
+}
+
+static bool cia402_check_mode_preconditions(cia402_axis_t *axis)
+{
+    uint32_t issues = 0U;
+    uint32_t abs_target_velocity = 0U;
+    axis->diag_last_mode_checked = axis->mode_of_operation;
+    if (axis->target_velocity == INT32_MIN) {
+        abs_target_velocity = (uint32_t)INT32_MAX + 1U;
+    } else if (axis->target_velocity < 0) {
+        abs_target_velocity = (uint32_t)(-axis->target_velocity);
+    } else {
+        abs_target_velocity = (uint32_t)axis->target_velocity;
+    }
+
+    switch ((cia402_mode_t)axis->mode_of_operation) {
+        case CIA402_MODE_PROFILE_POSITION:
+        case CIA402_MODE_INTERPOLATED_POSITION:
+        case CIA402_MODE_CYCLIC_SYNC_POSITION:
+            if (!axis->target_position_valid) {
+                issues |= CIA402_DIAG_REQ_TARGET_POSITION;
+            }
+            break;
+        case CIA402_MODE_VELOCITY:
+        case CIA402_MODE_CYCLIC_SYNC_VELOCITY:
+            if (!axis->target_velocity_valid) {
+                issues |= CIA402_DIAG_REQ_TARGET_VELOCITY;
+            }
+            break;
+        case CIA402_MODE_PROFILE_VELOCITY:
+            if (!axis->target_velocity_valid) {
+                issues |= CIA402_DIAG_REQ_TARGET_VELOCITY;
+            }
+            if (!axis->profile_velocity_valid) {
+                issues |= CIA402_DIAG_REQ_PROFILE_VELOCITY;
+            }
+            if (!axis->profile_acceleration_valid) {
+                issues |= CIA402_DIAG_REQ_PROFILE_ACCEL;
+            }
+            if (!axis->profile_deceleration_valid) {
+                issues |= CIA402_DIAG_REQ_PROFILE_DECEL;
+            }
+            if (axis->target_velocity_valid && axis->profile_velocity_valid &&
+                (axis->profile_velocity > 0U) && (abs_target_velocity > axis->profile_velocity)) {
+                issues |= CIA402_DIAG_RANGE_TARGET_VELOCITY;
+            }
+            break;
+        case CIA402_MODE_PROFILE_TORQUE:
+        case CIA402_MODE_CYCLIC_SYNC_TORQUE:
+            if (!axis->target_torque_valid) {
+                issues |= CIA402_DIAG_REQ_TARGET_TORQUE;
+            }
+            break;
+        case CIA402_MODE_HOMING:
+            break;
+        case CIA402_MODE_NONE:
+        default:
+            issues |= CIA402_DIAG_REQ_TARGET_POSITION;
+            break;
+    }
+
+    if (axis->profile_acceleration_valid && axis->profile_acceleration > CIA402_MAX_ACCEL_DECEL) {
+        issues |= CIA402_DIAG_RANGE_PROFILE_ACCEL;
+    }
+    if (axis->profile_deceleration_valid && axis->profile_deceleration > CIA402_MAX_ACCEL_DECEL) {
+        issues |= CIA402_DIAG_RANGE_PROFILE_DECEL;
+    }
+    if (axis->quick_stop_deceleration_valid &&
+        axis->quick_stop_deceleration > CIA402_MAX_ACCEL_DECEL) {
+        issues |= CIA402_DIAG_RANGE_QUICK_STOP_DECEL;
+    }
+
+    if ((axis->state == CIA402_QUICK_STOP) && !axis->quick_stop_deceleration_valid) {
+        issues |= CIA402_DIAG_REQ_QUICK_STOP_DECEL;
+    }
+
+    axis->diag_precondition_mask = issues;
+    return (issues == 0U);
 }
 
 static bool cia402_dispatch_mode_handler(cia402_axis_t *axis)
@@ -220,6 +317,10 @@ static bool cia402_dispatch_mode_handler(cia402_axis_t *axis)
 
     if (!cia402_mode_is_supported(axis, axis->mode_of_operation)) {
         cia402_enter_mode_fault(axis, CIA402_MSEF_UNSUPPORTED_MODE);
+        return false;
+    }
+    if (!cia402_check_mode_preconditions(axis)) {
+        cia402_enter_mode_fault(axis, CIA402_MSEF_PRECONDITION);
         return false;
     }
 
@@ -308,6 +409,194 @@ static uint32_t cia402_on_write_mode_of_operation(co_node_t *node,
 
     cia402_axis_t *axis = (cia402_axis_t *)user;
     axis->mode_of_operation = (int8_t)data[0];
+    return 0U;
+}
+
+static uint32_t cia402_parse_i32(const uint8_t *data, size_t size, int32_t *value)
+{
+    if (!data || !value || size != sizeof(*value)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    memcpy(value, data, sizeof(*value));
+    return 0U;
+}
+
+static uint32_t cia402_parse_u32(const uint8_t *data, size_t size, uint32_t *value)
+{
+    if (!data || !value || size != sizeof(*value)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    memcpy(value, data, sizeof(*value));
+    return 0U;
+}
+
+static uint32_t cia402_on_write_target_position(co_node_t *node,
+                                                const co_od_entry_t *entry,
+                                                const uint8_t *data,
+                                                size_t size,
+                                                void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    int32_t value = 0;
+    uint32_t abort_code = cia402_parse_i32(data, size, &value);
+    if (abort_code == 0U) {
+        axis->target_position = value;
+        axis->target_position_valid = true;
+    }
+    return abort_code;
+}
+
+static uint32_t cia402_on_write_target_velocity(co_node_t *node,
+                                                const co_od_entry_t *entry,
+                                                const uint8_t *data,
+                                                size_t size,
+                                                void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    int32_t value = 0;
+    uint32_t abort_code = cia402_parse_i32(data, size, &value);
+    if (abort_code == 0U) {
+        axis->target_velocity = value;
+        axis->target_velocity_valid = true;
+    }
+    return abort_code;
+}
+
+static uint32_t cia402_on_write_target_torque(co_node_t *node,
+                                              const co_od_entry_t *entry,
+                                              const uint8_t *data,
+                                              size_t size,
+                                              void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user || !data || size != sizeof(int16_t)) {
+        return CO_SDO_ABORT_PARAM_LENGTH;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    int16_t temp = 0;
+    memcpy(&temp, data, sizeof(temp));
+    axis->target_torque = temp;
+    axis->target_torque_valid = true;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_profile_velocity(co_node_t *node,
+                                                 const co_od_entry_t *entry,
+                                                 const uint8_t *data,
+                                                 size_t size,
+                                                 void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint32_t value = 0U;
+    uint32_t abort_code = cia402_parse_u32(data, size, &value);
+    if (abort_code != 0U) {
+        return abort_code;
+    }
+    if (value == 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_LOW;
+    }
+    axis->profile_velocity = value;
+    axis->profile_velocity_valid = true;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_profile_acceleration(co_node_t *node,
+                                                     const co_od_entry_t *entry,
+                                                     const uint8_t *data,
+                                                     size_t size,
+                                                     void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint32_t value = 0U;
+    uint32_t abort_code = cia402_parse_u32(data, size, &value);
+    if (abort_code != 0U) {
+        return abort_code;
+    }
+    if (value == 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_LOW;
+    }
+    if (value > CIA402_MAX_ACCEL_DECEL) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+    axis->profile_acceleration = value;
+    axis->profile_acceleration_valid = true;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_profile_deceleration(co_node_t *node,
+                                                     const co_od_entry_t *entry,
+                                                     const uint8_t *data,
+                                                     size_t size,
+                                                     void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint32_t value = 0U;
+    uint32_t abort_code = cia402_parse_u32(data, size, &value);
+    if (abort_code != 0U) {
+        return abort_code;
+    }
+    if (value == 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_LOW;
+    }
+    if (value > CIA402_MAX_ACCEL_DECEL) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+    axis->profile_deceleration = value;
+    axis->profile_deceleration_valid = true;
+    return 0U;
+}
+
+static uint32_t cia402_on_write_quick_stop_deceleration(co_node_t *node,
+                                                        const co_od_entry_t *entry,
+                                                        const uint8_t *data,
+                                                        size_t size,
+                                                        void *user)
+{
+    (void)node;
+    (void)entry;
+    if (!user) {
+        return CO_SDO_ABORT_COMMAND;
+    }
+    cia402_axis_t *axis = (cia402_axis_t *)user;
+    uint32_t value = 0U;
+    uint32_t abort_code = cia402_parse_u32(data, size, &value);
+    if (abort_code != 0U) {
+        return abort_code;
+    }
+    if (value == 0U) {
+        return CO_SDO_ABORT_PARAM_TOO_LOW;
+    }
+    if (value > CIA402_MAX_ACCEL_DECEL) {
+        return CO_SDO_ABORT_PARAM_TOO_HIGH;
+    }
+    axis->quick_stop_deceleration = value;
+    axis->quick_stop_deceleration_valid = true;
     return 0U;
 }
 
@@ -418,10 +707,109 @@ void cia402_bind_od(cia402_axis_t *axis, co_node_t *node)
                        NULL,
                        axis);
     (void)co_od_add_ex(node,
+                       0x607AU,
+                       0x00U,
+                       (uint8_t *)&axis->target_position,
+                       sizeof(axis->target_position),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_target_position,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x60FFU,
+                       0x00U,
+                       (uint8_t *)&axis->target_velocity,
+                       sizeof(axis->target_velocity),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_target_velocity,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6071U,
+                       0x00U,
+                       (uint8_t *)&axis->target_torque,
+                       sizeof(axis->target_torque),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_target_torque,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6081U,
+                       0x00U,
+                       (uint8_t *)&axis->profile_velocity,
+                       sizeof(axis->profile_velocity),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_profile_velocity,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6083U,
+                       0x00U,
+                       (uint8_t *)&axis->profile_acceleration,
+                       sizeof(axis->profile_acceleration),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_profile_acceleration,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6084U,
+                       0x00U,
+                       (uint8_t *)&axis->profile_deceleration,
+                       sizeof(axis->profile_deceleration),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_profile_deceleration,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x6085U,
+                       0x00U,
+                       (uint8_t *)&axis->quick_stop_deceleration,
+                       sizeof(axis->quick_stop_deceleration),
+                       (uint8_t)(CO_OD_ACCESS_READ | CO_OD_ACCESS_WRITE),
+                       NULL,
+                       cia402_on_write_quick_stop_deceleration,
+                       axis);
+    (void)co_od_add_ex(node,
                        0x6064U,
                        0x00U,
                        (uint8_t *)&axis->position_actual,
                        sizeof(axis->position_actual),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x603FU,
+                       0x00U,
+                       (uint8_t *)&axis->fault_code,
+                       sizeof(axis->fault_code),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x2300U,
+                       0x01U,
+                       (uint8_t *)&axis->fault_msef,
+                       sizeof(axis->fault_msef),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x2300U,
+                       0x02U,
+                       (uint8_t *)&axis->diag_last_mode_checked,
+                       sizeof(axis->diag_last_mode_checked),
+                       CO_OD_ACCESS_READ,
+                       NULL,
+                       NULL,
+                       axis);
+    (void)co_od_add_ex(node,
+                       0x2300U,
+                       0x03U,
+                       (uint8_t *)&axis->diag_precondition_mask,
+                       sizeof(axis->diag_precondition_mask),
                        CO_OD_ACCESS_READ,
                        NULL,
                        NULL,
@@ -481,8 +869,10 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
     cia402_apply_quick_stop_rules(axis, command);
     if ((command == CIA402_CMD_FAULT_RESET) && (axis->state == CIA402_SWITCH_ON_DISABLED)) {
         axis->fault_msef = 0U;
+        axis->fault_code = 0U;
         axis->warning = false;
         axis->internal_limit_active = false;
+        axis->diag_precondition_mask = 0U;
     }
 
     cia402_update_statusword(axis);
