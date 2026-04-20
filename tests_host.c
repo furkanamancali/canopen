@@ -383,6 +383,67 @@ static int test_heartbeat_and_emcy(void)
     return 0;
 }
 
+static int test_heartbeat_consumer_timeout_recovery_and_jitter(void)
+{
+    co_node_t node;
+    test_bus_t bus;
+    setup_node(&node, &bus, 0x05, 0);
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE); /* boot-up */
+
+    uint8_t hb_cons_count = 1U;
+    uint32_t hb_cons_entry = ((uint32_t)0x22U << 16U) | 100U;
+    TEST_ASSERT(co_od_write(&node, 0x1016, 0x00, &hb_cons_count, sizeof(hb_cons_count)) == 0U);
+    TEST_ASSERT(co_od_write(&node, 0x1016, 0x01, (const uint8_t *)&hb_cons_entry, sizeof(hb_cons_entry)) == 0U);
+    TEST_ASSERT(node.hb_consumers[0].enabled);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_UNKNOWN);
+
+    bus.now_ms = 250U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_UNKNOWN);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) == 0U);
+
+    bus.now_ms = 10U;
+    co_can_frame_t hb = {.cob_id = 0x722U, .len = 1U, .data = {CO_NMT_OPERATIONAL}};
+    TEST_ASSERT(co_on_can_rx(&node, &hb) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_ACTIVE);
+    TEST_ASSERT(node.hb_runtime[0].remote_state == CO_NMT_OPERATIONAL);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) == 0U);
+
+    bus.now_ms = 110U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_ACTIVE);
+
+    bus.now_ms = 111U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_TIMEOUT);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) != 0U);
+    TEST_ASSERT(node.faults[CO_FAULT_HEARTBEAT_CONSUMER].active);
+
+    bus.now_ms = 115U;
+    TEST_ASSERT(co_on_can_rx(&node, &hb) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_ACTIVE);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) == 0U);
+    TEST_ASSERT(!node.faults[CO_FAULT_HEARTBEAT_CONSUMER].active);
+
+    bus.now_ms = 210U;
+    TEST_ASSERT(co_on_can_rx(&node, &hb) == CO_ERROR_NONE);
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_ACTIVE);
+
+    bus.now_ms = 309U;
+    TEST_ASSERT(co_on_can_rx(&node, &hb) == CO_ERROR_NONE);
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_ACTIVE);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) == 0U);
+
+    bus.now_ms = 520U;
+    TEST_ASSERT(co_process(&node) == CO_ERROR_NONE);
+    TEST_ASSERT(node.hb_runtime[0].state == CO_HB_CONSUMER_TIMEOUT);
+    TEST_ASSERT((node.error_register & CO_ERROR_REG_COMMUNICATION) != 0U);
+
+    return 0;
+}
+
 static uint16_t expected_statusword(cia402_state_t state)
 {
     uint16_t sw = 0U;
@@ -473,6 +534,7 @@ int main(void)
         {"sdo_expedited_segmented_block", test_sdo_expedited_segmented_block},
         {"pdo_remap_and_runtime", test_pdo_remap_and_runtime},
         {"heartbeat_and_emcy", test_heartbeat_and_emcy},
+        {"heartbeat_consumer_timeout_recovery_and_jitter", test_heartbeat_consumer_timeout_recovery_and_jitter},
         {"cia402_transition_matrix_and_statusword", test_cia402_transition_matrix_and_statusword},
     };
 
