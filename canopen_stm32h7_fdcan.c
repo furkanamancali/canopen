@@ -61,7 +61,7 @@ void co_stm32_attach(co_node_t *node,
                      uint8_t node_id,
                      uint16_t heartbeat_ms)
 {
-    co_if_t iface;
+    co_if_t iface = {0};
     ctx->hfdcan = hfdcan;
 
     iface.user = ctx;

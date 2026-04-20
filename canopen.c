@@ -467,14 +467,61 @@ static co_error_t co_send_bootup(co_node_t *node)
     return node->iface.send(node->iface.user, &frame);
 }
 
-static void co_on_reset(co_node_t *node, co_reset_type_t type)
+static void co_restore_default_comm_objects(co_node_t *node)
+{
+    node->sdo_server_cob_rx = CO_COB_SDO_RX_BASE + node->node_id;
+    node->sdo_server_cob_tx = CO_COB_SDO_TX_BASE + node->node_id;
+
+    node->rpdo_map[0] = CO_COB_RPDO1_BASE + node->node_id;
+    node->rpdo_map[1] = CO_COB_RPDO2_BASE + node->node_id;
+    node->rpdo_map[2] = CO_COB_RPDO3_BASE + node->node_id;
+    node->rpdo_map[3] = CO_COB_RPDO4_BASE + node->node_id;
+    node->tpdo_map[0] = CO_COB_TPDO1_BASE + node->node_id;
+    node->tpdo_map[1] = CO_COB_TPDO2_BASE + node->node_id;
+    node->tpdo_map[2] = CO_COB_TPDO3_BASE + node->node_id;
+    node->tpdo_map[3] = CO_COB_TPDO4_BASE + node->node_id;
+}
+
+static void co_schedule_bootup(co_node_t *node)
 {
     node->nmt_state = CO_NMT_INITIALIZING;
     node->bootup_pending = true;
     node->last_heartbeat_ms = 0U;
+}
+
+static void co_on_reset_communication(co_node_t *node)
+{
+    co_restore_default_comm_objects(node);
+    co_schedule_bootup(node);
+
+    if (node->iface.on_reset_communication) {
+        node->iface.on_reset_communication(node->iface.user);
+    }
+}
+
+static void co_on_reset_application(co_node_t *node)
+{
+    co_on_reset_communication(node);
+
+    if (node->iface.on_reset_application) {
+        node->iface.on_reset_application(node->iface.user);
+    }
 
     if (node->iface.on_reset) {
-        node->iface.on_reset(node->iface.user, type);
+        node->iface.on_reset(node->iface.user, CO_RESET_APPLICATION);
+    }
+}
+
+static void co_on_reset(co_node_t *node, co_reset_type_t type)
+{
+    if (type == CO_RESET_APPLICATION) {
+        co_on_reset_application(node);
+        return;
+    }
+
+    co_on_reset_communication(node);
+    if (node->iface.on_reset) {
+        node->iface.on_reset(node->iface.user, CO_RESET_COMMUNICATION);
     }
 }
 
@@ -551,7 +598,7 @@ static co_error_t co_process_sdo(co_node_t *node, const co_can_frame_t *frame)
 
 static co_error_t co_process_nmt(co_node_t *node, const co_can_frame_t *frame)
 {
-    if (frame->len < 2U) {
+    if (frame->len != 2U) {
         return CO_ERROR_INVALID_ARGS;
     }
 
@@ -561,12 +608,21 @@ static co_error_t co_process_nmt(co_node_t *node, const co_can_frame_t *frame)
 
     switch (frame->data[0]) {
         case 0x01:
+            if (node->nmt_state == CO_NMT_INITIALIZING) {
+                return CO_ERROR_NONE;
+            }
             node->nmt_state = CO_NMT_OPERATIONAL;
             break;
         case 0x02:
+            if (node->nmt_state == CO_NMT_INITIALIZING) {
+                return CO_ERROR_NONE;
+            }
             node->nmt_state = CO_NMT_STOPPED;
             break;
         case 0x80:
+            if (node->nmt_state == CO_NMT_INITIALIZING) {
+                return CO_ERROR_NONE;
+            }
             node->nmt_state = CO_NMT_PRE_OPERATIONAL;
             break;
         case 0x81:
@@ -587,17 +643,8 @@ void co_init(co_node_t *node, const co_if_t *iface, uint8_t node_id, uint16_t he
     node->iface = *iface;
     node->node_id = node_id;
     node->heartbeat_ms = heartbeat_ms;
-    node->nmt_state = CO_NMT_INITIALIZING;
-    node->bootup_pending = true;
-
-    node->rpdo_map[0] = CO_COB_RPDO1_BASE + node_id;
-    node->rpdo_map[1] = CO_COB_RPDO2_BASE + node_id;
-    node->rpdo_map[2] = CO_COB_RPDO3_BASE + node_id;
-    node->rpdo_map[3] = CO_COB_RPDO4_BASE + node_id;
-    node->tpdo_map[0] = CO_COB_TPDO1_BASE + node_id;
-    node->tpdo_map[1] = CO_COB_TPDO2_BASE + node_id;
-    node->tpdo_map[2] = CO_COB_TPDO3_BASE + node_id;
-    node->tpdo_map[3] = CO_COB_TPDO4_BASE + node_id;
+    co_restore_default_comm_objects(node);
+    co_schedule_bootup(node);
 
     (void)co_register_builtin_od(node);
 }
