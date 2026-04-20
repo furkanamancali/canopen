@@ -40,6 +40,11 @@ static const cia402_transition_t g_cia402_transitions[] = {
     { CIA402_FAULT, CIA402_CMD_FAULT_RESET, CIA402_SWITCH_ON_DISABLED },
 };
 
+enum {
+    CIA402_MSEF_UNSUPPORTED_MODE = 1U,
+    CIA402_MSEF_MODE_HANDLER = 2U
+};
+
 static cia402_command_t cia402_decode_command(uint16_t controlword)
 {
     if ((controlword & 0x0080U) != 0U) {
@@ -179,11 +184,95 @@ static void cia402_sync_fault_to_canopen(cia402_axis_t *axis)
                              CO_FAULT_CIA402_PROFILE,
                              CO_EMCY_ERR_PROFILE,
                              CO_ERROR_REG_DEVICE_PROFILE,
-                             0U,
+                             axis->fault_msef,
                              NULL);
     } else {
         (void)co_fault_clear(axis->node, CO_FAULT_CIA402_PROFILE, 0U, NULL);
     }
+}
+
+static bool cia402_mode_is_supported(const cia402_axis_t *axis, int8_t mode)
+{
+    if (!axis || !axis->app || mode < 0 || mode >= 32) {
+        return false;
+    }
+
+    return (axis->app->supported_modes & CIA402_MODE_BIT(mode)) != 0U;
+}
+
+static void cia402_enter_mode_fault(cia402_axis_t *axis, uint8_t msef)
+{
+    axis->warning = true;
+    axis->target_reached = false;
+    axis->internal_limit_active = true;
+    axis->fault_msef = msef;
+    axis->state = CIA402_FAULT_REACTION_ACTIVE;
+    axis->fault_reaction_complete = true;
+}
+
+static bool cia402_dispatch_mode_handler(cia402_axis_t *axis)
+{
+    cia402_mode_command_cb_t handler = NULL;
+
+    if (axis->state != CIA402_OPERATION_ENABLED) {
+        return true;
+    }
+
+    if (!cia402_mode_is_supported(axis, axis->mode_of_operation)) {
+        cia402_enter_mode_fault(axis, CIA402_MSEF_UNSUPPORTED_MODE);
+        return false;
+    }
+
+    switch ((cia402_mode_t)axis->mode_of_operation) {
+        case CIA402_MODE_PROFILE_POSITION:
+            handler = axis->app ? axis->app->on_profile_position : NULL;
+            if (!handler) {
+                axis->target_reached = true;
+            }
+            break;
+        case CIA402_MODE_VELOCITY:
+            handler = axis->app ? axis->app->on_velocity : NULL;
+            break;
+        case CIA402_MODE_PROFILE_VELOCITY:
+            handler = axis->app ? axis->app->on_profile_velocity : NULL;
+            break;
+        case CIA402_MODE_PROFILE_TORQUE:
+            handler = axis->app ? axis->app->on_profile_torque : NULL;
+            break;
+        case CIA402_MODE_HOMING:
+            handler = axis->app ? axis->app->on_homing : NULL;
+            if (!handler) {
+                axis->target_reached = true;
+            }
+            break;
+        case CIA402_MODE_INTERPOLATED_POSITION:
+            handler = axis->app ? axis->app->on_interpolated_position : NULL;
+            break;
+        case CIA402_MODE_CYCLIC_SYNC_POSITION:
+            handler = axis->app ? axis->app->on_cyclic_sync_position : NULL;
+            break;
+        case CIA402_MODE_CYCLIC_SYNC_VELOCITY:
+            handler = axis->app ? axis->app->on_cyclic_sync_velocity : NULL;
+            break;
+        case CIA402_MODE_CYCLIC_SYNC_TORQUE:
+            handler = axis->app ? axis->app->on_cyclic_sync_torque : NULL;
+            break;
+        case CIA402_MODE_NONE:
+        default:
+            cia402_enter_mode_fault(axis, CIA402_MSEF_UNSUPPORTED_MODE);
+            return false;
+    }
+
+    if (!handler) {
+        return true;
+    }
+
+    if (!handler(axis, axis->app->user)) {
+        cia402_enter_mode_fault(axis, CIA402_MSEF_MODE_HANDLER);
+        return false;
+    }
+
+    return true;
 }
 
 void cia402_init(cia402_axis_t *axis)
@@ -202,6 +291,15 @@ void cia402_attach_node(cia402_axis_t *axis, co_node_t *node)
     }
     axis->node = node;
     cia402_sync_fault_to_canopen(axis);
+}
+
+void cia402_set_callbacks(cia402_axis_t *axis, const cia402_app_if_t *app)
+{
+    if (!axis) {
+        return;
+    }
+
+    axis->app = app;
 }
 
 void cia402_set_feedback(cia402_axis_t *axis, int32_t pos, int32_t vel, int16_t tq)
@@ -226,6 +324,11 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
     }
 
     cia402_apply_quick_stop_rules(axis, command);
+    if ((command == CIA402_CMD_FAULT_RESET) && (axis->state == CIA402_SWITCH_ON_DISABLED)) {
+        axis->fault_msef = 0U;
+        axis->warning = false;
+        axis->internal_limit_active = false;
+    }
 
     cia402_update_statusword(axis);
     cia402_sync_fault_to_canopen(axis);
@@ -233,11 +336,21 @@ void cia402_apply_controlword(cia402_axis_t *axis, uint16_t controlword)
 
 void cia402_step(cia402_axis_t *axis)
 {
+    if (axis->app && axis->app->on_feedback) {
+        axis->app->on_feedback(axis, axis->mode_of_operation, axis->app->user);
+    }
+
+    (void)cia402_dispatch_mode_handler(axis);
+
     if (axis->state == CIA402_FAULT_REACTION_ACTIVE) {
         if (axis->fault_reaction_complete) {
             axis->state = CIA402_FAULT;
         }
         cia402_update_statusword(axis);
         cia402_sync_fault_to_canopen(axis);
+        return;
     }
+
+    cia402_update_statusword(axis);
+    cia402_sync_fault_to_canopen(axis);
 }
