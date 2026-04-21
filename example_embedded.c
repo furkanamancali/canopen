@@ -5,27 +5,27 @@
  *
  * Topology
  * ────────
- *   STM32H7  (master, node 0x7F)  ←──CAN──→  eRob (slave, node 0x01)
+ *   STM32H7  (master, node 0x7F)  ←──CAN──→  eRob (slave, node 0x05)
  *
  *   SYNC producer : master, 1 ms period, COB-ID 0x080
  *
  * PDO wiring (master perspective)
  * ────────────────────────────────
- *   Master TPDO1  0x201 → eRob RPDO1   (every SYNC, 0x1800/0x1A00)
+ *   Master TPDO1  0x205 → eRob RPDO1   (every SYNC, 0x1800/0x1A00)
  *     Controlword  0x6040  16 bits
  *     Mode of Op   0x6060   8 bits   [fixed: Profile Velocity = 3]
  *     Target Vel   0x60FF  32 bits   [RPM, signed]
  *
- *   Master TPDO2  0x301 → eRob RPDO2   (every SYNC, 0x1801/0x1A01)
+ *   Master TPDO2  0x305 → eRob RPDO2   (every SYNC, 0x1801/0x1A01)
  *     Profile Accel  0x6083  32 bits  [RPM/s]
  *     Profile Decel  0x6084  32 bits  [RPM/s]
  *
- *   eRob TPDO1  0x181 → Master RPDO1   (every SYNC, 0x1400/0x1600)
+ *   eRob TPDO1  0x185 → Master RPDO1   (every SYNC, 0x1400/0x1600)
  *     Statusword     0x6041  16 bits
  *     Mode Display   0x6061   8 bits
  *     Velocity Act   0x606C  32 bits  [RPM, signed]
  *
- *   eRob TPDO2  0x281 → Master RPDO2   (every SYNC, 0x1401/0x1601)
+ *   eRob TPDO2  0x285 → Master RPDO2   (every SYNC, 0x1401/0x1601)
  *     Position Act   0x6064  32 bits  [encoder counts]
  *     Torque Act     0x6077  16 bits  [0.1 % rated]
  *
@@ -55,7 +55,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define MASTER_NODE_ID          0x7FU
 #define MASTER_HEARTBEAT_MS     100U
 
-#define EROB_NODE_ID            0x01U
+#define EROB_NODE_ID            0x05U
 #define EROB_HB_TIMEOUT_MS      1000U    /* declare eRob lost after 1 s       */
 
 #define SYNC_PERIOD_US          1000UL   /* 1 ms SYNC produced by master      */
@@ -95,49 +95,61 @@ typedef struct {
     uint8_t  size;
 } erob_sdo_write_t;
 
+#define EROB_RPDO1_COB  (0x80000000UL | (0x200UL + EROB_NODE_ID))  /* disabled */
+#define EROB_RPDO1_COBEN             (0x200UL + EROB_NODE_ID)       /* enabled  */
+#define EROB_RPDO2_COB  (0x80000000UL | (0x300UL + EROB_NODE_ID))
+#define EROB_RPDO2_COBEN             (0x300UL + EROB_NODE_ID)
+#define EROB_TPDO1_COB  (0x80000000UL | (0x180UL + EROB_NODE_ID))
+#define EROB_TPDO1_COBEN             (0x180UL + EROB_NODE_ID)
+#define EROB_TPDO2_COB  (0x80000000UL | (0x280UL + EROB_NODE_ID))
+#define EROB_TPDO2_COBEN             (0x280UL + EROB_NODE_ID)
+
 static const erob_sdo_write_t EROB_PDO_CFG[] = {
-    /* ── eRob RPDO1 (receives master TPDO1 at 0x201) ── */
-    { 0x1400U, 0x01U, 0x80000201UL, 4U },  /* disable while reconfiguring  */
-    { 0x1400U, 0x02U, 0xFFU,         1U },  /* event-driven transmission    */
-    { 0x1600U, 0x00U, 0U,            1U },  /* lock mapping                 */
-    { 0x1600U, 0x01U, 0x60400010UL, 4U },  /* controlword 16-bit           */
-    { 0x1600U, 0x02U, 0x60600008UL, 4U },  /* modes of operation 8-bit     */
-    { 0x1600U, 0x03U, 0x60FF0020UL, 4U },  /* target velocity 32-bit       */
-    { 0x1600U, 0x00U, 3U,            1U },  /* unlock: 3 entries            */
-    { 0x1400U, 0x01U, 0x00000201UL, 4U },  /* enable                       */
-    /* ── eRob RPDO2 (receives master TPDO2 at 0x301) ── */
-    { 0x1401U, 0x01U, 0x80000301UL, 4U },
-    { 0x1401U, 0x02U, 0xFFU,         1U },
-    { 0x1601U, 0x00U, 0U,            1U },
-    { 0x1601U, 0x01U, 0x60830020UL, 4U },  /* profile acceleration 32-bit  */
-    { 0x1601U, 0x02U, 0x60840020UL, 4U },  /* profile deceleration 32-bit  */
-    { 0x1601U, 0x00U, 2U,            1U },
-    { 0x1401U, 0x01U, 0x00000301UL, 4U },
-    /* ── eRob TPDO1 (sends to master RPDO1 at 0x181) ── */
-    { 0x1800U, 0x01U, 0x80000181UL, 4U },
-    { 0x1800U, 0x02U, 0x01U,         1U },  /* synchronous (SYNC-triggered) */
-    { 0x1A00U, 0x00U, 0U,            1U },
-    { 0x1A00U, 0x01U, 0x60410010UL, 4U },  /* statusword 16-bit            */
-    { 0x1A00U, 0x02U, 0x60610008UL, 4U },  /* modes of operation display   */
-    { 0x1A00U, 0x03U, 0x606C0020UL, 4U },  /* velocity actual value 32-bit */
-    { 0x1A00U, 0x00U, 3U,            1U },
-    { 0x1800U, 0x01U, 0x00000181UL, 4U },
-    /* ── eRob TPDO2 (sends to master RPDO2 at 0x281) ── */
-    { 0x1801U, 0x01U, 0x80000281UL, 4U },
-    { 0x1801U, 0x02U, 0x01U,         1U },
-    { 0x1A01U, 0x00U, 0U,            1U },
-    { 0x1A01U, 0x01U, 0x60640020UL, 4U },  /* position actual value 32-bit */
-    { 0x1A01U, 0x02U, 0x60770010UL, 4U },  /* torque actual value 16-bit   */
-    { 0x1A01U, 0x00U, 2U,            1U },
-    { 0x1801U, 0x01U, 0x00000281UL, 4U },
+    /* ── eRob RPDO1 (receives master TPDO1) ── */
+    { 0x1400U, 0x01U, EROB_RPDO1_COB,   4U },  /* disable while reconfiguring  */
+    { 0x1400U, 0x02U, 0xFFU,             1U },  /* event-driven transmission    */
+    { 0x1600U, 0x00U, 0U,                1U },  /* lock mapping                 */
+    { 0x1600U, 0x01U, 0x60400010UL,     4U },  /* controlword 16-bit           */
+    { 0x1600U, 0x02U, 0x60600008UL,     4U },  /* modes of operation 8-bit     */
+    { 0x1600U, 0x03U, 0x60FF0020UL,     4U },  /* target velocity 32-bit       */
+    { 0x1600U, 0x00U, 3U,                1U },  /* unlock: 3 entries            */
+    { 0x1400U, 0x01U, EROB_RPDO1_COBEN, 4U },  /* enable                       */
+    /* ── eRob RPDO2 (receives master TPDO2) ── */
+    { 0x1401U, 0x01U, EROB_RPDO2_COB,   4U },
+    { 0x1401U, 0x02U, 0xFFU,             1U },
+    { 0x1601U, 0x00U, 0U,                1U },
+    { 0x1601U, 0x01U, 0x60830020UL,     4U },  /* profile acceleration 32-bit  */
+    { 0x1601U, 0x02U, 0x60840020UL,     4U },  /* profile deceleration 32-bit  */
+    { 0x1601U, 0x00U, 2U,                1U },
+    { 0x1401U, 0x01U, EROB_RPDO2_COBEN, 4U },
+    /* ── eRob TPDO1 (sends to master RPDO1) ── */
+    { 0x1800U, 0x01U, EROB_TPDO1_COB,   4U },
+    { 0x1800U, 0x02U, 0x01U,             1U },  /* synchronous (SYNC-triggered) */
+    { 0x1A00U, 0x00U, 0U,                1U },
+    { 0x1A00U, 0x01U, 0x60410010UL,     4U },  /* statusword 16-bit            */
+    { 0x1A00U, 0x02U, 0x60610008UL,     4U },  /* modes of operation display   */
+    { 0x1A00U, 0x03U, 0x606C0020UL,     4U },  /* velocity actual value 32-bit */
+    { 0x1A00U, 0x00U, 3U,                1U },
+    { 0x1800U, 0x01U, EROB_TPDO1_COBEN, 4U },
+    /* ── eRob TPDO2 (sends to master RPDO2) ── */
+    { 0x1801U, 0x01U, EROB_TPDO2_COB,   4U },
+    { 0x1801U, 0x02U, 0x01U,             1U },
+    { 0x1A01U, 0x00U, 0U,                1U },
+    { 0x1A01U, 0x01U, 0x60640020UL,     4U },  /* position actual value 32-bit */
+    { 0x1A01U, 0x02U, 0x60770010UL,     4U },  /* torque actual value 16-bit   */
+    { 0x1A01U, 0x00U, 2U,                1U },
+    { 0x1801U, 0x01U, EROB_TPDO2_COBEN, 4U },
 };
 #define EROB_PDO_CFG_COUNT ((uint32_t)(sizeof(EROB_PDO_CFG) / sizeof(EROB_PDO_CFG[0])))
 
 typedef enum {
     EROB_SDO_CFG_IDLE = 0,
+    EROB_SDO_CFG_NMT_DELAY,      /* wait after NMT Pre-Op before first SDO write */
     EROB_SDO_CFG_WAIT_RESPONSE,
     EROB_SDO_CFG_DONE,
 } erob_sdo_cfg_state_t;
+
+#define EROB_NMT_PREOP_DELAY_MS  100U  /* guard time: eRob processes NMT Pre-Op */
 
 static erob_sdo_cfg_state_t m_sdo_cfg_state   = EROB_SDO_CFG_IDLE;
 static uint32_t             m_sdo_cfg_step     = 0U;
@@ -181,10 +193,11 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     if ((frame->data[0] & 0xE0U) == 0x60U) {
         m_sdo_cfg_resp_ok = true;
     }
-    /* Abort (0x80): treat as abort — reset and retry whole sequence */
+    /* Abort (0x80): reset and retry whole sequence from NMT Pre-Op */
     if (frame->data[0] == 0x80U) {
-        m_sdo_cfg_state = EROB_SDO_CFG_IDLE;
-        m_sdo_cfg_step  = 0U;
+        m_sdo_cfg_state   = EROB_SDO_CFG_IDLE;
+        m_sdo_cfg_step    = 0U;
+        m_sdo_cfg_resp_ok = false;
     }
 }
 
@@ -202,8 +215,20 @@ static bool erob_sdo_cfg_run(void)
     const uint32_t t = now_ms();
 
     if (m_sdo_cfg_state == EROB_SDO_CFG_IDLE) {
+        /* Send NMT Pre-Op to eRob on every attempt so PDO mapping writes are
+         * accepted even if the eRob was left in OPERATIONAL from a prior run. */
+        (void)co_nmt_master_send(&canopen_node, 0x80U, EROB_NODE_ID);
         m_sdo_cfg_step    = 0U;
         m_sdo_cfg_resp_ok = false;
+        m_sdo_cfg_step_ms = t;
+        m_sdo_cfg_state   = EROB_SDO_CFG_NMT_DELAY;
+        return false;
+    }
+
+    if (m_sdo_cfg_state == EROB_SDO_CFG_NMT_DELAY) {
+        if ((t - m_sdo_cfg_step_ms) < EROB_NMT_PREOP_DELAY_MS) {
+            return false;  /* still waiting for eRob to process NMT Pre-Op */
+        }
         m_sdo_cfg_step_ms = t;
         m_sdo_cfg_state   = EROB_SDO_CFG_WAIT_RESPONSE;
         const erob_sdo_write_t *w = &EROB_PDO_CFG[0];
@@ -477,17 +502,18 @@ static void on_erob_hb_event(co_node_t *node, uint8_t slave_node_id,
     }
 
     if (event == CO_HB_EVENT_TIMEOUT) {
-        /* eRob went silent — zero velocity command and return to IDLE.
-         * On reconnect, the sequencing restarts from scratch.               */
-        m_target_vel    = 0;
-        m_controlword   = CW_SHUTDOWN;
-        m_drive_state   = MASTER_CIA402_IDLE;
-        m_sdo_cfg_state = EROB_SDO_CFG_IDLE;
-        m_sdo_cfg_step  = 0U;
+        /* eRob went silent — zero velocity and stall sequencing. */
+        m_target_vel     = 0;
+        m_controlword    = CW_SHUTDOWN;
+        m_drive_state    = MASTER_CIA402_IDLE;
+        m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
+        m_sdo_cfg_step   = 0U;
+        m_master_started = false;   /* re-run SDO config when eRob comes back */
     } else {
         /* eRob recovered — re-run SDO config, then restart CiA 402 sequencing. */
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
+        m_master_started = false;
         m_drive_state    = MASTER_CIA402_IDLE;
         m_state_entry_ms = now_ms();
     }
@@ -607,19 +633,21 @@ co_error_t app_canopen_init(void)
 
     /* 4. RPDO communication parameters (master receives from eRob).
      *
-     *    0x1400: RPDO1 listens on 0x181 (eRob's TPDO1 COB-ID).
-     *    0x1401: RPDO2 listens on 0x281 (eRob's TPDO2 COB-ID).
+     *    0x1400: RPDO1 listens on 0x185 (eRob TPDO1 COB-ID, node 5).
+     *    0x1401: RPDO2 listens on 0x285 (eRob TPDO2 COB-ID, node 5).
      *
      *    COB-ID encoding (CiA 301 §7.3.3): bit 31=0 → valid, bits 0-10 = ID.
      *    Transmission type 0x01: process on SYNC (matches eRob TPDO type).
+     *    Note: eRob's TPDO COB-IDs are corrected to node-5 offsets by the SDO
+     *    configuration sequence that runs before NMT Start is sent.
      */
-    const uint32_t rpdo1_cob = 0x180UL + EROB_NODE_ID;   /* 0x181 */
+    const uint32_t rpdo1_cob = 0x180UL + EROB_NODE_ID;   /* 0x185 */
     const uint8_t  rpdo_sync = 0x01U;
     if (co_od_write(&canopen_node, 0x1400U, 0x01U,
                     (const uint8_t *)&rpdo1_cob, sizeof(rpdo1_cob)) != 0U) { return CO_ERROR_INVALID_ARGS; }
     if (co_od_write(&canopen_node, 0x1400U, 0x02U, &rpdo_sync, 1U) != 0U)  { return CO_ERROR_INVALID_ARGS; }
 
-    const uint32_t rpdo2_cob = 0x280UL + EROB_NODE_ID;   /* 0x281 */
+    const uint32_t rpdo2_cob = 0x280UL + EROB_NODE_ID;   /* 0x285 */
     if (co_od_write(&canopen_node, 0x1401U, 0x01U,
                     (const uint8_t *)&rpdo2_cob, sizeof(rpdo2_cob)) != 0U) { return CO_ERROR_INVALID_ARGS; }
     if (co_od_write(&canopen_node, 0x1401U, 0x02U, &rpdo_sync, 1U) != 0U)  { return CO_ERROR_INVALID_ARGS; }
@@ -648,8 +676,8 @@ co_error_t app_canopen_init(void)
 
     /* 6. TPDO communication parameters (master sends to eRob).
      *
-     *    0x1800: TPDO1 transmits on 0x201 (eRob's RPDO1 COB-ID).
-     *    0x1801: TPDO2 transmits on 0x301 (eRob's RPDO2 COB-ID).
+     *    0x1800: TPDO1 transmits on 0x205 (eRob's RPDO1 COB-ID, node 5).
+     *    0x1801: TPDO2 transmits on 0x305 (eRob's RPDO2 COB-ID, node 5).
      *
      *    Transmission type 0xFF (event-driven) + event timer = SYNC_PERIOD_US/1000
      *    ensures TPDOs fire on their own timer independent of SYNC delivery.
@@ -657,7 +685,7 @@ co_error_t app_canopen_init(void)
      *    the SYNC send failed even once (sync_last_produced_ms never updated →
      *    sync_event stays false → send_tpdo never becomes true).
      */
-    const uint32_t tpdo1_cob  = 0x200UL + EROB_NODE_ID;   /* 0x201 */
+    const uint32_t tpdo1_cob  = 0x200UL + EROB_NODE_ID;   /* 0x205 */
     const uint8_t  tpdo_event = 0xFFU;
     const uint16_t tpdo_timer_ms = (uint16_t)(SYNC_PERIOD_US / 1000U);  /* 1 ms */
     if (co_od_write(&canopen_node, 0x1800U, 0x01U,
@@ -666,7 +694,7 @@ co_error_t app_canopen_init(void)
     if (co_od_write(&canopen_node, 0x1800U, 0x05U,
                     (const uint8_t *)&tpdo_timer_ms, sizeof(tpdo_timer_ms)) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-    const uint32_t tpdo2_cob = 0x300UL + EROB_NODE_ID;   /* 0x301 */
+    const uint32_t tpdo2_cob = 0x300UL + EROB_NODE_ID;   /* 0x305 */
     if (co_od_write(&canopen_node, 0x1801U, 0x01U,
                     (const uint8_t *)&tpdo2_cob,   sizeof(tpdo2_cob))   != 0U) { return CO_ERROR_INVALID_ARGS; }
     if (co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo_event, 1U)     != 0U) { return CO_ERROR_INVALID_ARGS; }
@@ -747,16 +775,15 @@ void app_main_loop(void)
          *             eRob enters OPERATIONAL and PDO exchange begins.             */
         if (!m_master_started &&
             canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
-            /* Step A (first time only): promote master and hold eRob in pre-op. */
             co_nmt_set_state(&canopen_node, CO_NMT_OPERATIONAL);
-            (void)co_nmt_master_send(&canopen_node, 0x80U, EROB_NODE_ID);  /* NMT Pre-Op */
         }
 
         if (!m_master_started &&
             canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
-            /* Step B: configure eRob PDO mapping via SDO. */
+            /* erob_sdo_cfg_run() sends NMT Pre-Op itself on each attempt,
+             * waits 100 ms, then writes all eRob PDO mapping entries via SDO.
+             * Only after all writes are ACK'd do we send NMT Start.          */
             if (erob_sdo_cfg_run()) {
-                /* Step C: all writes acknowledged — start the eRob. */
                 (void)co_nmt_master_send(&canopen_node, 0x01U, EROB_NODE_ID);
                 m_master_started = true;
             }
