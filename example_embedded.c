@@ -490,17 +490,28 @@ co_error_t app_canopen_init(void)
      *
      *    0x1800: TPDO1 transmits on 0x201 (eRob's RPDO1 COB-ID).
      *    0x1801: TPDO2 transmits on 0x301 (eRob's RPDO2 COB-ID).
+     *
+     *    Transmission type 0xFF (event-driven) + event timer = SYNC_PERIOD_US/1000
+     *    ensures TPDOs fire on their own timer independent of SYNC delivery.
+     *    Using sync transmission type (0x01) caused TPDOs to silently stall if
+     *    the SYNC send failed even once (sync_last_produced_ms never updated →
+     *    sync_event stays false → send_tpdo never becomes true).
      */
-    const uint32_t tpdo1_cob = 0x200UL + EROB_NODE_ID;   /* 0x201 */
-    const uint8_t  tpdo_sync = 0x01U;
+    const uint32_t tpdo1_cob  = 0x200UL + EROB_NODE_ID;   /* 0x201 */
+    const uint8_t  tpdo_event = 0xFFU;
+    const uint16_t tpdo_timer_ms = (uint16_t)(SYNC_PERIOD_US / 1000U);  /* 1 ms */
     if (co_od_write(&canopen_node, 0x1800U, 0x01U,
-                    (const uint8_t *)&tpdo1_cob, sizeof(tpdo1_cob)) != 0U) { return CO_ERROR_INVALID_ARGS; }
-    if (co_od_write(&canopen_node, 0x1800U, 0x02U, &tpdo_sync, 1U) != 0U)  { return CO_ERROR_INVALID_ARGS; }
+                    (const uint8_t *)&tpdo1_cob,   sizeof(tpdo1_cob))   != 0U) { return CO_ERROR_INVALID_ARGS; }
+    if (co_od_write(&canopen_node, 0x1800U, 0x02U, &tpdo_event, 1U)     != 0U) { return CO_ERROR_INVALID_ARGS; }
+    if (co_od_write(&canopen_node, 0x1800U, 0x05U,
+                    (const uint8_t *)&tpdo_timer_ms, sizeof(tpdo_timer_ms)) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
     const uint32_t tpdo2_cob = 0x300UL + EROB_NODE_ID;   /* 0x301 */
     if (co_od_write(&canopen_node, 0x1801U, 0x01U,
-                    (const uint8_t *)&tpdo2_cob, sizeof(tpdo2_cob)) != 0U) { return CO_ERROR_INVALID_ARGS; }
-    if (co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo_sync, 1U) != 0U)  { return CO_ERROR_INVALID_ARGS; }
+                    (const uint8_t *)&tpdo2_cob,   sizeof(tpdo2_cob))   != 0U) { return CO_ERROR_INVALID_ARGS; }
+    if (co_od_write(&canopen_node, 0x1801U, 0x02U, &tpdo_event, 1U)     != 0U) { return CO_ERROR_INVALID_ARGS; }
+    if (co_od_write(&canopen_node, 0x1801U, 0x05U,
+                    (const uint8_t *)&tpdo_timer_ms, sizeof(tpdo_timer_ms)) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
     /* 7. TPDO mapping (master OD objects → eRob RPDO). */
     const uint32_t t1m1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
