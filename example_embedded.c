@@ -156,11 +156,13 @@ static const erob_sdo_write_t EROB_PDO_CFG[] = {
 
 typedef enum {
     EROB_SDO_CFG_IDLE = 0,
+    EROB_SDO_CFG_RESET_DELAY,    /* wait after NMT Reset Communication           */
     EROB_SDO_CFG_NMT_DELAY,      /* wait after NMT Pre-Op before first SDO write */
     EROB_SDO_CFG_WAIT_RESPONSE,
     EROB_SDO_CFG_DONE,
 } erob_sdo_cfg_state_t;
 
+#define EROB_NMT_RESET_DELAY_MS  500U  /* wait for eRob to complete Reset Communication */
 #define EROB_NMT_PREOP_DELAY_MS  100U  /* guard time: eRob processes NMT Pre-Op */
 
 static erob_sdo_cfg_state_t m_sdo_cfg_state   = EROB_SDO_CFG_IDLE;
@@ -287,7 +289,13 @@ static void on_erob_nmt_state_change(co_nmt_state_t new_state)
     switch (new_state) {
 
     case CO_NMT_INITIALIZING:
-        /* Bootup message — full reconnect: re-run SDO config + NMT Start. */
+        /* Bootup from our own NMT Reset Communication — expected during
+         * RESET_DELAY.  Do not restart the config sequence; let RESET_DELAY
+         * advance to NMT_DELAY once eRob reaches Pre-Op. */
+        if (m_sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
+            break;
+        }
+        /* Unexpected bootup — full reconnect: re-run SDO config + NMT Start. */
         m_target_vel     = 0;
         m_controlword    = CW_SHUTDOWN;
         m_drive_state    = MASTER_CIA402_IDLE;
@@ -300,13 +308,14 @@ static void on_erob_nmt_state_change(co_nmt_state_t new_state)
         m_target_vel  = 0;
         m_controlword = CW_SHUTDOWN;
         m_drive_state = MASTER_CIA402_IDLE;
-        /* NMT_DELAY means WE just sent NMT Pre-Op as the first step of the
-         * SDO config sequence and this heartbeat is the expected confirmation.
-         * Resetting here would restart the sequence and send a second Pre-Op,
-         * which confuses some drives during master restart.  All other states
-         * (IDLE, WAIT_RESPONSE, DONE) mean Pre-Op arrived unexpectedly and a
-         * full re-config is required. */
-        if (m_sdo_cfg_state != EROB_SDO_CFG_NMT_DELAY) {
+        /* RESET_DELAY: eRob just completed its Reset Communication and
+         * reached Pre-Op — exactly what we're waiting for; let the state
+         * machine advance naturally.
+         * NMT_DELAY: we sent NMT Pre-Op ourselves; confirmation heartbeat,
+         * not a surprise.
+         * All other states: unexpected Pre-Op — full re-config required. */
+        if (m_sdo_cfg_state != EROB_SDO_CFG_NMT_DELAY &&
+            m_sdo_cfg_state != EROB_SDO_CFG_RESET_DELAY) {
             m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
             m_sdo_cfg_step   = 0U;
             m_master_started = false;
@@ -362,11 +371,12 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     if ((frame->data[0] & 0xE0U) == 0x60U) {
         m_sdo_cfg_resp_ok = true;
     }
-    /* Abort (0x80): reset and retry whole sequence from NMT Pre-Op */
+    /* Abort (0x80): skip unsupported/optional entry and continue the sequence.
+     * Resetting to IDLE here caused an infinite loop: the abort on 0x1400:05
+     * (event timer, not supported by eRob) would restart from step 0, which
+     * re-disables RPDO1 — so the enable at step 7 never survives. */
     if (frame->data[0] == 0x80U) {
-        m_sdo_cfg_state   = EROB_SDO_CFG_IDLE;
-        m_sdo_cfg_step    = 0U;
-        m_sdo_cfg_resp_ok = false;
+        m_sdo_cfg_resp_ok = true;
     }
 }
 
@@ -384,11 +394,27 @@ static bool erob_sdo_cfg_run(void)
     const uint32_t t = now_ms();
 
     if (m_sdo_cfg_state == EROB_SDO_CFG_IDLE) {
-        /* Send NMT Pre-Op to eRob on every attempt so PDO mapping writes are
-         * accepted even if the eRob was left in OPERATIONAL from a prior run. */
-        (void)co_nmt_master_send(&canopen_node, 0x80U, EROB_NODE_ID);
+        /* Reset eRob communication layer first so it enters a clean Pre-Op
+         * state regardless of what it was doing before (e.g. master restart
+         * while eRob was in OPERATIONAL).  This also resets any stale PDO
+         * configuration from a previous run. */
+        (void)co_nmt_master_send(&canopen_node, 0x82U, EROB_NODE_ID);
         m_sdo_cfg_step    = 0U;
         m_sdo_cfg_resp_ok = false;
+        m_sdo_cfg_step_ms = t;
+        m_sdo_cfg_state   = EROB_SDO_CFG_RESET_DELAY;
+        return false;
+    }
+
+    if (m_sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
+        /* Wait for eRob to finish its reset and reach Pre-Op.  We accept the
+         * Pre-Op heartbeat as the ready signal, with a hard timeout fallback. */
+        if (m_erob_nmt_state != CO_NMT_PRE_OPERATIONAL &&
+            (t - m_sdo_cfg_step_ms) < EROB_NMT_RESET_DELAY_MS) {
+            return false;
+        }
+        /* eRob is in Pre-Op (or timeout elapsed) — send NMT Pre-Op to confirm. */
+        (void)co_nmt_master_send(&canopen_node, 0x80U, EROB_NODE_ID);
         m_sdo_cfg_step_ms = t;
         m_sdo_cfg_state   = EROB_SDO_CFG_NMT_DELAY;
         return false;
