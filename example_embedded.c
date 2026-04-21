@@ -147,8 +147,8 @@ static inline bool erob_sw_operation_enabled(uint16_t sw)
 }
 static inline bool erob_sw_fault_reaction_active(uint16_t sw)
 {
-    /* DS402 Table 14: only SW_FAULT set, drive is still reacting */
-    return (sw & SW_MASK) == SW_FAULT;
+    /* DS402 Table 14: Fault Reaction Active = RTSO+SO+OE+Fault bits all set */
+    return (sw & SW_MASK) == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
 }
 static inline bool erob_sw_fault(uint16_t sw)
 {
@@ -173,10 +173,21 @@ static void erob_state_machine_step(void)
     switch (m_drive_state) {
 
     case MASTER_CIA402_IDLE:
-        /* Start sequencing: always begin with a fault-reset pulse. */
-        m_controlword    = CW_FAULT_RESET;
-        m_drive_state    = MASTER_CIA402_FAULT_RESET;
-        m_state_entry_ms = t;
+        /* Wait for a stable, known state before attempting sequencing.
+         * SW=0 ("Not Ready to Switch On") is a transient power-on state;
+         * advancing before the drive finishes its own init causes spurious
+         * SHUTDOWN timeouts that loop forever.                             */
+        if (erob_sw_fault(sw)) {
+            m_controlword    = CW_FAULT_RESET;
+            m_drive_state    = MASTER_CIA402_FAULT_RESET;
+            m_state_entry_ms = t;
+        } else if (erob_sw_switch_on_disabled(sw) ||
+                   erob_sw_ready_to_switch_on(sw)  ||
+                   erob_sw_switched_on(sw)          ||
+                   erob_sw_operation_enabled(sw)) {
+            m_drive_state    = MASTER_CIA402_SHUTDOWN;
+            m_state_entry_ms = t;
+        }
         break;
 
     case MASTER_CIA402_FAULT_RESET:
