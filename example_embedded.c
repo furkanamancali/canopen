@@ -210,6 +210,11 @@ static uint32_t              m_state_entry_ms = 0;
 /* Whether the master has self-promoted to OPERATIONAL and started the eRob. */
 static bool m_master_started = false;
 
+/* Set only when a real runtime heartbeat timeout fires (m_master_started=true).
+ * Guards the RECOVERED handler from acting on spurious recoveries caused by
+ * the startup silence after NMT Reset Communication. */
+static bool m_erob_hb_lost = false;
+
 /* Last observed NMT state of the eRob (from its heartbeat frames). */
 static co_nmt_state_t m_erob_nmt_state = CO_NMT_INITIALIZING;
 
@@ -302,6 +307,7 @@ static void on_erob_nmt_state_change(co_nmt_state_t new_state)
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
         m_master_started = false;
+        m_erob_hb_lost   = false;
         break;
 
     case CO_NMT_PRE_OPERATIONAL:
@@ -407,13 +413,14 @@ static bool erob_sdo_cfg_run(void)
     }
 
     if (m_sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
-        /* Wait for eRob to finish its reset and reach Pre-Op.  We accept the
-         * Pre-Op heartbeat as the ready signal, with a hard timeout fallback. */
-        if (m_erob_nmt_state != CO_NMT_PRE_OPERATIONAL &&
-            (t - m_sdo_cfg_step_ms) < EROB_NMT_RESET_DELAY_MS) {
+        /* Always wait the full reset delay before proceeding.  Do NOT check
+         * m_erob_nmt_state here: if eRob was already in Pre-Op when Reset
+         * Communication was sent, the state appears ready immediately, but the
+         * reset bootup frame arrives shortly after and would trigger a full
+         * config restart if we had already advanced to NMT_DELAY. */
+        if ((t - m_sdo_cfg_step_ms) < EROB_NMT_RESET_DELAY_MS) {
             return false;
         }
-        /* eRob is in Pre-Op (or timeout elapsed) — send NMT Pre-Op to confirm. */
         (void)co_nmt_master_send(&canopen_node, 0x80U, EROB_NODE_ID);
         m_sdo_cfg_step_ms = t;
         m_sdo_cfg_state   = EROB_SDO_CFG_NMT_DELAY;
@@ -625,6 +632,12 @@ static void on_erob_hb_event(co_node_t *node, uint8_t slave_node_id,
     }
 
     if (event == CO_HB_EVENT_TIMEOUT) {
+        /* Ignore heartbeat loss during startup: Reset Communication reboots
+         * eRob (heartbeat producer reset to 0), so silence is expected until
+         * the SDO config sequence restores 0x1017 and NMT Start is sent. */
+        if (!m_master_started) {
+            return;
+        }
         /* Attempt a Quick Stop — if the bus is still up the drive will
          * decelerate gracefully; if not, the drive's own RPDO event timer
          * (0x1400:05 = 500 ms) will have already triggered a self-stop. */
@@ -637,8 +650,15 @@ static void on_erob_hb_event(co_node_t *node, uint8_t slave_node_id,
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
         m_master_started = false;
+        m_erob_hb_lost   = true;
     } else {
-        /* eRob recovered — re-run SDO config, then restart CiA 402 sequencing. */
+        /* eRob recovered — only re-configure if a real timeout previously
+         * fired.  Spurious RECOVERED events arise from the startup silence
+         * after NMT Reset Communication and must be ignored. */
+        if (!m_erob_hb_lost) {
+            return;
+        }
+        m_erob_hb_lost   = false;
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
         m_master_started = false;
