@@ -197,10 +197,64 @@ static void erob_sdo_send_write(uint16_t index, uint8_t subindex, uint32_t value
     (void)canopen_node.iface.send(canopen_node.iface.user, &f);
 }
 
+static void on_erob_nmt_state_change(co_nmt_state_t new_state)
+{
+    switch (new_state) {
+
+    case CO_NMT_INITIALIZING:
+        /* Bootup message — full reconnect: re-run SDO config + NMT Start. */
+        m_target_vel     = 0;
+        m_controlword    = CW_SHUTDOWN;
+        m_drive_state    = MASTER_CIA402_IDLE;
+        m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
+        m_sdo_cfg_step   = 0U;
+        m_master_started = false;
+        break;
+
+    case CO_NMT_PRE_OPERATIONAL:
+        /* eRob dropped to pre-op (e.g. received Reset Communication or
+         * external NMT command) — PDOs are inactive.  Re-configure and
+         * send NMT Start so PDO exchange resumes. */
+        m_target_vel     = 0;
+        m_controlword    = CW_SHUTDOWN;
+        m_drive_state    = MASTER_CIA402_IDLE;
+        m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
+        m_sdo_cfg_step   = 0U;
+        m_master_started = false;
+        break;
+
+    case CO_NMT_STOPPED:
+        /* eRob in Stopped state — no PDOs, no SDO.  Zero velocity and
+         * stall the drive state machine; send NMT Start to recover. */
+        m_target_vel     = 0;
+        m_controlword    = CW_SHUTDOWN;
+        m_drive_state    = MASTER_CIA402_IDLE;
+        /* Do NOT reset m_master_started — we just need NMT Start, not
+         * a full SDO re-config.  The main loop detects !m_master_started
+         * only when nmt_state == OPERATIONAL; here we send Start directly. */
+        (void)co_nmt_master_send(&canopen_node, 0x01U, EROB_NODE_ID);
+        break;
+
+    case CO_NMT_OPERATIONAL:
+        /* eRob is (back) in Operational — CiA 402 sequencing resumes
+         * automatically via the RPDO frame callback. */
+        break;
+    }
+}
+
 /* on_rx_frame hook — intercepts SDO responses and EMCY frames from the eRob. */
 static void on_rx_frame(void *user, const co_can_frame_t *frame)
 {
     (void)user;
+
+    /* Track eRob NMT state from its heartbeat (COB-ID 0x700 + node_id). */
+    if (frame->cob_id == (0x700U + EROB_NODE_ID) && frame->len >= 1U) {
+        const co_nmt_state_t new_state = (co_nmt_state_t)(frame->data[0] & 0x7FU);
+        if (new_state != m_erob_nmt_state) {
+            m_erob_nmt_state = new_state;
+            on_erob_nmt_state_change(new_state);
+        }
+    }
 
     /* Capture EMCY frames (COB-ID 0x80 + node_id) to expose the fault code. */
     if (frame->cob_id == (0x80U + EROB_NODE_ID) && frame->len >= 3U) {
@@ -323,6 +377,9 @@ static uint32_t              m_state_entry_ms = 0;
 
 /* Whether the master has self-promoted to OPERATIONAL and started the eRob. */
 static bool m_master_started = false;
+
+/* Last observed NMT state of the eRob (from its heartbeat frames). */
+static co_nmt_state_t m_erob_nmt_state = CO_NMT_INITIALIZING;
 
 /* ── CiA 402 statusword bit helpers (DS402 Table 14) ─────────────────────── */
 #define SW_RTSO  0x0001U  /* Ready to Switch On       */
