@@ -122,5 +122,13 @@ void co_stm32_attach(co_node_t *node,
     iface.send   = co_stm32_send;
     iface.millis = co_stm32_millis;
 
+    /* Move the FDCAN peripheral from configuration mode to normal operation.
+     * HAL_FDCAN_AddMessageToTxFifoQ returns HAL_ERROR if the peripheral has
+     * not been started, which surfaces as CO_ERROR_HW on the first send.   */
+    (void)HAL_FDCAN_Start(hfdcan);
+
+    /* Activate RX FIFO0 so HAL_FDCAN_GetRxFifoFillLevel works correctly.  */
+    (void)HAL_FDCAN_ActivateNotification(hfdcan, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, 0U);
+
     co_init(node, &iface, node_id, heartbeat_ms);
 }
