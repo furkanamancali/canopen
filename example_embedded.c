@@ -156,6 +156,10 @@ static uint32_t             m_sdo_cfg_step     = 0U;
 static uint32_t             m_sdo_cfg_step_ms  = 0U;
 static bool                 m_sdo_cfg_resp_ok  = false;
 
+/* Last EMCY frame received from eRob — inspect in debugger to identify fault. */
+volatile uint16_t g_erob_last_emcy_code = 0U;   /* e.g. 0x8611 = following error */
+volatile uint8_t  g_erob_last_emcy_reg  = 0U;   /* error register bits           */
+
 static void erob_sdo_send_write(uint16_t index, uint8_t subindex, uint32_t value, uint8_t size)
 {
     uint8_t cmd;
@@ -179,10 +183,18 @@ static void erob_sdo_send_write(uint16_t index, uint8_t subindex, uint32_t value
     (void)canopen_node.iface.send(canopen_node.iface.user, &f);
 }
 
-/* on_rx_frame hook — intercepts SDO responses from the eRob. */
+/* on_rx_frame hook — intercepts SDO responses and EMCY frames from the eRob. */
 static void on_rx_frame(void *user, const co_can_frame_t *frame)
 {
     (void)user;
+
+    /* Capture EMCY frames (COB-ID 0x80 + node_id) to expose the fault code. */
+    if (frame->cob_id == (0x80U + EROB_NODE_ID) && frame->len >= 3U) {
+        g_erob_last_emcy_code = (uint16_t)frame->data[0]
+                              | ((uint16_t)frame->data[1] << 8);
+        g_erob_last_emcy_reg  = frame->data[2];
+    }
+
     if (m_sdo_cfg_state != EROB_SDO_CFG_WAIT_RESPONSE) {
         return;
     }
@@ -325,8 +337,11 @@ static inline bool erob_sw_operation_enabled(uint16_t sw)
 }
 static inline bool erob_sw_fault_reaction_active(uint16_t sw)
 {
-    /* DS402 Table 14: Fault Reaction Active = RTSO+SO+OE+QS+Fault all set */
-    return (sw & SW_MASK) == (SW_FAULT | SW_OE | SW_SO | SW_RTSO | SW_QS);
+    /* FRA: Fault set while drive still appears enabled (RTSO+SO+OE all set).
+     * QS is excluded from the mask — drives differ on whether it is set or
+     * clear during fault reaction, so matching it would miss half the cases. */
+    return (sw & (SW_FAULT | SW_OE | SW_SO | SW_RTSO))
+               == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
 }
 static inline bool erob_sw_fault(uint16_t sw)
 {
@@ -440,11 +455,13 @@ static void erob_state_machine_step(void)
         break;
 
     case MASTER_CIA402_RUNNING:
-        m_controlword = CW_ENABLE_OPERATION;
         if (erob_sw_fault(sw)) {
             m_target_vel     = 0;
+            m_controlword    = CW_FAULT_RESET_CLEAR;  /* stop enabling immediately */
             m_drive_state    = MASTER_CIA402_FAULT;
             m_state_entry_ms = t;
+        } else {
+            m_controlword = CW_ENABLE_OPERATION;
         }
         break;
 
