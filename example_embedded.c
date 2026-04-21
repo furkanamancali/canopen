@@ -53,10 +53,10 @@ extern FDCAN_HandleTypeDef hfdcan1;
 
 /* ── Master / eRob configuration ─────────────────────────────────────────── */
 #define MASTER_NODE_ID          0x7FU
-#define MASTER_HEARTBEAT_MS     100U
+#define MASTER_HEARTBEAT_MS     50U      /* send every 50 ms; eRob times out at 150 ms */
 
 #define EROB_NODE_ID            0x05U
-#define EROB_HB_TIMEOUT_MS      1000U    /* declare eRob lost after 1 s       */
+#define EROB_HB_TIMEOUT_MS      150U     /* 3× master heartbeat period        */
 
 #define SYNC_PERIOD_US          1000UL   /* 1 ms SYNC produced by master      */
 
@@ -69,7 +69,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 /* Sequencing state timeouts */
 #define EROB_STATE_TIMEOUT_MS     2000U  /* max time to wait in any seq state */
 #define EROB_FAULT_RESET_MS       10U    /* duration to hold fault-reset bit  */
-#define EROB_RPDO_WATCHDOG_MS     500U   /* master-side: stop if no RPDO for this long */
+#define EROB_RPDO_WATCHDOG_MS     100U   /* master-side: stop if no RPDO for this long */
 
 /* CiA 402 controlword patterns (DS402 §8.1.3) */
 #define CW_SHUTDOWN             0x0006U
@@ -144,6 +144,13 @@ static const erob_sdo_write_t EROB_PDO_CFG[] = {
     { 0x1A01U, 0x02U, 0x60770010UL,     4U },  /* torque actual value 16-bit   */
     { 0x1A01U, 0x00U, 2U,                1U },
     { 0x1801U, 0x01U, EROB_TPDO2_COBEN, 4U },
+    /* ── Heartbeat watchdog: eRob monitors master ── */
+    /* eRob produces its own heartbeat every 50 ms so the master consumer
+     * (EROB_HB_TIMEOUT_MS = 150 ms) detects loss within ~150 ms.           */
+    { 0x1017U, 0x00U, 50U,                                        2U },
+    /* eRob consumes the master (0x7F) heartbeat with 150 ms timeout.
+     * If master disappears the drive self-faults and stops.                */
+    { 0x1016U, 0x01U, ((uint32_t)MASTER_NODE_ID << 16) | 150U,   4U },
 };
 #define EROB_PDO_CFG_COUNT ((uint32_t)(sizeof(EROB_PDO_CFG) / sizeof(EROB_PDO_CFG[0])))
 
