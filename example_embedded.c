@@ -174,10 +174,16 @@ static void erob_state_machine_step(void)
 
     case MASTER_CIA402_IDLE:
         /* Wait for a stable, known state before attempting sequencing.
-         * SW=0 ("Not Ready to Switch On") is a transient power-on state;
-         * advancing before the drive finishes its own init causes spurious
-         * SHUTDOWN timeouts that loop forever.                             */
-        if (erob_sw_fault(sw)) {
+         * - SW=0 ("Not Ready to Switch On"): transient power-on, wait.
+         * - Fault Reaction Active: drive is still stopping; fault-reset
+         *   requires a 0→1 rising edge *after* the drive reaches stable
+         *   Fault state — issuing it earlier is a spec violation and most
+         *   drives silently ignore it, leaving the fault uncleared.
+         * - Fault: raise the reset pulse.
+         * - Any non-fault state: proceed directly to Shutdown.            */
+        if (erob_sw_fault_reaction_active(sw)) {
+            break;  /* wait for drive to reach stable Fault state */
+        } else if (erob_sw_fault(sw)) {
             m_controlword    = CW_FAULT_RESET;
             m_drive_state    = MASTER_CIA402_FAULT_RESET;
             m_state_entry_ms = t;
