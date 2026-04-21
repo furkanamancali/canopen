@@ -60,27 +60,16 @@ extern FDCAN_HandleTypeDef hfdcan1;
 
 #define SYNC_PERIOD_US          1000UL   /* 1 ms SYNC produced by master      */
 
-/*
- * Velocity unit conversion: 0x60FF / 0x6083 / 0x6084 native units.
- *
- * Check the eRob's 0x6094:01 (numerator) and 0x6094:02 (denominator) to
- * find the actual factor.  Common cases:
- *   - Drive reports RPM directly:    EROB_VEL_UNITS_PER_RPM = 1
- *   - 17-bit encoder, counts/s:      EROB_VEL_UNITS_PER_RPM = 131072/60 ≈ 2185
- *   - 14-bit encoder, counts/s:      EROB_VEL_UNITS_PER_RPM = 16384/60  ≈  273
- *
- * Set EROB_VEL_UNITS_PER_RPM to 1 initially; increase if motor runs far
- * too slowly for a given RPM command.
- */
-#define EROB_VEL_UNITS_PER_RPM  1        /* update after reading 0x6094       */
-
-#define EROB_DEFAULT_ACCEL      (5000U * EROB_VEL_UNITS_PER_RPM)   /* [RPM/s]  */
-#define EROB_DEFAULT_DECEL      (5000U * EROB_VEL_UNITS_PER_RPM)   /* [RPM/s]  */
-#define EROB_MAX_VEL_RPM        3000     /* [RPM]  clamped before unit convert */
-
+#define EROB_DEFAULT_ACCEL            (5000)     /* [plus/s] */
+#define EROB_DEFAULT_DECEL            (5000)     /* [plus/s] */ 
+#define EROB_MAX_VEL_RPM              (3000)     /* [RPM]  clamped before unit convert */
+#define EROB_ENCODER_MAX_VAL          (524288U)  /* [plus]*/
+#define EROB_ENCODER_REDUCTOR_RATE    (0.6F)
+#define EROB_ENCODER_RPM_TO_PLUS_RATE (8738)     /* EROB_ENCODER_MAX_VAL * EROB_ENCODER_REDUCTOR_RATE */
 /* Sequencing state timeouts */
-#define EROB_STATE_TIMEOUT_MS   2000U    /* max time to wait in any seq state */
-#define EROB_FAULT_RESET_MS     10U      /* duration to hold fault-reset bit  */
+#define EROB_STATE_TIMEOUT_MS     2000U  /* max time to wait in any seq state */
+#define EROB_FAULT_RESET_MS       10U    /* duration to hold fault-reset bit  */
+#define EROB_RPDO_WATCHDOG_MS     500U   /* master-side: stop if no RPDO for this long */
 
 /* CiA 402 controlword patterns (DS402 §8.1.3) */
 #define CW_SHUTDOWN             0x0006U
@@ -128,6 +117,7 @@ static const erob_sdo_write_t EROB_PDO_CFG[] = {
     { 0x1600U, 0x03U, 0x60FF0020UL,     4U },  /* target velocity 32-bit       */
     { 0x1600U, 0x00U, 3U,                1U },  /* unlock: 3 entries            */
     { 0x1400U, 0x01U, EROB_RPDO1_COBEN, 4U },  /* enable                       */
+    { 0x1400U, 0x05U, 500U,             2U },  /* comm watchdog: fault if no PDO for 500 ms */
     /* ── eRob RPDO2 (receives master TPDO2) ── */
     { 0x1401U, 0x01U, EROB_RPDO2_COB,   4U },
     { 0x1401U, 0x02U, 0xFFU,             1U },
@@ -136,6 +126,7 @@ static const erob_sdo_write_t EROB_PDO_CFG[] = {
     { 0x1601U, 0x02U, 0x60840020UL,     4U },  /* profile deceleration 32-bit  */
     { 0x1601U, 0x00U, 2U,                1U },
     { 0x1401U, 0x01U, EROB_RPDO2_COBEN, 4U },
+    { 0x1401U, 0x05U, 500U,             2U },  /* comm watchdog: fault if no PDO for 500 ms */
     /* ── eRob TPDO1 (sends to master RPDO1) ── */
     { 0x1800U, 0x01U, EROB_TPDO1_COB,   4U },
     { 0x1800U, 0x02U, 0x01U,             1U },  /* synchronous (SYNC-triggered) */
@@ -169,6 +160,93 @@ static erob_sdo_cfg_state_t m_sdo_cfg_state   = EROB_SDO_CFG_IDLE;
 static uint32_t             m_sdo_cfg_step     = 0U;
 static uint32_t             m_sdo_cfg_step_ms  = 0U;
 static bool                 m_sdo_cfg_resp_ok  = false;
+
+/* Timestamp of the last received RPDO1 from the eRob (ms). */
+static uint32_t m_last_rpdo1_ms = 0U;
+
+/* ── OD backing storage ──────────────────────────────────────────────────── */
+/* TPDO1: command frame sent to eRob every SYNC */
+static uint16_t  m_controlword   = CW_SHUTDOWN;
+static int8_t    m_mode_of_op    = EROB_MODE_PROFILE_VEL;
+static int32_t   m_target_vel    = 0;
+
+/* TPDO2: ramp parameters sent to eRob every SYNC */
+static uint32_t  m_profile_accel = EROB_DEFAULT_ACCEL;
+static uint32_t  m_profile_decel = EROB_DEFAULT_DECEL;
+
+/* RPDO1: feedback received from eRob every SYNC */
+static uint16_t  m_statusword    = 0;
+static int8_t    m_mode_display  = 0;
+static int32_t   m_velocity_act  = 0;
+
+/* RPDO2: feedback received from eRob every SYNC */
+static int32_t   m_position_act  = 0;
+static int16_t   m_torque_act    = 0;
+
+/* ── CiA 402 master state machine ────────────────────────────────────────── */
+typedef enum {
+    MASTER_CIA402_IDLE = 0,      /* waiting for first statusword               */
+    MASTER_CIA402_FAULT_RESET,   /* holding fault-reset bit high               */
+    MASTER_CIA402_WAIT_FAULT_CLEAR, /* waiting for SW_FAULT to drop            */
+    MASTER_CIA402_SHUTDOWN,      /* sending Shutdown → READY_TO_SWITCH_ON      */
+    MASTER_CIA402_SWITCH_ON,     /* sending Switch On → SWITCHED_ON            */
+    MASTER_CIA402_ENABLE,        /* sending Enable Op → OPERATION_ENABLED      */
+    MASTER_CIA402_RUNNING,       /* OPERATION_ENABLED, applying velocity        */
+    MASTER_CIA402_FAULT,         /* eRob reported a fault — recovery pending    */
+} master_cia402_state_t;
+
+static master_cia402_state_t m_drive_state    = MASTER_CIA402_IDLE;
+static uint32_t              m_state_entry_ms = 0;
+
+/* Whether the master has self-promoted to OPERATIONAL and started the eRob. */
+static bool m_master_started = false;
+
+/* Last observed NMT state of the eRob (from its heartbeat frames). */
+static co_nmt_state_t m_erob_nmt_state = CO_NMT_INITIALIZING;
+
+/* ── CiA 402 statusword bit helpers (DS402 Table 14) ─────────────────────── */
+#define SW_RTSO  0x0001U  /* Ready to Switch On       */
+#define SW_SO    0x0002U  /* Switched On              */
+#define SW_OE    0x0004U  /* Operation Enabled        */
+#define SW_FAULT 0x0008U  /* Fault                    */
+#define SW_QS    0x0020U  /* Quick Stop               */
+#define SW_SOD   0x0040U  /* Switch On Disabled       */
+#define SW_MASK  (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD)
+
+static inline bool erob_sw_switch_on_disabled(uint16_t sw)
+{
+    return (sw & SW_MASK) == SW_SOD;
+}
+static inline bool erob_sw_ready_to_switch_on(uint16_t sw)
+{
+    return (sw & SW_MASK) == (SW_RTSO | SW_QS);
+}
+static inline bool erob_sw_switched_on(uint16_t sw)
+{
+    return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_QS);
+}
+static inline bool erob_sw_operation_enabled(uint16_t sw)
+{
+    return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_OE | SW_QS);
+}
+static inline bool erob_sw_fault_reaction_active(uint16_t sw)
+{
+    /* FRA: Fault set while drive still appears enabled (RTSO+SO+OE all set).
+     * QS is excluded from the mask — drives differ on whether it is set or
+     * clear during fault reaction, so matching it would miss half the cases. */
+    return (sw & (SW_FAULT | SW_OE | SW_SO | SW_RTSO))
+               == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
+}
+static inline bool erob_sw_fault(uint16_t sw)
+{
+    return (sw & SW_FAULT) != 0U;
+}
+
+/* ── Inline millis helper ────────────────────────────────────────────────── */
+static inline uint32_t now_ms(void)
+{
+    return canopen_node.iface.millis(canopen_node.iface.user);
+}
 
 /* Last EMCY frame received from eRob — inspect in debugger to identify fault. */
 volatile uint16_t g_erob_last_emcy_code = 0U;   /* e.g. 0x8611 = following error */
@@ -341,90 +419,6 @@ static bool erob_sdo_cfg_run(void)
     return false;
 }
 
-/* ── OD backing storage ──────────────────────────────────────────────────── */
-/* TPDO1: command frame sent to eRob every SYNC */
-static uint16_t  m_controlword   = CW_SHUTDOWN;
-static int8_t    m_mode_of_op    = EROB_MODE_PROFILE_VEL;
-static int32_t   m_target_vel    = 0;
-
-/* TPDO2: ramp parameters sent to eRob every SYNC */
-static uint32_t  m_profile_accel = EROB_DEFAULT_ACCEL;
-static uint32_t  m_profile_decel = EROB_DEFAULT_DECEL;
-
-/* RPDO1: feedback received from eRob every SYNC */
-static uint16_t  m_statusword    = 0;
-static int8_t    m_mode_display  = 0;
-static int32_t   m_velocity_act  = 0;
-
-/* RPDO2: feedback received from eRob every SYNC */
-static int32_t   m_position_act  = 0;
-static int16_t   m_torque_act    = 0;
-
-/* ── CiA 402 master state machine ────────────────────────────────────────── */
-typedef enum {
-    MASTER_CIA402_IDLE = 0,      /* waiting for first statusword               */
-    MASTER_CIA402_FAULT_RESET,   /* holding fault-reset bit high               */
-    MASTER_CIA402_WAIT_FAULT_CLEAR, /* waiting for SW_FAULT to drop            */
-    MASTER_CIA402_SHUTDOWN,      /* sending Shutdown → READY_TO_SWITCH_ON      */
-    MASTER_CIA402_SWITCH_ON,     /* sending Switch On → SWITCHED_ON            */
-    MASTER_CIA402_ENABLE,        /* sending Enable Op → OPERATION_ENABLED      */
-    MASTER_CIA402_RUNNING,       /* OPERATION_ENABLED, applying velocity        */
-    MASTER_CIA402_FAULT,         /* eRob reported a fault — recovery pending    */
-} master_cia402_state_t;
-
-static master_cia402_state_t m_drive_state    = MASTER_CIA402_IDLE;
-static uint32_t              m_state_entry_ms = 0;
-
-/* Whether the master has self-promoted to OPERATIONAL and started the eRob. */
-static bool m_master_started = false;
-
-/* Last observed NMT state of the eRob (from its heartbeat frames). */
-static co_nmt_state_t m_erob_nmt_state = CO_NMT_INITIALIZING;
-
-/* ── CiA 402 statusword bit helpers (DS402 Table 14) ─────────────────────── */
-#define SW_RTSO  0x0001U  /* Ready to Switch On       */
-#define SW_SO    0x0002U  /* Switched On              */
-#define SW_OE    0x0004U  /* Operation Enabled        */
-#define SW_FAULT 0x0008U  /* Fault                    */
-#define SW_QS    0x0020U  /* Quick Stop               */
-#define SW_SOD   0x0040U  /* Switch On Disabled       */
-#define SW_MASK  (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD)
-
-static inline bool erob_sw_switch_on_disabled(uint16_t sw)
-{
-    return (sw & SW_MASK) == SW_SOD;
-}
-static inline bool erob_sw_ready_to_switch_on(uint16_t sw)
-{
-    return (sw & SW_MASK) == (SW_RTSO | SW_QS);
-}
-static inline bool erob_sw_switched_on(uint16_t sw)
-{
-    return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_QS);
-}
-static inline bool erob_sw_operation_enabled(uint16_t sw)
-{
-    return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_OE | SW_QS);
-}
-static inline bool erob_sw_fault_reaction_active(uint16_t sw)
-{
-    /* FRA: Fault set while drive still appears enabled (RTSO+SO+OE all set).
-     * QS is excluded from the mask — drives differ on whether it is set or
-     * clear during fault reaction, so matching it would miss half the cases. */
-    return (sw & (SW_FAULT | SW_OE | SW_SO | SW_RTSO))
-               == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
-}
-static inline bool erob_sw_fault(uint16_t sw)
-{
-    return (sw & SW_FAULT) != 0U;
-}
-
-/* ── Inline millis helper ────────────────────────────────────────────────── */
-static inline uint32_t now_ms(void)
-{
-    return canopen_node.iface.millis(canopen_node.iface.user);
-}
-
 /*
  * Drive the eRob CiA 402 state machine from the master side.
  * Called once per SYNC tick from on_erob_rpdo_frame (after full RPDO1 unpack).
@@ -575,6 +569,7 @@ static void on_erob_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
 
     if (rpdo_num == 0U) {
         /* RPDO1 complete: statusword + mode_display + velocity_act are fresh. */
+        m_last_rpdo1_ms = now_ms();
         erob_state_machine_step();
     }
     /* RPDO2 (position_act + torque_act) needs no immediate action. */
@@ -593,13 +588,18 @@ static void on_erob_hb_event(co_node_t *node, uint8_t slave_node_id,
     }
 
     if (event == CO_HB_EVENT_TIMEOUT) {
-        /* eRob went silent — zero velocity and stall sequencing. */
-        m_target_vel     = 0;
+        /* Attempt a Quick Stop — if the bus is still up the drive will
+         * decelerate gracefully; if not, the drive's own RPDO event timer
+         * (0x1400:05 = 500 ms) will have already triggered a self-stop. */
+        m_target_vel  = 0;
+        m_controlword = CW_QUICK_STOP;
+        (void)co_send_tpdo(&canopen_node, 0U);  /* force immediate send */
+
         m_controlword    = CW_SHUTDOWN;
         m_drive_state    = MASTER_CIA402_IDLE;
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
-        m_master_started = false;   /* re-run SDO config when eRob comes back */
+        m_master_started = false;
     } else {
         /* eRob recovered — re-run SDO config, then restart CiA 402 sequencing. */
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
@@ -640,17 +640,17 @@ void erob_set_target_velocity(int32_t rpm)
 {
     if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
     if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
-    m_target_vel = rpm * (int32_t)EROB_VEL_UNITS_PER_RPM;
+    m_target_vel = rpm * EROB_ENCODER_RPM_TO_PLUS_RATE;
 }
 
 /*
  * erob_set_accel() — change profile acceleration/deceleration at runtime.
- * Values are in RPM/s.  Takes effect on the next TPDO2 transmission.
+ * Values are in plus/s.  Takes effect on the next TPDO2 transmission.
  */
-void erob_set_accel(uint32_t accel_rpm_s, uint32_t decel_rpm_s)
+void erob_set_accel(uint32_t accel_plus_s, uint32_t decel_plus_s)
 {
-    m_profile_accel = accel_rpm_s * EROB_VEL_UNITS_PER_RPM;
-    m_profile_decel = decel_rpm_s * EROB_VEL_UNITS_PER_RPM;
+    m_profile_accel = accel_plus_s;
+    m_profile_decel = decel_plus_s;
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
@@ -890,7 +890,20 @@ void app_main_loop(void)
             }
         }
 
-        /* 3. On each SYNC tick: forward the application target velocity into
+        /* 3. RPDO watchdog — if the drive is running but no RPDO1 has arrived
+         *    within EROB_RPDO_WATCHDOG_MS, the bus is probably broken.  Send a
+         *    Quick Stop immediately; the drive's own RPDO event timer (500 ms)
+         *    provides the drive-side redundant safety stop.                   */
+        if (m_master_started &&
+            m_drive_state == MASTER_CIA402_RUNNING &&
+            (now_ms() - m_last_rpdo1_ms) >= EROB_RPDO_WATCHDOG_MS) {
+            m_target_vel  = 0;
+            m_controlword = CW_QUICK_STOP;
+            (void)co_send_tpdo(&canopen_node, 0U);
+            m_drive_state = MASTER_CIA402_IDLE;
+        }
+
+        /* 4. On each SYNC tick: forward the application target velocity into
          *    the TPDO1 backing variable.  co_process() will pack it and send
          *    it to the eRob on the same SYNC event.                          */
         if (canopen_node.sync_event_pending) {
