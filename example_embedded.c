@@ -297,27 +297,31 @@ static void on_erob_nmt_state_change(co_nmt_state_t new_state)
         break;
 
     case CO_NMT_PRE_OPERATIONAL:
-        /* eRob dropped to pre-op (e.g. received Reset Communication or
-         * external NMT command) — PDOs are inactive.  Re-configure and
-         * send NMT Start so PDO exchange resumes. */
+        m_target_vel  = 0;
+        m_controlword = CW_SHUTDOWN;
+        m_drive_state = MASTER_CIA402_IDLE;
+        /* NMT_DELAY means WE just sent NMT Pre-Op as the first step of the
+         * SDO config sequence and this heartbeat is the expected confirmation.
+         * Resetting here would restart the sequence and send a second Pre-Op,
+         * which confuses some drives during master restart.  All other states
+         * (IDLE, WAIT_RESPONSE, DONE) mean Pre-Op arrived unexpectedly and a
+         * full re-config is required. */
+        if (m_sdo_cfg_state != EROB_SDO_CFG_NMT_DELAY) {
+            m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
+            m_sdo_cfg_step   = 0U;
+            m_master_started = false;
+        }
+        break;
+
+    case CO_NMT_STOPPED:
+        /* eRob stopped — PDOs and SDO are inactive.  Trigger a full
+         * re-config so PDO mapping is restored before NMT Start is sent. */
         m_target_vel     = 0;
         m_controlword    = CW_SHUTDOWN;
         m_drive_state    = MASTER_CIA402_IDLE;
         m_sdo_cfg_state  = EROB_SDO_CFG_IDLE;
         m_sdo_cfg_step   = 0U;
         m_master_started = false;
-        break;
-
-    case CO_NMT_STOPPED:
-        /* eRob in Stopped state — no PDOs, no SDO.  Zero velocity and
-         * stall the drive state machine; send NMT Start to recover. */
-        m_target_vel     = 0;
-        m_controlword    = CW_SHUTDOWN;
-        m_drive_state    = MASTER_CIA402_IDLE;
-        /* Do NOT reset m_master_started — we just need NMT Start, not
-         * a full SDO re-config.  The main loop detects !m_master_started
-         * only when nmt_state == OPERATIONAL; here we send Start directly. */
-        (void)co_nmt_master_send(&canopen_node, 0x01U, EROB_NODE_ID);
         break;
 
     case CO_NMT_OPERATIONAL:
