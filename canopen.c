@@ -2163,6 +2163,10 @@ co_error_t co_on_can_rx(co_node_t *node, const co_can_frame_t *frame)
         return CO_ERROR_INVALID_ARGS;
     }
 
+    if (node->iface.on_rx_frame) {
+        node->iface.on_rx_frame(node->iface.user, frame);
+    }
+
     if (frame->cob_id == CO_COB_NMT) {
         return co_process_nmt(node, frame);
     }

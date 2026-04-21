@@ -183,6 +183,7 @@ typedef struct {
     void (*on_reset_communication)(void *user);
     void (*on_reset_application)(void *user);
     void (*on_reset)(void *user, co_reset_type_t type);
+    void (*on_rx_frame)(void *user, const co_can_frame_t *frame);
 } co_if_t;
 
 struct co_node {
