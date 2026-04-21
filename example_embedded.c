@@ -325,8 +325,8 @@ static inline bool erob_sw_operation_enabled(uint16_t sw)
 }
 static inline bool erob_sw_fault_reaction_active(uint16_t sw)
 {
-    /* DS402 Table 14: Fault Reaction Active = RTSO+SO+OE+Fault bits all set */
-    return (sw & SW_MASK) == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
+    /* DS402 Table 14: Fault Reaction Active = RTSO+SO+OE+QS+Fault all set */
+    return (sw & SW_MASK) == (SW_FAULT | SW_OE | SW_SO | SW_RTSO | SW_QS);
 }
 static inline bool erob_sw_fault(uint16_t sw)
 {
@@ -452,7 +452,10 @@ static void erob_state_machine_step(void)
         m_target_vel  = 0;
 
         if (erob_sw_fault_reaction_active(sw)) {
-            /* Drive is still reacting — do not touch controlword. */
+            /* Drive is decelerating — keep controlword neutral and hold the
+             * timer so the fault-reset pulse starts only after FRA exits. */
+            m_controlword    = CW_FAULT_RESET_CLEAR;
+            m_state_entry_ms = t;
             break;
         }
 
@@ -467,7 +470,7 @@ static void erob_state_machine_step(void)
                 m_state_entry_ms = t;
             } else if ((t - m_state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
                 /* eRob is still faulted after timeout — retry reset pulse. */
-                m_state_entry_ms = t;  /* restart the FAULT phase timer */
+                m_state_entry_ms = t;
             }
         }
         break;
