@@ -60,9 +60,23 @@ extern FDCAN_HandleTypeDef hfdcan1;
 
 #define SYNC_PERIOD_US          1000UL   /* 1 ms SYNC produced by master      */
 
-#define EROB_DEFAULT_ACCEL      500U     /* [RPM/s]                           */
-#define EROB_DEFAULT_DECEL      500U     /* [RPM/s]                           */
-#define EROB_MAX_VEL_RPM        3000     /* [RPM]  clamped before write       */
+/*
+ * Velocity unit conversion: 0x60FF / 0x6083 / 0x6084 native units.
+ *
+ * Check the eRob's 0x6094:01 (numerator) and 0x6094:02 (denominator) to
+ * find the actual factor.  Common cases:
+ *   - Drive reports RPM directly:    EROB_VEL_UNITS_PER_RPM = 1
+ *   - 17-bit encoder, counts/s:      EROB_VEL_UNITS_PER_RPM = 131072/60 ≈ 2185
+ *   - 14-bit encoder, counts/s:      EROB_VEL_UNITS_PER_RPM = 16384/60  ≈  273
+ *
+ * Set EROB_VEL_UNITS_PER_RPM to 1 initially; increase if motor runs far
+ * too slowly for a given RPM command.
+ */
+#define EROB_VEL_UNITS_PER_RPM  1        /* update after reading 0x6094       */
+
+#define EROB_DEFAULT_ACCEL      (5000U * EROB_VEL_UNITS_PER_RPM)   /* [RPM/s]  */
+#define EROB_DEFAULT_DECEL      (5000U * EROB_VEL_UNITS_PER_RPM)   /* [RPM/s]  */
+#define EROB_MAX_VEL_RPM        3000     /* [RPM]  clamped before unit convert */
 
 /* Sequencing state timeouts */
 #define EROB_STATE_TIMEOUT_MS   2000U    /* max time to wait in any seq state */
@@ -569,7 +583,17 @@ void erob_set_target_velocity(int32_t rpm)
 {
     if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
     if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
-    m_target_vel = rpm;
+    m_target_vel = rpm * (int32_t)EROB_VEL_UNITS_PER_RPM;
+}
+
+/*
+ * erob_set_accel() — change profile acceleration/deceleration at runtime.
+ * Values are in RPM/s.  Takes effect on the next TPDO2 transmission.
+ */
+void erob_set_accel(uint32_t accel_rpm_s, uint32_t decel_rpm_s)
+{
+    m_profile_accel = accel_rpm_s * EROB_VEL_UNITS_PER_RPM;
+    m_profile_decel = decel_rpm_s * EROB_VEL_UNITS_PER_RPM;
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
