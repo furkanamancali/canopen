@@ -73,6 +73,105 @@ uint32_t co_stm32_millis(void *user)
     return HAL_GetTick();
 }
 
+/* ── SPSC ring buffer helpers ────────────────────────────────────────────────
+ * Only co_stm32_rx_isr() writes head; only co_stm32_drain_rx() writes tail.
+ * __DMB() barriers ensure the frame data is visible before the index update
+ * on both producer and consumer sides (required on out-of-order pipelines
+ * such as Cortex-M7). */
+
+static bool co_stm32_rx_enqueue(co_stm32_rx_queue_t *q, const co_can_frame_t *f)
+{
+    uint32_t h    = q->head;
+    uint32_t next = (h + 1U) & (CO_STM32_RX_QUEUE_SIZE - 1U);
+    if (next == q->tail) {
+        return false;   /* full — drop frame */
+    }
+    q->buf[h] = *f;
+    __DMB();
+    q->head = next;
+    return true;
+}
+
+static bool co_stm32_rx_dequeue(co_stm32_rx_queue_t *q, co_can_frame_t *f)
+{
+    uint32_t t = q->tail;
+    if (t == q->head) {
+        return false;   /* empty */
+    }
+    *f = q->buf[t];
+    __DMB();
+    q->tail = (t + 1U) & (CO_STM32_RX_QUEUE_SIZE - 1U);
+    return true;
+}
+
+/* ── ISR entry point ─────────────────────────────────────────────────────────
+ * Called from HAL_FDCAN_RxFifo0MsgPendingCallback().
+ *
+ * For heartbeat frames (COB-ID 0x701–0x77F) the matching consumer's
+ * last_rx_ms is updated in-place before the frame is queued.  This prevents
+ * co_process() from reporting a false timeout if the main loop is momentarily
+ * busy: the timeout check compares now_ms() against last_rx_ms, so keeping
+ * that timestamp current is all that matters for liveness.
+ *
+ * All other stack processing (NMT state changes, SDO, PDO callbacks) is
+ * deferred to main-loop context via co_stm32_drain_rx() — no stack re-entrancy
+ * or callback-from-ISR issues. */
+void co_stm32_rx_isr(co_node_t *node, co_stm32_ctx_t *ctx)
+{
+    FDCAN_RxHeaderTypeDef rx_header;
+    uint8_t data[8];
+
+    while (HAL_FDCAN_GetRxFifoFillLevel(ctx->hfdcan, CO_STM32_RX_FIFO) > 0U) {
+        if (HAL_FDCAN_GetRxMessage(ctx->hfdcan, CO_STM32_RX_FIFO, &rx_header, data) != HAL_OK) {
+            break;
+        }
+        if (rx_header.IdType != FDCAN_STANDARD_ID || rx_header.RxFrameType != FDCAN_DATA_FRAME) {
+            continue;
+        }
+        const uint8_t len = co_stm32_decode_dlc(rx_header.DataLength);
+        if (len > 8U) {
+            continue;
+        }
+
+        co_can_frame_t frame;
+        frame.cob_id = rx_header.Identifier;
+        frame.len    = len;
+        for (uint8_t i = 0U; i < len; ++i) {
+            frame.data[i] = data[i];
+        }
+
+        /* Fast-path heartbeat: keep consumer timestamp current so
+         * co_process() never fires a spurious TIMEOUT due to poll latency. */
+        if (frame.cob_id >= 0x701U && frame.cob_id <= 0x77FU && len >= 1U) {
+            const uint8_t hb_node = (uint8_t)(frame.cob_id - 0x700U);
+            const uint32_t now    = HAL_GetTick();
+            for (uint8_t i = 0U; i < CO_HEARTBEAT_CONSUMERS_MAX; ++i) {
+                if (node->hb_consumers[i].enabled &&
+                    node->hb_consumers[i].node_id == hb_node) {
+                    node->hb_runtime[i].last_rx_ms = now;  /* atomic 32-bit write */
+                    break;
+                }
+            }
+        }
+
+        (void)co_stm32_rx_enqueue(&ctx->rx_queue, &frame);
+    }
+}
+
+/* ── Main-loop drain ─────────────────────────────────────────────────────────
+ * Delivers every queued frame to co_on_can_rx() so the full CANopen stack
+ * (NMT callbacks, SDO state machine, PDO unpack + RPDO hooks) runs in task
+ * context, not ISR context. */
+void co_stm32_drain_rx(co_node_t *node, co_stm32_ctx_t *ctx)
+{
+    co_can_frame_t frame;
+    while (co_stm32_rx_dequeue(&ctx->rx_queue, &frame)) {
+        (void)co_on_can_rx(node, &frame);
+    }
+}
+
+/* ── Legacy polled path ──────────────────────────────────────────────────────
+ * Retained for setups that do not use the ISR path. */
 void co_stm32_poll_rx(co_node_t *node, FDCAN_HandleTypeDef *hfdcan)
 {
     FDCAN_RxHeaderTypeDef rx_header;

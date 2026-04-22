@@ -899,6 +899,20 @@ co_error_t app_canopen_init(void)
     return CO_ERROR_NONE;
 }
 
+/* ── FDCAN RX interrupt ──────────────────────────────────────────────────── */
+
+/* Override the HAL weak callback (STM32H7 FDCAN — not bxCAN).
+ * Fires on FDCAN_IT_RX_FIFO0_NEW_MESSAGE, activated in co_stm32_attach().
+ *   - Heartbeat timestamp updated immediately (prevents false timeout).
+ *   - Frame enqueued for full processing in app_main_loop via co_stm32_drain_rx(). */
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    (void)RxFifo0ITs;
+    if (hfdcan == &hfdcan1) {
+        co_stm32_rx_isr(&canopen_node, &can_ctx);
+    }
+}
+
 /* ── Main loop ───────────────────────────────────────────────────────────── */
 
 /*
@@ -914,10 +928,13 @@ volatile int32_t g_target_rpm = 0;
 void app_main_loop(void)
 {
     for (;;) {
-        /* 1. Drain the FDCAN RX FIFO (max CO_STM32_RX_MAX_PER_POLL frames).
-         *    Incoming eRob TPDOs are unpacked into OD backing storage and
-         *    on_erob_rpdo_frame → erob_state_machine_step() is called.      */
-        co_stm32_poll_rx(&canopen_node, &hfdcan1);
+        /* 1. Deliver queued frames to the CANopen stack.
+         *    Frames are placed in the ring buffer by co_stm32_rx_isr() which
+         *    fires from HAL_FDCAN_RxFifo0MsgPendingCallback() at interrupt
+         *    priority.  Heartbeat timestamps are updated there immediately;
+         *    full stack processing (PDO unpack, NMT callbacks, SDO) happens
+         *    here in task context.                                           */
+        co_stm32_drain_rx(&canopen_node, &can_ctx);
 
         /* 2. Startup sequence once the stack sends bootup and enters PRE_OPERATIONAL:
          *
