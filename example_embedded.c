@@ -489,10 +489,13 @@ static void erob_state_machine_step(void)
             m_controlword    = CW_FAULT_RESET;
             m_drive_state    = MASTER_CIA402_FAULT_RESET;
             m_state_entry_ms = t;
-        } else if (erob_sw_switch_on_disabled(sw) ||
-                   erob_sw_ready_to_switch_on(sw)  ||
-                   erob_sw_switched_on(sw)          ||
-                   erob_sw_operation_enabled(sw)) {
+        } else if (sw != 0U) {
+            /* Any non-zero, non-fault statusword — including Quick Stop Active
+             * (0x0003) and Switch On Disabled with QS bit set (0x0060).
+             * CiA 402 Table 7 marks the Quick Stop bit "X" (don't care) in
+             * several states, so exact-mask checks miss valid SOD/RTSO/SO
+             * words with unexpected bits set.  Sending Shutdown is safe from
+             * any non-fault state. */
             m_drive_state    = MASTER_CIA402_SHUTDOWN;
             m_state_entry_ms = t;
         }
