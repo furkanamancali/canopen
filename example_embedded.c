@@ -11,8 +11,10 @@
  *
  * To add or remove eRob modules edit only the EROB_NODES[] table below.
  * Each instance uses two TPDOs and two RPDOs on the master:
- *   instance i → tpdo_num/rpdo_num = i*2  (controlword / statusword)
- *              → tpdo_num/rpdo_num = i*2+1 (accel/decel / position/torque)
+ *   instance i → tpdo_num = i*2    (controlword, mode, target_vel → eRob RPDO1)
+ *              → rpdo_num = i*2    (statusword, mode_display, velocity_act ← eRob TPDO1)
+ *              → rpdo_num = i*2+1  (position_act, torque_act ← eRob TPDO2)
+ * Accel/decel are written once at startup via SDO (0x6083 / 0x6084).
  *
  * OD backing storage uses vendor-specific indices so instances never collide:
  *   TPDO data for instance i: OD index 0x4000 + i  (sub 1–5)
@@ -30,7 +32,8 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_HB_TIMEOUT_MS          150U
 #define SYNC_PERIOD_US              1000UL
 #define EROB_MAX_VEL_RPM            3000
-#define EROB_ENCODER_RPM_TO_PLUS    8738
+#define EROB_COUNTS_PER_REV         540000UL    /* counts per output revolution (empirical) */
+#define EROB_ENCODER_RPM_TO_PLUS    9000        /* counts/s per RPM = 540000/60 */
 #define EROB_STATE_TIMEOUT_MS       2000U
 #define EROB_FAULT_RESET_MS         10U
 #define EROB_RPDO_WATCHDOG_MS       100U
@@ -80,7 +83,7 @@ typedef struct {
     uint8_t  size;
 } erob_sdo_entry_t;
 
-#define EROB_SDO_STEPS 35U
+#define EROB_SDO_STEPS 28U
 static erob_sdo_entry_t m_sdo_tbl[EROB_N][EROB_SDO_STEPS];
 
 static void erob_build_sdo_table(uint8_t i)
@@ -88,8 +91,6 @@ static void erob_build_sdo_table(uint8_t i)
     const uint8_t  nid = EROB_NODES[i].node_id;
     const uint32_t r1d = 0x80000000UL | (0x200UL + nid);
     const uint32_t r1e =                 0x200UL + nid;
-    const uint32_t r2d = 0x80000000UL | (0x300UL + nid);
-    const uint32_t r2e =                 0x300UL + nid;
     const uint32_t t1d = 0x80000000UL | (0x180UL + nid);
     const uint32_t t1e =                 0x180UL + nid;
     const uint32_t t2d = 0x80000000UL | (0x280UL + nid);
@@ -107,15 +108,6 @@ static void erob_build_sdo_table(uint8_t i)
     t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x00U, 3U,            1U };
     t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x01U, r1e,           4U };
     t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x05U, 500U,          2U };
-    /* eRob RPDO2 */
-    t[n++] = (erob_sdo_entry_t){ 0x1401U, 0x01U, r2d,          4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1401U, 0x02U, 0xFFU,         1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1601U, 0x00U, 0U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1601U, 0x01U, 0x60830020UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1601U, 0x02U, 0x60840020UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1601U, 0x00U, 2U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1401U, 0x01U, r2e,           4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1401U, 0x05U, 500U,          2U };
     /* eRob TPDO1 */
     t[n++] = (erob_sdo_entry_t){ 0x1800U, 0x01U, t1d,          4U };
     t[n++] = (erob_sdo_entry_t){ 0x1800U, 0x02U, 0x01U,         1U };
@@ -133,6 +125,9 @@ static void erob_build_sdo_table(uint8_t i)
     t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x02U, 0x60770010UL, 4U };
     t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x00U, 2U,            1U };
     t[n++] = (erob_sdo_entry_t){ 0x1801U, 0x01U, t2e,           4U };
+    /* Profile ramp — written once; accel/decel are no longer PDO-mapped */
+    t[n++] = (erob_sdo_entry_t){ 0x6083U, 0x00U, EROB_NODES[i].default_accel, 4U };
+    t[n++] = (erob_sdo_entry_t){ 0x6084U, 0x00U, EROB_NODES[i].default_decel, 4U };
     /* Heartbeat */
     t[n++] = (erob_sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
     t[n++] = (erob_sdo_entry_t){ 0x1016U, 0x01U,
@@ -164,9 +159,6 @@ typedef struct {
     uint16_t controlword;
     int8_t   mode_of_op;
     int32_t  target_vel;
-    /* OD backing: TPDO2 — master → eRob ramp params */
-    uint32_t profile_accel;
-    uint32_t profile_decel;
     /* OD backing: RPDO1 — eRob → master feedback */
     uint16_t statusword;
     int8_t   mode_display;
@@ -510,6 +502,16 @@ static void erob_cia402_step(uint8_t i)
             e->controlword    = CW_FAULT_RESET_CLEAR;
             e->drive_state    = MASTER_CIA402_FAULT;
             e->state_entry_ms = t;
+        } else if (!erob_sw_operation_enabled(sw)) {
+            /* Drive dropped out of Operation Enabled without asserting Fault
+             * (e.g. Quick Stop Active, Switch On Disabled after cable-replug,
+             * or an inhibit input).  Zero velocity and fall back to IDLE so
+             * the state machine re-reads the live statusword on the next
+             * RPDO1 and runs the correct CiA 402 re-enable sequence. */
+            e->target_vel     = 0;
+            e->controlword    = CW_SHUTDOWN;
+            e->drive_state    = MASTER_CIA402_IDLE;
+            e->state_entry_ms = t;
         } else {
             e->controlword = CW_ENABLE_OPERATION;
         }
@@ -560,6 +562,13 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
     const uint8_t i = (uint8_t)idx;
 
     if (event == CO_HB_EVENT_TIMEOUT) {
+        /* Ignore timeouts that fire before the drive has been started.
+         * erob_sdo_cfg_run() issues an NMT reset (0x82) as its first step,
+         * which takes the drive offline for ~500 ms — longer than
+         * EROB_HB_TIMEOUT_MS.  That expected gap must not disrupt the SDO
+         * config sequence.  Recovery for drives that never completed startup
+         * is handled by on_erob_nmt_change() via the NMT heartbeat callbacks,
+         * not through this path. */
         if (!m_erob[i].master_started) { return; }
         m_erob[i].target_vel  = 0;
         m_erob[i].controlword = CW_QUICK_STOP;
@@ -593,17 +602,19 @@ static void on_reset_communication(void *user)
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32, float *const p_vel_rpm_f32)
+void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
+                      float *const p_vel_rpm_f32, float *const p_torque_pct_f32)
 {
-	*p_pos_deg_f32 = (float)m_erob[erob_find(node_id_u16)].position_act / EROB_ENCODER_RPM_TO_PLUS;
-	*p_vel_rpm_f32 = (float)m_erob[erob_find(node_id_u16)].velocity_act / EROB_ENCODER_RPM_TO_PLUS;
-}
-
-void erob_set_accel(uint8_t instance, uint32_t accel_plus_s, uint32_t decel_plus_s)
-{
-    if (instance >= (uint8_t)EROB_N) { return; }
-    m_erob[instance].profile_accel = accel_plus_s;
-    m_erob[instance].profile_decel = decel_plus_s;
+    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    if (idx < 0) { return; }
+    /* position: counts × (360 / 524288) */
+    *p_pos_deg_f32    = (float)m_erob[idx].position_act
+                        * (360.0f / (float)EROB_COUNTS_PER_REV);
+    /* velocity: counts/s ÷ (524288/60) = RPM */
+    *p_vel_rpm_f32    = (float)m_erob[idx].velocity_act
+                        / (float)EROB_ENCODER_RPM_TO_PLUS;
+    /* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
+    *p_torque_pct_f32 = (float)m_erob[idx].torque_act * 0.1f;
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
@@ -619,11 +630,9 @@ co_error_t app_canopen_init(void)
     for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
         erob_build_sdo_table(i);
 
-        m_erob[i].controlword   = CW_SHUTDOWN;
-        m_erob[i].mode_of_op    = EROB_MODE_PROFILE_VEL;
-        m_erob[i].profile_accel = EROB_NODES[i].default_accel;
-        m_erob[i].profile_decel = EROB_NODES[i].default_decel;
-        m_erob[i].drive_state   = MASTER_CIA402_IDLE;
+        m_erob[i].controlword = CW_SHUTDOWN;
+        m_erob[i].mode_of_op  = EROB_MODE_PROFILE_VEL;
+        m_erob[i].drive_state = MASTER_CIA402_IDLE;
         m_erob[i].nmt_state     = CO_NMT_INITIALIZING;
 
         /* Vendor-specific OD indices avoid collision between instances.
@@ -639,12 +648,6 @@ co_error_t app_canopen_init(void)
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ti, 0x03U,
                         (uint8_t *)&m_erob[i].target_vel,    4U, true, true);
-        if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ti, 0x04U,
-                        (uint8_t *)&m_erob[i].profile_accel, 4U, true, true);
-        if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ti, 0x05U,
-                        (uint8_t *)&m_erob[i].profile_decel, 4U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
 
         err = co_od_add(&canopen_node, ri, 0x01U,
@@ -697,11 +700,9 @@ co_error_t app_canopen_init(void)
         if (co_od_write(&canopen_node, 0x1600U + rn1, 0x02U, (const uint8_t *)&r2m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
         if (co_od_write(&canopen_node, 0x1600U + rn1, 0x00U, &two,  1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-        /* TPDO comm + mapping.  Instance i uses tpdo_num = i*2 and i*2+1. */
+        /* TPDO comm + mapping.  Instance i uses tpdo_num = i*2 only. */
         const uint8_t  tn0   = (uint8_t)(i * 2U);
-        const uint8_t  tn1   = (uint8_t)(i * 2U + 1U);
         const uint32_t tcob0 = 0x200UL + EROB_NODES[i].node_id;
-        const uint32_t tcob1 = 0x300UL + EROB_NODES[i].node_id;
         const uint8_t  tev   = 0xFFU;
         const uint16_t tms   = 1U;
 
@@ -719,19 +720,6 @@ co_error_t app_canopen_init(void)
         if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x02U, (const uint8_t *)&t1m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
         if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x03U, (const uint8_t *)&t1m3, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
         if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x00U, &three, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-
-        if (co_od_write(&canopen_node, 0x1800U + tn1, 0x01U,
-                        (const uint8_t *)&tcob1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1800U + tn1, 0x02U, &tev, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1800U + tn1, 0x05U,
-                        (const uint8_t *)&tms, 2U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-
-        const uint32_t t2m1 = ((uint32_t)ti << 16) | (0x04UL << 8) | 32UL;
-        const uint32_t t2m2 = ((uint32_t)ti << 16) | (0x05UL << 8) | 32UL;
-        if (co_od_write(&canopen_node, 0x1A00U + tn1, 0x00U, &z,   1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn1, 0x01U, (const uint8_t *)&t2m1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn1, 0x02U, (const uint8_t *)&t2m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn1, 0x00U, &two,  1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
     }
 
     co_set_rpdo_frame_hook(&canopen_node, on_rpdo_frame, NULL);
