@@ -14,7 +14,8 @@
  *   instance i → tpdo_num = i*2    (controlword, mode, target_vel → eRob RPDO1)
  *              → rpdo_num = i*2    (statusword, mode_display, velocity_act ← eRob TPDO1)
  *              → rpdo_num = i*2+1  (position_act, torque_act ← eRob TPDO2)
- * Accel/decel are written once at startup via SDO (0x6083 / 0x6084).
+ * Accel/decel are written via SDO (0x6083/0x6084): once at startup, and again
+ * at runtime via erob_set_accel() which queues writes through erob_sdo_rt_run().
  *
  * OD backing storage uses vendor-specific indices so instances never collide:
  *   TPDO data for instance i: OD index 0x4000 + i  (sub 1–5)
@@ -23,6 +24,7 @@
 
 #include "canopen.h"
 #include "canopen_stm32h7_fdcan.h"
+#include "utils/utils.h"
 
 extern FDCAN_HandleTypeDef hfdcan1;
 
@@ -32,14 +34,15 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_HB_TIMEOUT_MS          150U
 #define SYNC_PERIOD_US              1000UL
 #define EROB_MAX_VEL_RPM            3000
-#define EROB_COUNTS_PER_REV         540000UL    /* counts per output revolution (empirical) */
-#define EROB_ENCODER_RPM_TO_PLUS    9000        /* counts/s per RPM = 540000/60 */
+#define EROB_COUNTS_PER_REV         524288    /* counts per output revolution (empirical) */
+#define EROB_ENCODER_RPM_TO_PLUS    8738        /* counts/s per RPM = 524288/60 */
 #define EROB_STATE_TIMEOUT_MS       2000U
 #define EROB_FAULT_RESET_MS         10U
 #define EROB_RPDO_WATCHDOG_MS       100U
 #define EROB_NMT_RESET_DELAY_MS     500U
 #define EROB_NMT_PREOP_DELAY_MS     100U
 #define EROB_SDO_TIMEOUT_MS         500U
+#define EROB_SDO_RT_QUEUE_SIZE      4U   /* max queued runtime SDO writes per instance */
 
 #define CW_SHUTDOWN             0x0006U
 #define CW_SWITCH_ON            0x0007U
@@ -172,6 +175,16 @@ typedef struct {
     uint32_t             sdo_cfg_step_ms;
     bool                 sdo_cfg_resp_ok;
 
+    /* Runtime SDO write queue — filled by erob_set_accel() etc., drained by
+     * erob_sdo_rt_run() one entry per response cycle.  Only active after
+     * master_started = true (startup config is complete). */
+    erob_sdo_entry_t sdo_rt_queue[EROB_SDO_RT_QUEUE_SIZE];
+    uint8_t          sdo_rt_head;     /* next write slot */
+    uint8_t          sdo_rt_tail;     /* next read slot  */
+    bool             sdo_rt_active;   /* waiting for response to current entry */
+    bool             sdo_rt_resp_ok;
+    uint32_t         sdo_rt_ms;       /* timestamp of last send */
+
     master_cia402_state_t drive_state;
     uint32_t              state_entry_ms;
     uint32_t              last_rpdo1_ms;
@@ -239,6 +252,9 @@ static void erob_reset(uint8_t i, bool full)
     m_erob[i].controlword    = CW_SHUTDOWN;
     m_erob[i].drive_state    = MASTER_CIA402_IDLE;
     m_erob[i].master_started = false;
+    m_erob[i].sdo_rt_head    = 0U;
+    m_erob[i].sdo_rt_tail    = 0U;
+    m_erob[i].sdo_rt_active  = false;
     if (full) {
         m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
         m_erob[i].sdo_cfg_step  = 0U;
@@ -343,10 +359,15 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     if (frame->cob_id >= 0x581U && frame->cob_id <= 0x5FFU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x580U);
         const int8_t  idx = erob_find(nid);
-        if (idx >= 0 &&
-            m_erob[idx].sdo_cfg_state == EROB_SDO_CFG_WAIT_RESPONSE) {
-            if ((frame->data[0] & 0xE0U) == 0x60U || frame->data[0] == 0x80U) {
-                m_erob[idx].sdo_cfg_resp_ok = true;
+        if (idx >= 0) {
+            const bool is_response = (frame->data[0] & 0xE0U) == 0x60U
+                                  ||  frame->data[0] == 0x80U;
+            if (is_response) {
+                if (m_erob[idx].sdo_cfg_state == EROB_SDO_CFG_WAIT_RESPONSE) {
+                    m_erob[idx].sdo_cfg_resp_ok = true;
+                } else if (m_erob[idx].sdo_rt_active) {
+                    m_erob[idx].sdo_rt_resp_ok = true;
+                }
             }
         }
     }
@@ -406,6 +427,55 @@ static bool erob_sdo_cfg_run(uint8_t i)
     const erob_sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
     erob_sdo_send(nid, w->index, w->subindex, w->value, w->size);
     return false;
+}
+
+/* ── Runtime SDO write queue ─────────────────────────────────────────────────
+ * erob_sdo_rt_enqueue() is called from public API (e.g. erob_set_accel).
+ * erob_sdo_rt_run() is called every main-loop tick; it sends one entry at a
+ * time and waits for the SDO response before advancing to the next.
+ * Only operates when master_started = true so it never races with the startup
+ * config sequence, which uses the same SDO channel. */
+
+static bool erob_sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
+                                 uint32_t value, uint8_t size)
+{
+    erob_state_t *e   = &m_erob[i];
+    const uint8_t next = (uint8_t)((e->sdo_rt_head + 1U) % EROB_SDO_RT_QUEUE_SIZE);
+    if (next == e->sdo_rt_tail) { return false; }   /* full — caller should retry */
+    e->sdo_rt_queue[e->sdo_rt_head] =
+        (erob_sdo_entry_t){ index, subindex, value, size };
+    e->sdo_rt_head = next;
+    return true;
+}
+
+static void erob_sdo_rt_run(uint8_t i)
+{
+    erob_state_t *e = &m_erob[i];
+    if (!e->master_started) { return; }
+
+    const uint32_t t = now_ms();
+
+    if (e->sdo_rt_active) {
+        if (e->sdo_rt_resp_ok) {
+            /* Response received — consume entry and move on. */
+            e->sdo_rt_resp_ok = false;
+            e->sdo_rt_active  = false;
+            e->sdo_rt_tail    = (uint8_t)((e->sdo_rt_tail + 1U) % EROB_SDO_RT_QUEUE_SIZE);
+        } else if ((t - e->sdo_rt_ms) >= EROB_SDO_TIMEOUT_MS) {
+            /* Timeout — drop entry and continue with the rest. */
+            e->sdo_rt_active = false;
+            e->sdo_rt_tail   = (uint8_t)((e->sdo_rt_tail + 1U) % EROB_SDO_RT_QUEUE_SIZE);
+        }
+        return;
+    }
+
+    if (e->sdo_rt_tail == e->sdo_rt_head) { return; }  /* queue empty */
+
+    const erob_sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
+    erob_sdo_send(EROB_NODES[i].node_id, w->index, w->subindex, w->value, w->size);
+    e->sdo_rt_active  = true;
+    e->sdo_rt_resp_ok = false;
+    e->sdo_rt_ms      = t;
 }
 
 /* ── CiA 402 state machine (per instance) ────────────────────────────────── */
@@ -607,14 +677,25 @@ void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
 {
     const int8_t idx = erob_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
-    /* position: counts × (360 / 524288) */
-    *p_pos_deg_f32    = (float)m_erob[idx].position_act
+    /* position: (counts % 360 ) × (360 / 524288) */
+    *p_pos_deg_f32    = (float)(m_erob[idx].position_act % EROB_COUNTS_PER_REV)
                         * (360.0f / (float)EROB_COUNTS_PER_REV);
+    if (FLOAT32_LT(*p_pos_deg_f32, 360.0F)) {
+    	*p_pos_deg_f32 += 360.0f;
+    }
     /* velocity: counts/s ÷ (524288/60) = RPM */
     *p_vel_rpm_f32    = (float)m_erob[idx].velocity_act
                         / (float)EROB_ENCODER_RPM_TO_PLUS;
     /* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
     *p_torque_pct_f32 = (float)m_erob[idx].torque_act * 0.1f;
+}
+
+void erob_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_plus_s)
+{
+    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    if (idx < 0) { return; }
+    (void)erob_sdo_rt_enqueue((uint8_t)idx, 0x6083U, 0x00U, accel_plus_s, 4U);
+    (void)erob_sdo_rt_enqueue((uint8_t)idx, 0x6084U, 0x00U, decel_plus_s, 4U);
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
@@ -791,6 +872,11 @@ void app_canopen_loop(void)
 			(void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
 			m_erob[i].drive_state = MASTER_CIA402_IDLE;
 		}
+	}
+
+	/* 5. Drain runtime SDO write queue for each instance. */
+	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
+		erob_sdo_rt_run(i);
 	}
 }
 
