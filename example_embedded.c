@@ -30,29 +30,7 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_HB_TIMEOUT_MS          150U
 #define SYNC_PERIOD_US              1000UL
 #define EROB_MAX_VEL_RPM            3000
-#define EROB_ENCODER_RPM_TO_PLUS    8738   /* counts/s per RPM = 524288/60 */
-
-/*
- * Encoder reference and units
- * ───────────────────────────
- * EROB_COUNTS_PER_REV is the number of position counts for one full revolution
- * of the output shaft (2^19 = 524288).
- *
- * Zero point: the encoder counts from the factory-calibrated (or homed)
- * mechanical reference of the output shaft.  After power-on the drive reports
- * the absolute position relative to that reference.  To define your own zero:
- *   1. Read position_act when the shaft is at your desired zero angle.
- *   2. Store it as a reference offset.
- *   3. Relative position = position_act - reference_offset.
- *
- * Converting counts to degrees:
- *   degrees = (float)counts * (360.0f / EROB_COUNTS_PER_REV)
- *           = (float)counts * 0.000686646f
- *
- * Position limits (pos_min / pos_max in erob_cfg_t) use the same raw count
- * units as position_act.  Set pos_limit_en = false to disable limiting.
- */
-#define EROB_COUNTS_PER_REV         524288UL   /* 2^19 counts / output rev */
+#define EROB_ENCODER_RPM_TO_PLUS    8738
 #define EROB_STATE_TIMEOUT_MS       2000U
 #define EROB_FAULT_RESET_MS         10U
 #define EROB_RPDO_WATCHDOG_MS       100U
@@ -76,16 +54,12 @@ typedef struct {
     uint8_t  node_id;
     uint32_t default_accel;   /* [plus/s] */
     uint32_t default_decel;   /* [plus/s] */
-    bool     pos_limit_en;    /* enable software position limits */
-    int32_t  pos_min;         /* minimum allowed position [counts] */
-    int32_t  pos_max;         /* maximum allowed position [counts] */
 } erob_cfg_t;
 
 static const erob_cfg_t EROB_NODES[] = {
-    /*  node_id   accel    decel   limit  pos_min       pos_max      */
-    {   0x05U,   5000U,   5000U,  false,  0,            0            },
-    /* { 0x06U,  5000U,   5000U,  true,  -262144,       262144       }, */
-    /* pos_min/max example above = ±0.5 rev = ±180°                     */
+    { 0x05U, 50000U, 200000U },
+//    { 0x01U, 5000U, 5000U },
+    /* { 0x06U, 5000U, 5000U }, */
 };
 /* ══════════════════════════════════════════════════════════════════════════ */
 
@@ -278,6 +252,19 @@ static void erob_reset(uint8_t i, bool full)
         m_erob[i].sdo_cfg_step  = 0U;
         m_erob[i].hb_lost       = false;
     }
+}
+
+void erob_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
+{
+	g_target_rpm[erob_find(node_id_u16)] = target_rpm_i32;
+}
+
+static void erob_set_velocity(uint8_t instance, int32_t rpm)
+{
+    if (instance >= (uint8_t)EROB_N) { return; }
+    if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
+    if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
+    m_erob[instance].target_vel = rpm * EROB_ENCODER_RPM_TO_PLUS;
 }
 
 /* ── SDO send helper ─────────────────────────────────────────────────────── */
@@ -525,13 +512,6 @@ static void erob_cia402_step(uint8_t i)
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_ENABLE_OPERATION;
-            if (EROB_NODES[i].pos_limit_en) {
-                if (e->position_act >= EROB_NODES[i].pos_max && e->target_vel > 0) {
-                    e->target_vel = 0;
-                } else if (e->position_act <= EROB_NODES[i].pos_min && e->target_vel < 0) {
-                    e->target_vel = 0;
-                }
-            }
         }
         break;
 
@@ -610,26 +590,13 @@ static void on_reset_communication(void *user)
     }
 }
 
+
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-void erob_set_velocity(uint8_t instance, int32_t rpm)
+void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32, float *const p_vel_rpm_f32)
 {
-    if (instance >= (uint8_t)EROB_N) { return; }
-    if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
-    if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
-    m_erob[instance].target_vel = rpm * EROB_ENCODER_RPM_TO_PLUS;
-}
-
-int32_t erob_get_position_counts(uint8_t instance)
-{
-    if (instance >= (uint8_t)EROB_N) { return 0; }
-    return m_erob[instance].position_act;
-}
-
-float erob_get_position_deg(uint8_t instance)
-{
-    return (float)erob_get_position_counts(instance)
-           * (360.0f / (float)EROB_COUNTS_PER_REV);
+	*p_pos_deg_f32 = (float)m_erob[erob_find(node_id_u16)].position_act / EROB_ENCODER_RPM_TO_PLUS;
+	*p_vel_rpm_f32 = (float)m_erob[erob_find(node_id_u16)].velocity_act / EROB_ENCODER_RPM_TO_PLUS;
 }
 
 void erob_set_accel(uint8_t instance, uint32_t accel_plus_s, uint32_t decel_plus_s)
@@ -803,51 +770,52 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
-void app_main_loop(void)
+void app_canopen_loop(void)
 {
-    for (;;) {
-        /* 1. Deliver queued frames (heartbeat timestamps already updated by ISR). */
-        co_stm32_drain_rx(&canopen_node, &can_ctx);
+	/* 1. Deliver queued frames (heartbeat timestamps already updated by ISR). */
+	co_stm32_drain_rx(&canopen_node, &can_ctx);
 
-        /* 2. Self-promote master to OPERATIONAL once it reaches PRE_OPERATIONAL. */
-        if (canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
-            co_nmt_set_state(&canopen_node, CO_NMT_OPERATIONAL);
-        }
+	/* 2. Self-promote master to OPERATIONAL once it reaches PRE_OPERATIONAL. */
+	if (canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
+		co_nmt_set_state(&canopen_node, CO_NMT_OPERATIONAL);
+	}
 
-        /* 3. Per-instance startup: SDO config → NMT Start. */
-        if (canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
-            for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-                if (!m_erob[i].master_started && erob_sdo_cfg_run(i)) {
-                    (void)co_nmt_master_send(&canopen_node, 0x01U,
-                                            EROB_NODES[i].node_id);
-                    m_erob[i].master_started = true;
-                }
-            }
-        }
+	/* 3. Per-instance startup: SDO config → NMT Start. */
+	if (canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
+		for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
+			if (!m_erob[i].master_started && erob_sdo_cfg_run(i)) {
+				(void)co_nmt_master_send(&canopen_node, 0x01U,
+										EROB_NODES[i].node_id);
+				m_erob[i].master_started = true;
+			}
+		}
+	}
 
-        /* 4. RPDO watchdog: if RUNNING but no RPDO1 for EROB_RPDO_WATCHDOG_MS,
-         *    send Quick Stop; drive's own event timer provides redundant stop. */
-        const uint32_t now = now_ms();
+	/* 4. RPDO watchdog: if RUNNING but no RPDO1 for EROB_RPDO_WATCHDOG_MS,
+	 *    send Quick Stop; drive's own event timer provides redundant stop. */
+	const uint32_t now = now_ms();
+	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
+		if (m_erob[i].master_started &&
+			m_erob[i].drive_state == MASTER_CIA402_RUNNING &&
+			(now - m_erob[i].last_rpdo1_ms) >= EROB_RPDO_WATCHDOG_MS) {
+			m_erob[i].target_vel  = 0;
+			m_erob[i].controlword = CW_QUICK_STOP;
+			(void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
+			m_erob[i].drive_state = MASTER_CIA402_IDLE;
+		}
+	}
+}
+
+void co_transmit_process(void)
+{
+    /* 5. Forward application target velocities on each SYNC tick. */
+    if (canopen_node.sync_event_pending) {
+        canopen_node.sync_event_pending = false;
         for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-            if (m_erob[i].master_started &&
-                m_erob[i].drive_state == MASTER_CIA402_RUNNING &&
-                (now - m_erob[i].last_rpdo1_ms) >= EROB_RPDO_WATCHDOG_MS) {
-                m_erob[i].target_vel  = 0;
-                m_erob[i].controlword = CW_QUICK_STOP;
-                (void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
-                m_erob[i].drive_state = MASTER_CIA402_IDLE;
-            }
+            erob_set_velocity(i, (int32_t)g_target_rpm[i]);
         }
-
-        /* 5. Forward application target velocities on each SYNC tick. */
-        if (canopen_node.sync_event_pending) {
-            canopen_node.sync_event_pending = false;
-            for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-                erob_set_velocity(i, (int32_t)g_target_rpm[i]);
-            }
-        }
-
-        /* 6. Run CANopen stack: SYNC, TPDOs, heartbeat, HB consumer timeout. */
-        co_process(&canopen_node);
     }
+
+    /* Run CANopen stack: SYNC, TPDOs, heartbeat, HB consumer timeout. */
+	co_process(&canopen_node);
 }
