@@ -30,7 +30,29 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_HB_TIMEOUT_MS          150U
 #define SYNC_PERIOD_US              1000UL
 #define EROB_MAX_VEL_RPM            3000
-#define EROB_ENCODER_RPM_TO_PLUS    8738
+#define EROB_ENCODER_RPM_TO_PLUS    8738   /* counts/s per RPM = 524288/60 */
+
+/*
+ * Encoder reference and units
+ * ───────────────────────────
+ * EROB_COUNTS_PER_REV is the number of position counts for one full revolution
+ * of the output shaft (2^19 = 524288).
+ *
+ * Zero point: the encoder counts from the factory-calibrated (or homed)
+ * mechanical reference of the output shaft.  After power-on the drive reports
+ * the absolute position relative to that reference.  To define your own zero:
+ *   1. Read position_act when the shaft is at your desired zero angle.
+ *   2. Store it as a reference offset.
+ *   3. Relative position = position_act - reference_offset.
+ *
+ * Converting counts to degrees:
+ *   degrees = (float)counts * (360.0f / EROB_COUNTS_PER_REV)
+ *           = (float)counts * 0.000686646f
+ *
+ * Position limits (pos_min / pos_max in erob_cfg_t) use the same raw count
+ * units as position_act.  Set pos_limit_en = false to disable limiting.
+ */
+#define EROB_COUNTS_PER_REV         524288UL   /* 2^19 counts / output rev */
 #define EROB_STATE_TIMEOUT_MS       2000U
 #define EROB_FAULT_RESET_MS         10U
 #define EROB_RPDO_WATCHDOG_MS       100U
@@ -54,11 +76,16 @@ typedef struct {
     uint8_t  node_id;
     uint32_t default_accel;   /* [plus/s] */
     uint32_t default_decel;   /* [plus/s] */
+    bool     pos_limit_en;    /* enable software position limits */
+    int32_t  pos_min;         /* minimum allowed position [counts] */
+    int32_t  pos_max;         /* maximum allowed position [counts] */
 } erob_cfg_t;
 
 static const erob_cfg_t EROB_NODES[] = {
-    { 0x05U, 5000U, 5000U },
-    /* { 0x06U, 5000U, 5000U }, */
+    /*  node_id   accel    decel   limit  pos_min       pos_max      */
+    {   0x05U,   5000U,   5000U,  false,  0,            0            },
+    /* { 0x06U,  5000U,   5000U,  true,  -262144,       262144       }, */
+    /* pos_min/max example above = ±0.5 rev = ±180°                     */
 };
 /* ══════════════════════════════════════════════════════════════════════════ */
 
@@ -498,6 +525,13 @@ static void erob_cia402_step(uint8_t i)
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_ENABLE_OPERATION;
+            if (EROB_NODES[i].pos_limit_en) {
+                if (e->position_act >= EROB_NODES[i].pos_max && e->target_vel > 0) {
+                    e->target_vel = 0;
+                } else if (e->position_act <= EROB_NODES[i].pos_min && e->target_vel < 0) {
+                    e->target_vel = 0;
+                }
+            }
         }
         break;
 
@@ -584,6 +618,18 @@ void erob_set_velocity(uint8_t instance, int32_t rpm)
     if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
     if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
     m_erob[instance].target_vel = rpm * EROB_ENCODER_RPM_TO_PLUS;
+}
+
+int32_t erob_get_position_counts(uint8_t instance)
+{
+    if (instance >= (uint8_t)EROB_N) { return 0; }
+    return m_erob[instance].position_act;
+}
+
+float erob_get_position_deg(uint8_t instance)
+{
+    return (float)erob_get_position_counts(instance)
+           * (360.0f / (float)EROB_COUNTS_PER_REV);
 }
 
 void erob_set_accel(uint8_t instance, uint32_t accel_plus_s, uint32_t decel_plus_s)
