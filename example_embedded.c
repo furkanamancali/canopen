@@ -41,6 +41,12 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define EROB_RPDO_WATCHDOG_MS       100U
 #define EROB_NMT_RESET_DELAY_MS     500U
 #define EROB_NMT_PREOP_DELAY_MS     100U
+/* Minimum time PRE_OPERATIONAL must persist after the master has finished
+ * configuring the drive before we treat it as a real slave drop and re-run
+ * the SDO config.  Set well above the heartbeat period so a single anomalous
+ * HB carrying PRE_OP (e.g. one missed/garbled frame between two OP frames)
+ * cannot, on its own, destroy master_started and replay the 28-step sequence. */
+#define EROB_NMT_PREOP_DEBOUNCE_MS  150U
 #define EROB_SDO_TIMEOUT_MS         500U
 #define EROB_SDO_RT_QUEUE_SIZE      4U   /* max queued runtime SDO writes per instance */
 
@@ -206,6 +212,12 @@ typedef struct {
     bool           master_started;
     bool           hb_lost;
     co_nmt_state_t nmt_state;
+
+    /* PRE_OP debounce.  Armed by on_erob_nmt_change when a started drive
+     * reports PRE_OPERATIONAL; cleared on return to OPERATIONAL or when the
+     * main loop confirms the drop after EROB_NMT_PREOP_DEBOUNCE_MS. */
+    bool           pre_op_pending;
+    uint32_t       pre_op_entry_ms;
 } erob_state_t;
 
 static erob_state_t m_erob[EROB_N];
@@ -277,6 +289,7 @@ static void erob_reset(uint8_t i, bool full)
     m_erob[i].sdo_rt_head    = 0U;
     m_erob[i].sdo_rt_tail    = 0U;
     m_erob[i].sdo_rt_active  = false;
+    m_erob[i].pre_op_pending = false;
     if (full) {
         m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
         m_erob[i].sdo_cfg_step  = 0U;
@@ -333,17 +346,29 @@ static void on_erob_nmt_change(uint8_t i, co_nmt_state_t st)
         erob_reset(i, true);
         break;
     case CO_NMT_PRE_OPERATIONAL:
-        erob_reset(i, false);
-        if (m_erob[i].sdo_cfg_state != EROB_SDO_CFG_NMT_DELAY &&
-            m_erob[i].sdo_cfg_state != EROB_SDO_CFG_RESET_DELAY) {
-            m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
-            m_erob[i].sdo_cfg_step  = 0U;
+        /* Expected during our own startup (we just sent NMT reset / 0x80) —
+         * leave the in-flight cfg sequence alone. */
+        if (m_erob[i].sdo_cfg_state == EROB_SDO_CFG_NMT_DELAY ||
+            m_erob[i].sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
+            break;
+        }
+        /* Unexpected drop from a started drive — arm the debounce instead of
+         * tearing down state.  If the slave returns to OPERATIONAL within
+         * EROB_NMT_PREOP_DEBOUNCE_MS this is treated as a transient HB and
+         * the master continues uninterrupted; otherwise the main loop will
+         * commit to a full re-config.  Idempotent: a second PRE_OP transition
+         * inside the window does not restart the timer. */
+        if (!m_erob[i].pre_op_pending) {
+            m_erob[i].pre_op_pending  = true;
+            m_erob[i].pre_op_entry_ms = now_ms();
         }
         break;
     case CO_NMT_STOPPED:
         erob_reset(i, true);
         break;
     case CO_NMT_OPERATIONAL:
+        /* Slave returned to OP — cancel any pending re-config. */
+        m_erob[i].pre_op_pending = false;
         break;
     }
 }
@@ -970,6 +995,19 @@ void app_canopen_loop(void)
 			m_erob[i].controlword = CW_QUICK_STOP;
 			(void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
 			m_erob[i].drive_state = MASTER_CIA402_IDLE;
+		}
+	}
+
+	/* 5b. PRE_OP debounce.  Confirmed slave drop (PRE_OP held past the
+	 *     debounce window) → tear down state and replay the SDO config.
+	 *     Transient drops that resolve back to OP inside the window are
+	 *     cleared by on_erob_nmt_change and never reach this branch. */
+	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
+		if (m_erob[i].pre_op_pending &&
+			(now - m_erob[i].pre_op_entry_ms) >= EROB_NMT_PREOP_DEBOUNCE_MS) {
+			erob_reset(i, false);                       /* clears pre_op_pending */
+			m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
+			m_erob[i].sdo_cfg_step  = 0U;
 		}
 	}
 
