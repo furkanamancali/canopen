@@ -184,6 +184,14 @@ typedef struct {
     bool             sdo_rt_active;   /* waiting for response to current entry */
     bool             sdo_rt_resp_ok;
     uint32_t         sdo_rt_ms;       /* timestamp of last send */
+    /* Last SDO abort observed on the runtime path.  Non-zero means the most
+     * recent runtime SDO write was rejected by the drive; data[4..7] of the
+     * abort frame, plus the index/subindex of the entry that failed.  Cleared
+     * on full instance reset; mirrored to g_erob_sdo_rt_abort_code[] so it is
+     * visible without walking m_erob[]. */
+    uint32_t         sdo_rt_abort_code;
+    uint16_t         sdo_rt_abort_index;
+    uint8_t          sdo_rt_abort_subindex;
 
     master_cia402_state_t drive_state;
     uint32_t              state_entry_ms;
@@ -199,6 +207,14 @@ static erob_state_t m_erob[EROB_N];
 /* Last EMCY per instance — inspect in debugger to identify faults. */
 volatile uint16_t g_erob_emcy_code[EROB_N];
 volatile uint8_t  g_erob_emcy_reg[EROB_N];
+
+/* Last runtime-SDO abort per instance.  Non-zero abort_code means a runtime
+ * write (e.g. erob_set_accel) was rejected; the index/subindex identify the
+ * entry that failed.  Sticky until cleared by the application or instance
+ * reset. */
+volatile uint32_t g_erob_sdo_rt_abort_code[EROB_N];
+volatile uint16_t g_erob_sdo_rt_abort_index[EROB_N];
+volatile uint8_t  g_erob_sdo_rt_abort_subindex[EROB_N];
 
 /* Per-instance target RPM set from any task context. */
 volatile int32_t g_target_rpm[EROB_N];
@@ -357,17 +373,44 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
         return;
     }
 
-    /* SDO response (COB-ID = 0x580 + node_id): signal waiting instance */
+    /* SDO response (COB-ID = 0x580 + node_id): signal waiting instance.
+     *
+     * SCS bits (data[0] & 0xE0):
+     *   0x60 = expedited/segmented download confirm  → success
+     *   0x40 = upload response                       → success (not used here)
+     * data[0] == 0x80                                → abort
+     *
+     * Aborts must NOT be treated as success silently: the rt queue would
+     * advance with the caller none the wiser.  Capture the 4-byte abort code
+     * (data[4..7]) and the failing entry's index/subindex into per-instance
+     * fields and the g_erob_sdo_rt_abort_*[] surfaces.  The queue still
+     * advances on abort — retrying would produce the same code — but the
+     * failure is now observable. */
     if (frame->cob_id >= 0x581U && frame->cob_id <= 0x5FFU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x580U);
         const int8_t  idx = erob_find(nid);
         if (idx >= 0) {
-            const bool is_response = (frame->data[0] & 0xE0U) == 0x60U
-                                  ||  frame->data[0] == 0x80U;
-            if (is_response) {
+            const uint8_t scs        = (uint8_t)(frame->data[0] & 0xE0U);
+            const bool    is_success = (scs == 0x60U);
+            const bool    is_abort   = (frame->data[0] == 0x80U);
+            if (is_success || is_abort) {
                 if (m_erob[idx].sdo_cfg_state == EROB_SDO_CFG_WAIT_RESPONSE) {
                     m_erob[idx].sdo_cfg_resp_ok = true;
                 } else if (m_erob[idx].sdo_rt_active) {
+                    if (is_abort && frame->len >= 8U) {
+                        const uint32_t code = (uint32_t)frame->data[4]
+                                            | ((uint32_t)frame->data[5] << 8)
+                                            | ((uint32_t)frame->data[6] << 16)
+                                            | ((uint32_t)frame->data[7] << 24);
+                        const erob_sdo_entry_t *w =
+                            &m_erob[idx].sdo_rt_queue[m_erob[idx].sdo_rt_tail];
+                        m_erob[idx].sdo_rt_abort_code     = code;
+                        m_erob[idx].sdo_rt_abort_index    = w->index;
+                        m_erob[idx].sdo_rt_abort_subindex = w->subindex;
+                        g_erob_sdo_rt_abort_code[idx]     = code;
+                        g_erob_sdo_rt_abort_index[idx]    = w->index;
+                        g_erob_sdo_rt_abort_subindex[idx] = w->subindex;
+                    }
                     m_erob[idx].sdo_rt_resp_ok = true;
                 }
             }
