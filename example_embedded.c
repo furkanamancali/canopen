@@ -184,6 +184,12 @@ typedef struct {
     bool             sdo_rt_active;   /* waiting for response to current entry */
     bool             sdo_rt_resp_ok;
     uint32_t         sdo_rt_ms;       /* timestamp of last send */
+    /* Last expedited SDO upload payload (data[4..7], little-endian) for the
+     * current entry.  Meaningful only when the in-flight entry was a read and
+     * the response was an upload confirm (SCS 0x40); writes leave it
+     * unchanged.  Sized for the common 1–4 byte CiA 402 objects (controlword,
+     * statusword, mode_of_op, etc.). */
+    uint32_t         sdo_rt_resp_value;
     /* Last SDO abort observed on the runtime path.  Non-zero means the most
      * recent runtime SDO write was rejected by the drive; data[4..7] of the
      * abort frame, plus the index/subindex of the entry that failed.  Cleared
@@ -376,8 +382,9 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     /* SDO response (COB-ID = 0x580 + node_id): signal waiting instance.
      *
      * SCS bits (data[0] & 0xE0):
-     *   0x60 = expedited/segmented download confirm  → success
-     *   0x40 = upload response                       → success (not used here)
+     *   0x60 = expedited/segmented download confirm  → success (write ack)
+     *   0x40 = upload response                       → success (read result;
+     *                                                  payload in data[4..7])
      * data[0] == 0x80                                → abort
      *
      * Aborts must NOT be treated as success silently: the rt queue would
@@ -385,15 +392,20 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
      * (data[4..7]) and the failing entry's index/subindex into per-instance
      * fields and the g_erob_sdo_rt_abort_*[] surfaces.  The queue still
      * advances on abort — retrying would produce the same code — but the
-     * failure is now observable. */
+     * failure is now observable.
+     *
+     * For upload (read) confirms we also stash the expedited payload into
+     * sdo_rt_resp_value so a future read API has somewhere to fetch it from
+     * before the queue advances and the entry is overwritten. */
     if (frame->cob_id >= 0x581U && frame->cob_id <= 0x5FFU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x580U);
         const int8_t  idx = erob_find(nid);
         if (idx >= 0) {
-            const uint8_t scs        = (uint8_t)(frame->data[0] & 0xE0U);
-            const bool    is_success = (scs == 0x60U);
-            const bool    is_abort   = (frame->data[0] == 0x80U);
-            if (is_success || is_abort) {
+            const uint8_t scs           = (uint8_t)(frame->data[0] & 0xE0U);
+            const bool    is_dl_confirm = (scs == 0x60U);
+            const bool    is_ul_confirm = (scs == 0x40U);
+            const bool    is_abort      = (frame->data[0] == 0x80U);
+            if (is_dl_confirm || is_ul_confirm || is_abort) {
                 if (m_erob[idx].sdo_cfg_state == EROB_SDO_CFG_WAIT_RESPONSE) {
                     m_erob[idx].sdo_cfg_resp_ok = true;
                 } else if (m_erob[idx].sdo_rt_active) {
@@ -410,6 +422,12 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
                         g_erob_sdo_rt_abort_code[idx]     = code;
                         g_erob_sdo_rt_abort_index[idx]    = w->index;
                         g_erob_sdo_rt_abort_subindex[idx] = w->subindex;
+                    } else if (is_ul_confirm && frame->len >= 8U) {
+                        m_erob[idx].sdo_rt_resp_value =
+                              (uint32_t)frame->data[4]
+                            | ((uint32_t)frame->data[5] << 8)
+                            | ((uint32_t)frame->data[6] << 16)
+                            | ((uint32_t)frame->data[7] << 24);
                     }
                     m_erob[idx].sdo_rt_resp_ok = true;
                 }
