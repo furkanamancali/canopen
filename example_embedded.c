@@ -264,7 +264,9 @@ static void erob_reset(uint8_t i, bool full)
 
 void erob_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
 {
-	g_target_rpm[erob_find(node_id_u16)] = target_rpm_i32;
+    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    if (idx < 0) { return; }
+    g_target_rpm[idx] = target_rpm_i32;
 }
 
 static void erob_set_velocity(uint8_t instance, int32_t rpm)
@@ -498,71 +500,92 @@ static void erob_cia402_step(uint8_t i)
             /* Any non-zero, non-fault statusword including Quick Stop Active
              * (0x0003) and Switch On Disabled with QS bit set (0x0060).
              * CiA 402 Table 7 marks QS "don't care" in several states so
-             * exact-mask checks miss valid words with unexpected bits set. */
+             * exact-mask checks miss valid words with unexpected bits set.
+             * CW is set immediately so the next master TPDO carries the
+             * Shutdown command — without this the drive sees a stale CW for
+             * one event-timer cycle, which is the typical cause of the drive
+             * "lingering" in Switch On Disabled. */
+            e->controlword    = CW_SHUTDOWN;
             e->drive_state    = MASTER_CIA402_SHUTDOWN;
             e->state_entry_ms = t;
         }
         break;
 
     case MASTER_CIA402_FAULT_RESET:
-        e->controlword = CW_FAULT_RESET;
         if ((t - e->state_entry_ms) >= EROB_FAULT_RESET_MS) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
             e->drive_state    = MASTER_CIA402_WAIT_FAULT_CLEAR;
             e->state_entry_ms = t;
+        } else {
+            e->controlword = CW_FAULT_RESET;
         }
         break;
 
     case MASTER_CIA402_WAIT_FAULT_CLEAR:
-        e->controlword = CW_FAULT_RESET_CLEAR;
         if (!erob_sw_fault(sw)) {
+            e->controlword    = CW_SHUTDOWN;
             e->drive_state    = MASTER_CIA402_SHUTDOWN;
             e->state_entry_ms = t;
         } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+            e->controlword    = CW_FAULT_RESET;
             e->drive_state    = MASTER_CIA402_FAULT_RESET;
             e->state_entry_ms = t;
+        } else {
+            e->controlword = CW_FAULT_RESET_CLEAR;
         }
         break;
 
     case MASTER_CIA402_SHUTDOWN:
-        e->controlword = CW_SHUTDOWN;
         if (erob_sw_ready_to_switch_on(sw)) {
+            e->controlword    = CW_SWITCH_ON;
             e->drive_state    = MASTER_CIA402_SWITCH_ON;
             e->state_entry_ms = t;
         } else if (erob_sw_fault(sw)) {
+            e->controlword    = CW_FAULT_RESET_CLEAR;
             e->drive_state    = MASTER_CIA402_FAULT;
             e->state_entry_ms = t;
         } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+            e->controlword    = CW_FAULT_RESET;
             e->drive_state    = MASTER_CIA402_FAULT_RESET;
             e->state_entry_ms = t;
+        } else {
+            e->controlword = CW_SHUTDOWN;
         }
         break;
 
     case MASTER_CIA402_SWITCH_ON:
-        e->controlword = CW_SWITCH_ON;
         if (erob_sw_switched_on(sw)) {
+            e->controlword    = CW_ENABLE_OPERATION;
             e->drive_state    = MASTER_CIA402_ENABLE;
             e->state_entry_ms = t;
         } else if (erob_sw_fault(sw)) {
+            e->controlword    = CW_FAULT_RESET_CLEAR;
             e->drive_state    = MASTER_CIA402_FAULT;
             e->state_entry_ms = t;
         } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+            e->controlword    = CW_FAULT_RESET;
             e->drive_state    = MASTER_CIA402_FAULT_RESET;
             e->state_entry_ms = t;
+        } else {
+            e->controlword = CW_SWITCH_ON;
         }
         break;
 
     case MASTER_CIA402_ENABLE:
-        e->controlword = CW_ENABLE_OPERATION;
         if (erob_sw_operation_enabled(sw)) {
             e->drive_state    = MASTER_CIA402_RUNNING;
             e->state_entry_ms = t;
+            e->controlword    = CW_ENABLE_OPERATION;
         } else if (erob_sw_fault(sw)) {
+            e->controlword    = CW_FAULT_RESET_CLEAR;
             e->drive_state    = MASTER_CIA402_FAULT;
             e->state_entry_ms = t;
         } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+            e->controlword    = CW_FAULT_RESET;
             e->drive_state    = MASTER_CIA402_FAULT_RESET;
             e->state_entry_ms = t;
+        } else {
+            e->controlword = CW_ENABLE_OPERATION;
         }
         break;
 
@@ -596,14 +619,16 @@ static void erob_cia402_step(uint8_t i)
         }
         if ((t - e->state_entry_ms) < EROB_FAULT_RESET_MS) {
             e->controlword = CW_FAULT_RESET;
+        } else if (!erob_sw_fault(sw)) {
+            e->controlword    = CW_SHUTDOWN;
+            e->drive_state    = MASTER_CIA402_SHUTDOWN;
+            e->state_entry_ms = t;
+        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+            /* Restart fault-reset cycle. */
+            e->controlword    = CW_FAULT_RESET;
+            e->state_entry_ms = t;
         } else {
             e->controlword = CW_FAULT_RESET_CLEAR;
-            if (!erob_sw_fault(sw)) {
-                e->drive_state    = MASTER_CIA402_SHUTDOWN;
-                e->state_entry_ms = t;
-            } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
-                e->state_entry_ms = t;
-            }
         }
         break;
     }
@@ -677,12 +702,13 @@ void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
 {
     const int8_t idx = erob_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
-    /* position: (counts % 360 ) × (360 / 524288) */
-    *p_pos_deg_f32    = (float)(m_erob[idx].position_act % EROB_COUNTS_PER_REV)
-                        * (360.0f / (float)EROB_COUNTS_PER_REV);
-    if (FLOAT32_LT(*p_pos_deg_f32, 360.0F)) {
-    	*p_pos_deg_f32 += 360.0f;
-    }
+    /* Wrap signed encoder counts into [0, COUNTS_PER_REV) before scaling.
+     * C truncates negative modulo toward zero, so an explicit add-back is
+     * needed for the result to land in [0, 360) for both signs. */
+    int32_t mod_counts = m_erob[idx].position_act % (int32_t)EROB_COUNTS_PER_REV;
+    if (mod_counts < 0) { mod_counts += (int32_t)EROB_COUNTS_PER_REV; }
+    *p_pos_deg_f32 = (float)mod_counts
+                     * (360.0f / (float)EROB_COUNTS_PER_REV);
     /* velocity: counts/s ÷ (524288/60) = RPM */
     *p_vel_rpm_f32    = (float)m_erob[idx].velocity_act
                         / (float)EROB_ENCODER_RPM_TO_PLUS;
@@ -860,7 +886,19 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 4. RPDO watchdog: if RUNNING but no RPDO1 for EROB_RPDO_WATCHDOG_MS,
+	/* 4. Tick the CiA 402 enable sequence for every started instance.
+	 *    on_rpdo_frame() also invokes this on RPDO1 receipt for fast response,
+	 *    but driving it from the main loop guarantees forward progress and
+	 *    timeout handling even if RPDO1 frames are missed (e.g. drive slow to
+	 *    leave SOD).  The state machine is idempotent — repeated calls with
+	 *    the same statusword and state are safe. */
+	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
+		if (m_erob[i].master_started) {
+			erob_cia402_step(i);
+		}
+	}
+
+	/* 5. RPDO watchdog: if RUNNING but no RPDO1 for EROB_RPDO_WATCHDOG_MS,
 	 *    send Quick Stop; drive's own event timer provides redundant stop. */
 	const uint32_t now = now_ms();
 	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
@@ -874,7 +912,7 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 5. Drain runtime SDO write queue for each instance. */
+	/* 6. Drain runtime SDO write queue for each instance. */
 	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
 		erob_sdo_rt_run(i);
 	}
