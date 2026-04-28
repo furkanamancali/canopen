@@ -29,7 +29,7 @@
 
 #include "canopen.h"
 #include "canopen_stm32h7_fdcan.h"
-#include "example_embedded.h"
+#include "cia402_app.h"
 #include "utils/utils.h"
 
 extern FDCAN_HandleTypeDef hfdcan1;
@@ -101,7 +101,8 @@ static void build_sdo_table(uint8_t i)
     sdo_entry_t *t = m_sdo_tbl[i];
     uint32_t n = 0U;
 
-    if (cia402_nodes[i].driver_type == DRIVER_CIA402) {
+    if ((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
+        (cia402_nodes[i].driver_type == DRIVER_DELTA  )   ) {
         const uint32_t r1d = 0x80000000UL | (0x200UL + nid);
         const uint32_t r1e =                 0x200UL + nid;
         const uint32_t t1d = 0x80000000UL | (0x180UL + nid);
@@ -197,6 +198,8 @@ typedef struct {
 #endif
 
 typedef struct {
+	driver_type_t driver_type_st;
+
     /* OD backing: TPDO1 — master → slave commands */
     uint16_t controlword;
     int8_t   mode_of_op;
@@ -253,10 +256,9 @@ typedef struct {
     uint32_t       pre_op_entry_ms;
 
     /* Per-instance encoder constants derived from cia402_nodes[i] at
-     * app_canopen_init() time.
-     *   counts_per_rev   = 1 << encoder_resolution;
-     *   counts_per_rpm_s = counts_per_rev * reductor_ratio / 60   (counts/s
-     *                      per output-shaft RPM).
+     * app_canopen_init() time.  counts_per_rpm_s is driver-specific:
+     *   DRIVER_ZEROERR: cpr * reductor_ratio / 60  (counts/s per output RPM)
+     *   DRIVER_DELTA:   10  * reductor_ratio
      * Cached once so the SYNC-tick conversion in
      * cia402_apply_target_internal() and the float math in cia402_get_pos_vel()
      * don't recompute them every call. */
@@ -291,7 +293,7 @@ volatile uint16_t g_sdo_rt_abort_index[CIA402_MAX_NODES];
 volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
 
 /* Per-instance target RPM set from any task context. */
-volatile int32_t g_target_rpm[CIA402_MAX_NODES];
+volatile float32_t g_target_rpm[CIA402_MAX_NODES];
 
 /* ── CiA 402 statusword helpers ──────────────────────────────────────────── */
 #define SW_RTSO  0x0001U
@@ -415,21 +417,21 @@ static void node_reset(uint8_t i, bool full)
  * disable-IRQ critical section so a higher-priority preemptor cannot observe
  * or produce a torn value, and the volatile guarantees co_transmit_process()
  * picks up the latched value on the next SYNC tick. */
-void cia402_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
+void cia402_set_target_rpm(uint16_t node_id_u16, float target_rpm_f32)
 {
     const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
     const uint32_t pm = co_enter_critical();
-    g_target_rpm[idx] = target_rpm_i32;
+    g_target_rpm[idx] = target_rpm_f32;
     co_exit_critical(pm);
 }
 
-static void cia402_apply_target_internal(uint8_t instance, int32_t rpm)
+static void cia402_apply_target_internal(uint8_t instance, float rpm)
 {
     if (instance >= cia402_node_count) { return; }
     if (rpm >  CIA402_MAX_VEL_RPM) { rpm =  CIA402_MAX_VEL_RPM; }
     if (rpm < -CIA402_MAX_VEL_RPM) { rpm = -CIA402_MAX_VEL_RPM; }
-    m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
+	m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
 }
 
 /* ── SDO send helper ─────────────────────────────────────────────────────── */
@@ -858,7 +860,8 @@ static void on_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
     (void)node; (void)user;
     const uint8_t i = rpdo_num / 2U;
     if (i >= cia402_node_count) { return; }
-    if (cia402_nodes[i].driver_type != DRIVER_CIA402) { return; }
+    if (!((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
+         (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) { return; }
     if (rpdo_num % 2U == 0U) {   /* RPDO1: statusword + mode + velocity */
         m_node[i].last_rpdo1_ms = now_ms();
         cia402_step(i);
@@ -976,28 +979,31 @@ co_error_t app_canopen_init(void)
 
         /* Cache the encoder constants once.  counts_per_rpm_s folds the gear
          * reduction into the RPM↔counts conversion so values supplied to
-         * the public API are interpreted on the OUTPUT shaft:
-         *   counts/s @ 1 RPM_out = counts_per_rev * reductor_ratio / 60.
-         * 64-bit intermediate guards against overflow at large
-         * resolution × ratio products; the result still fits int32_t for any
-         * realistic actuator. */
-        const int32_t  cpr   = (int32_t)(1UL << cia402_nodes[i].encoder_resolution);
+         * the public API are interpreted on the OUTPUT shaft.
+         * 64-bit intermediate guards against overflow at large CPR × ratio
+         * products; the result still fits int32_t for any realistic actuator. */
+        const uint32_t cpr   = cia402_nodes[i].encoder_counts_per_rev;
         const uint16_t ratio = cia402_nodes[i].reductor_ratio;
-        m_node[i].encoder_counts_per_rev = cpr;
-        m_node[i].counts_per_rpm_s       =
-            (int32_t)(((uint64_t)(uint32_t)cpr * (uint64_t)ratio) / 60U);
+        m_node[i].encoder_counts_per_rev = (int32_t)cpr;
+        if (DRIVER_DELTA == cia402_nodes[i].driver_type) {
+            m_node[i].counts_per_rpm_s = 10 * ratio;
+        } else if (DRIVER_ZEROERR == cia402_nodes[i].driver_type) {
+            m_node[i].counts_per_rpm_s =
+                (int32_t)(((uint64_t)cpr * (uint64_t)ratio) / 60U);
+        }
 
         m_node[i].controlword = CW_SHUTDOWN;
         m_node[i].mode_of_op  = CIA402_MODE_PROFILE_VEL;
         m_node[i].drive_state = MASTER_CIA402_IDLE;
         m_node[i].nmt_state     = CO_NMT_INITIALIZING;
-
+        m_node[i].driver_type_st = cia402_nodes[i].driver_type;
         /* OD backing storage and PDO mapping below assume the CiA 402 layout
          * (controlword 0x6040, statusword 0x6041, target velocity 0x60FF,
          * etc.).  A non-CiA-402 driver gets a stub heartbeat-only SDO table
          * from build_sdo_table() and is otherwise left untouched —
          * extend this branch when the alternative driver's OD is defined. */
-        if (cia402_nodes[i].driver_type != DRIVER_CIA402) {
+        if (!((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
+              (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) {
             continue;
         }
 
@@ -1161,8 +1167,9 @@ void app_canopen_loop(void)
 	 *    skipped here; their state machine, if any, is the application's
 	 *    responsibility. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-		if (m_node[i].master_started &&
-		    cia402_nodes[i].driver_type == DRIVER_CIA402) {
+		if ((m_node[i].master_started                       ) &&
+		    ((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
+		     (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) {
 			cia402_step(i);
 		}
 	}
@@ -1228,7 +1235,7 @@ void co_transmit_process(void)
     if (canopen_node.sync_event_pending) {
         canopen_node.sync_event_pending = false;
         for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-            cia402_apply_target_internal(i, (int32_t)g_target_rpm[i]);
+            cia402_apply_target_internal(i, g_target_rpm[i]);
         }
     }
 
