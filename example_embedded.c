@@ -263,6 +263,7 @@ typedef struct {
      * cia402_apply_target_internal() and the float math in cia402_get_pos_vel()
      * don't recompute them every call. */
     int32_t        encoder_counts_per_rev;
+    int16_t        ratio;
     int32_t        counts_per_rpm_s;
 
 #ifdef DEBUG
@@ -431,7 +432,13 @@ static void cia402_apply_target_internal(uint8_t instance, float rpm)
     if (instance >= cia402_node_count) { return; }
     if (rpm >  CIA402_MAX_VEL_RPM) { rpm =  CIA402_MAX_VEL_RPM; }
     if (rpm < -CIA402_MAX_VEL_RPM) { rpm = -CIA402_MAX_VEL_RPM; }
-	m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
+	if (DRIVER_ZEROERR == m_node[instance].driver_type_st) {
+		m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
+		/* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
+	} else if(DRIVER_DELTA == m_node[instance].driver_type_st) {
+		m_node[instance].target_vel = rpm * m_node[instance].ratio * 10.0f;
+	}
+
 }
 
 /* ── SDO send helper ─────────────────────────────────────────────────────── */
@@ -928,17 +935,22 @@ void cia402_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
 {
     const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
-    const int32_t cpr = m_node[idx].encoder_counts_per_rev;
-    /* Wrap signed encoder counts into [0, counts_per_rev) before scaling.
-     * C truncates negative modulo toward zero, so an explicit add-back is
-     * needed for the result to land in [0, 360) for both signs. */
-    int32_t mod_counts = m_node[idx].position_act % cpr;
-    if (mod_counts < 0) { mod_counts += cpr; }
-    *p_pos_deg_f32 = (float)mod_counts * (360.0f / (float)cpr);
-    /* velocity: counts/s ÷ counts_per_rpm_s = RPM */
-    *p_vel_rpm_f32    = (float)m_node[idx].velocity_act
-                        / (float)m_node[idx].counts_per_rpm_s;
-    /* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
+	const int32_t cpr = m_node[idx].encoder_counts_per_rev ;
+	/* Wrap signed encoder counts into [0, counts_per_rev) before scaling.
+	 * C truncates negative modulo toward zero, so an explicit add-back is
+	 * needed for the result to land in [0, 360) for both signs. */
+	int32_t mod_counts = m_node[idx].position_act % cpr ;
+	if (mod_counts < 0) { mod_counts += cpr; }
+	*p_pos_deg_f32 = (float)mod_counts * (360.0f / (float)cpr);
+
+	if (DRIVER_ZEROERR == m_node[idx].driver_type_st) {
+        /* velocity: counts/s ÷ counts_per_rpm_s = RPM */
+		*p_vel_rpm_f32    = (float)m_node[idx].velocity_act / (float)m_node[idx].counts_per_rpm_s;
+	} else if(DRIVER_DELTA == m_node[idx].driver_type_st) {
+		*p_vel_rpm_f32    = (float)m_node[idx].velocity_act / (10.0f * m_node[idx].ratio);
+	}
+
+	/* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
     *p_torque_pct_f32 = (float)m_node[idx].torque_act * 0.1f;
 }
 
@@ -984,13 +996,10 @@ co_error_t app_canopen_init(void)
          * products; the result still fits int32_t for any realistic actuator. */
         const uint32_t cpr   = cia402_nodes[i].encoder_counts_per_rev;
         const uint16_t ratio = cia402_nodes[i].reductor_ratio;
-        m_node[i].encoder_counts_per_rev = (int32_t)cpr;
-        if (DRIVER_DELTA == cia402_nodes[i].driver_type) {
-            m_node[i].counts_per_rpm_s = 10 * ratio;
-        } else if (DRIVER_ZEROERR == cia402_nodes[i].driver_type) {
-            m_node[i].counts_per_rpm_s =
+        m_node[i].encoder_counts_per_rev = (int32_t)cpr * ratio;
+        m_node[i].ratio = ratio;
+		m_node[i].counts_per_rpm_s =
                 (int32_t)(((uint64_t)cpr * (uint64_t)ratio) / 60U);
-        }
 
         m_node[i].controlword = CW_SHUTDOWN;
         m_node[i].mode_of_op  = CIA402_MODE_PROFILE_VEL;
