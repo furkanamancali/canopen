@@ -300,6 +300,26 @@ static inline uint32_t now_ms(void)
     return canopen_node.iface.millis(canopen_node.iface.user);
 }
 
+/* ── Primitive critical section ──────────────────────────────────────────── */
+/* Save-and-restore PRIMASK guard — three Cortex-M instructions per side and,
+ * unlike a mutex, callable from ISR context.  Used to make the producer-side
+ * updates in erob_sdo_rt_enqueue() and erob_set_target_rpm() atomic against
+ * any other priority that might also produce into them, including a higher-
+ * priority ISR preempting an RTOS task mid-update.  Saving PRIMASK (rather
+ * than blindly enabling on exit) keeps the helpers nest-safe: a critical
+ * section taken while interrupts are already disabled leaves them disabled
+ * on exit, exactly as the caller expects. */
+static inline uint32_t co_enter_critical(void)
+{
+    const uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    return pm;
+}
+static inline void co_exit_critical(uint32_t saved_primask)
+{
+    __set_PRIMASK(saved_primask);
+}
+
 /* ── Instance lookup ─────────────────────────────────────────────────────── */
 static int8_t erob_find(uint8_t node_id)
 {
@@ -364,14 +384,21 @@ static void erob_reset(uint8_t i, bool full)
     }
 }
 
+/* Threading: any context (ISR, RTOS task, main loop).  Concurrent callers
+ * from any priority are safe — the slot write is wrapped in a primitive
+ * disable-IRQ critical section so a higher-priority preemptor cannot observe
+ * or produce a torn value, and the volatile guarantees co_transmit_process()
+ * picks up the latched value on the next SYNC tick. */
 void erob_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
 {
     const int8_t idx = erob_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
+    const uint32_t pm = co_enter_critical();
     g_target_rpm[idx] = target_rpm_i32;
+    co_exit_critical(pm);
 }
 
-static void erob_set_velocity(uint8_t instance, int32_t rpm)
+static void erob_apply_target_internal(uint8_t instance, int32_t rpm)
 {
     if (instance >= (uint8_t)EROB_N) { return; }
     if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
@@ -591,15 +618,27 @@ static bool erob_sdo_cfg_run(uint8_t i)
  * Only operates when master_started = true so it never races with the startup
  * config sequence, which uses the same SDO channel. */
 
+/* Producer side of the runtime SDO queue.  The slot write + head advance is
+ * wrapped in a disable-IRQ critical section so concurrent producers from any
+ * priority — including an ISR preempting an RTOS-task caller mid-update —
+ * cannot interleave their writes onto the same slot or lose an enqueue by
+ * racing the head pointer.  The consumer (erob_sdo_rt_run()) only mutates
+ * tail and so does not need the guard, but it does benefit from it: any
+ * head value it reads is fully published. */
 static bool erob_sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
                                  uint32_t value, uint8_t size)
 {
     erob_state_t *e   = &m_erob[i];
+    const uint32_t pm = co_enter_critical();
     const uint8_t next = (uint8_t)((e->sdo_rt_head + 1U) % EROB_SDO_RT_QUEUE_SIZE);
-    if (next == e->sdo_rt_tail) { return false; }   /* full — caller should retry */
+    if (next == e->sdo_rt_tail) {
+        co_exit_critical(pm);
+        return false;                                   /* full — caller should retry */
+    }
     e->sdo_rt_queue[e->sdo_rt_head] =
         (erob_sdo_entry_t){ index, subindex, value, size };
     e->sdo_rt_head = next;
+    co_exit_critical(pm);
     return true;
 }
 
@@ -850,6 +889,10 @@ static void on_reset_communication(void *user)
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
+/* Threading: any context.  Reads m_erob[] PDO feedback fields written from
+ * the main-loop RPDO callback path; 32-bit reads of position/velocity can
+ * tear relative to a concurrent RPDO update.  Suitable for telemetry, not
+ * for sub-cycle synchronization. */
 void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
                       float *const p_vel_rpm_f32, float *const p_torque_pct_f32)
 {
@@ -869,6 +912,11 @@ void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
     *p_torque_pct_f32 = (float)m_erob[idx].torque_act * 0.1f;
 }
 
+/* Threading: any context (ISR, RTOS task, main loop).  Concurrent callers
+ * are serialised by the disable-IRQ critical section in
+ * erob_sdo_rt_enqueue(), so two producers cannot race the head pointer; the
+ * consumer (erob_sdo_rt_run() in app_canopen_loop()) only mutates tail and
+ * so never contends with this path. */
 void erob_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_plus_s)
 {
     const int8_t idx = erob_find((uint8_t)node_id_u16);
@@ -878,6 +926,8 @@ void erob_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
+/* Threading: call once during system init, before FDCAN interrupts are
+ * enabled and before app_canopen_loop() / co_transmit_process() begin. */
 co_error_t app_canopen_init(void)
 {
     co_error_t err;
@@ -1009,6 +1059,9 @@ co_error_t app_canopen_init(void)
 
 /* ── FDCAN RX interrupt ──────────────────────────────────────────────────── */
 
+/* Threading: FDCAN RX FIFO0 ISR only.  Invoked by HAL from interrupt
+ * context; do not call from task code.  Drains the FDCAN FIFO into the SPSC
+ * ring buffer consumed by app_canopen_loop(). */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
     (void)RxFifo0ITs;
@@ -1018,6 +1071,10 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 }
 
 /* ── Main loop ───────────────────────────────────────────────────────────── */
+/* Threading: main-loop / single task context only.  Not reentrant.  Consumes
+ * the SPSC ring filled by HAL_FDCAN_RxFifo0Callback() and owns every
+ * m_erob[] mutation outside of the ISR heartbeat-timestamp fast path; must
+ * therefore be the sole context driving the CiA 402 state machine. */
 void app_canopen_loop(void)
 {
 	/* 1. Deliver queued frames (heartbeat timestamps already updated by ISR). */
@@ -1084,13 +1141,35 @@ void app_canopen_loop(void)
 	}
 }
 
+/* Invocation policy — read this before wiring the call site:
+ *
+ *   • MUST be called every SYNC_PERIOD_US (1 ms by default).  This is the
+ *     transmit half of the stack — it generates the SYNC frame, latches
+ *     g_target_rpm[] into the OD, and emits the synchronous TPDOs that
+ *     carry controlword + target velocity to every drive.  Skipping a tick
+ *     means the slaves see a stale CW/target for that cycle; sustained
+ *     skipping trips the master's own HB producer and the drive-side RPDO
+ *     event timer, which faults the drives with "communication lost".
+ *
+ *   • MUST run from a high-priority context — a hardware timer ISR or the
+ *     top-priority RTOS task.  Co-locating it with app_canopen_loop() in a
+ *     low-priority main loop is a foot-gun: any longer-running task
+ *     (logging, flash write, SDO upload from a slower bus) will jitter the
+ *     SYNC period and reproduce the symptoms above.
+ *
+ *   • MUST share its execution context with app_canopen_loop() — both
+ *     touch m_erob[] and the canopen_node SDO/PDO state without locks, so
+ *     they cannot preempt each other.  In practice this means: either run
+ *     both from the same timer/task, or guard m_erob[] and canopen_node
+ *     with a critical section / mutex if they live on different priorities.
+ */
 void co_transmit_process(void)
 {
     /* 5. Forward application target velocities on each SYNC tick. */
     if (canopen_node.sync_event_pending) {
         canopen_node.sync_event_pending = false;
         for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-            erob_set_velocity(i, (int32_t)g_target_rpm[i]);
+            erob_apply_target_internal(i, (int32_t)g_target_rpm[i]);
         }
     }
 
