@@ -998,8 +998,18 @@ co_error_t app_canopen_init(void)
         const uint16_t ratio = cia402_nodes[i].reductor_ratio;
         m_node[i].encoder_counts_per_rev = (int32_t)cpr * ratio;
         m_node[i].ratio = ratio;
-		m_node[i].counts_per_rpm_s =
+        /* counts_per_rpm_s: scaling factor from output-shaft RPM to the
+         * velocity register unit used by this driver.
+         *   DRIVER_ZEROERR: 0x60FF / 0x606C in encoder counts/s
+         *     → 1 RPM_out = cpr * ratio / 60 counts/s
+         *   DRIVER_DELTA (ASDA-B3): 0x60FF / 0x606C in 0.1-RPM units
+         *     → 1 RPM_out = ratio motor RPM = ratio * 10 in 0.1-RPM units */
+        if (cia402_nodes[i].driver_type == DRIVER_DELTA) {
+            m_node[i].counts_per_rpm_s = (int32_t)ratio * 10;
+        } else {
+            m_node[i].counts_per_rpm_s =
                 (int32_t)(((uint64_t)cpr * (uint64_t)ratio) / 60U);
+        }
 
         m_node[i].controlword = CW_SHUTDOWN;
         m_node[i].mode_of_op  = CIA402_MODE_PROFILE_VEL;

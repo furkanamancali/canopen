@@ -28,12 +28,14 @@ typedef struct {
                                           updated at runtime via cia402_set_accel(). */
     uint32_t      encoder_counts_per_rev; /* encoder counts per motor revolution.
                                              Supply the raw CPR value, e.g.:
-                                               524288  — ZeroErr 19-bit absolute
-                                               1280000 — Delta ASDA-A3 20-bit
-                                               10000   — 2500-PPR incremental ×4
-                                             Used for RPM↔counts conversion in
-                                             cia402_set_target_rpm() and
-                                             cia402_get_pos_vel(). */
+                                               524288   — ZeroErr 19-bit absolute
+                                               16777216 — Delta ASDA-B3 24-bit optical
+                                               131072   — Delta ASDA-B3 17-bit magnetic
+                                               10000    — 2500-PPR incremental ×4
+                                             For DRIVER_DELTA, velocity commands
+                                             use 0.1-RPM units (not counts/s) so
+                                             this field affects only position
+                                             reporting in cia402_get_pos_vel(). */
     uint16_t      reductor_ratio;      /* gearbox ratio: motor revolutions per
                                           one output revolution.  Use 1 for a
                                           direct-drive actuator.  Folded into the
@@ -56,7 +58,8 @@ typedef struct {
 /* Configuration table — define once in your application, e.g.:
  *
  *   const cia402_cfg_t cia402_nodes[] = {
- *       { 0x05U, 50000U, 200000U, 524288U, 1U, DRIVER_ZEROERR },
+ *       { 0x05U, 50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  /* ZeroErr 19-bit */
+ *       { 0x06U, 50000U, 200000U, 16777216U, 1U, DRIVER_DELTA   },  /* Delta ASDA-B3 24-bit */
  *   };
  *   const uint8_t cia402_node_count =
  *       (uint8_t)(sizeof(cia402_nodes) / sizeof(cia402_nodes[0]));
