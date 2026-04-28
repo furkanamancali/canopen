@@ -1,21 +1,26 @@
 /*
- * eRob CANopen Master — STM32H7 FDCAN (multi-instance)
+ * CANopen Master — STM32H7 FDCAN (multi-instance)
  *
- * Controls one or more eRob CiA 402 Profile Velocity actuators.
+ * Controls one or more CiA 402 Profile Velocity actuators (and, as a stub,
+ * non-CiA-402 drives flagged DRIVER_WAT).
  *
  * Topology
  * ────────
- *   STM32H7 (master, node 0x7F) ←──CAN──→ eRob[0] (node 0x05)
- *                                          eRob[1] (node 0x06)  ← optional
+ *   STM32H7 (master, node 0x7F) ←──CAN──→ slave[0] (node 0x05)
+ *                                          slave[1] (node 0x06)  ← optional
  *                                          ...
  *
- * To add or remove eRob modules edit only the EROB_NODES[] table below.
- * Each instance uses two TPDOs and two RPDOs on the master:
- *   instance i → tpdo_num = i*2    (controlword, mode, target_vel → eRob RPDO1)
- *              → rpdo_num = i*2    (statusword, mode_display, velocity_act ← eRob TPDO1)
- *              → rpdo_num = i*2+1  (position_act, torque_act ← eRob TPDO2)
+ * The instance table is supplied by the application via the externs declared
+ * in example_embedded.h (cia402_nodes[] / cia402_node_count).  This source
+ * file no longer owns the configuration array — drop it in any translation
+ * unit and the stack picks it up.
+ *
+ * Each CiA 402 instance uses two TPDOs and two RPDOs on the master:
+ *   instance i → tpdo_num = i*2    (controlword, mode, target_vel → slave RPDO1)
+ *              → rpdo_num = i*2    (statusword, mode_display, velocity_act ← slave TPDO1)
+ *              → rpdo_num = i*2+1  (position_act, torque_act ← slave TPDO2)
  * Accel/decel are written via SDO (0x6083/0x6084): once at startup, and again
- * at runtime via erob_set_accel() which queues writes through erob_sdo_rt_run().
+ * at runtime via cia402_set_accel() which queues writes through sdo_rt_run().
  *
  * OD backing storage uses vendor-specific indices so instances never collide:
  *   TPDO data for instance i: OD index 0x4000 + i  (sub 1–5)
@@ -24,6 +29,7 @@
 
 #include "canopen.h"
 #include "canopen_stm32h7_fdcan.h"
+#include "example_embedded.h"
 #include "utils/utils.h"
 
 extern FDCAN_HandleTypeDef hfdcan1;
@@ -31,24 +37,22 @@ extern FDCAN_HandleTypeDef hfdcan1;
 /* ── Master configuration ────────────────────────────────────────────────── */
 #define MASTER_NODE_ID              0x7FU
 #define MASTER_HEARTBEAT_MS         50U
-#define EROB_HB_TIMEOUT_MS          150U
+#define SLAVE_HB_TIMEOUT_MS          150U
 #define SYNC_PERIOD_US              1000UL
-#define EROB_MAX_VEL_RPM            3000
-#define EROB_COUNTS_PER_REV         524288    /* counts per output revolution (empirical) */
-#define EROB_ENCODER_RPM_TO_PLUS    8738        /* counts/s per RPM = 524288/60 */
-#define EROB_STATE_TIMEOUT_MS       2000U
-#define EROB_FAULT_RESET_MS         10U
-#define EROB_RPDO_WATCHDOG_MS       100U
-#define EROB_NMT_RESET_DELAY_MS     500U
-#define EROB_NMT_PREOP_DELAY_MS     100U
+#define CIA402_MAX_VEL_RPM            3000
+#define CIA402_STATE_TIMEOUT_MS       2000U
+#define CIA402_FAULT_RESET_MS         10U
+#define CIA402_RPDO_WATCHDOG_MS       100U
+#define NMT_RESET_DELAY_MS     500U
+#define NMT_PREOP_DELAY_MS     100U
 /* Minimum time PRE_OPERATIONAL must persist after the master has finished
  * configuring the drive before we treat it as a real slave drop and re-run
  * the SDO config.  Set well above the heartbeat period so a single anomalous
  * HB carrying PRE_OP (e.g. one missed/garbled frame between two OP frames)
  * cannot, on its own, destroy master_started and replay the 28-step sequence. */
-#define EROB_NMT_PREOP_DEBOUNCE_MS  150U
-#define EROB_SDO_TIMEOUT_MS         500U
-#define EROB_SDO_RT_QUEUE_SIZE      4U   /* max queued runtime SDO writes per instance */
+#define NMT_PREOP_DEBOUNCE_MS  150U
+#define SDO_TIMEOUT_MS         500U
+#define SDO_RT_QUEUE_SIZE      4U   /* max queued runtime SDO writes per instance */
 
 #define CW_SHUTDOWN             0x0006U
 #define CW_SWITCH_ON            0x0007U
@@ -56,29 +60,21 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define CW_QUICK_STOP           0x000BU
 #define CW_FAULT_RESET          0x0080U
 #define CW_FAULT_RESET_CLEAR    0x0000U
-#define EROB_MODE_PROFILE_VEL   ((int8_t)3)
+#define CIA402_MODE_PROFILE_VEL   ((int8_t)3)
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * INSTANCE CONFIGURATION — add or remove rows to control more eRob modules.
- * CO_MAX_RPDO / CO_MAX_TPDO in canopen.h must each be >= count * 2.
+ * INSTANCE CONFIGURATION
+ *
+ * The cia402_nodes[] / cia402_node_count externs (declared in
+ * example_embedded.h) come from the application — see that header for the
+ * recommended pattern.  All loops in this file use cia402_node_count, and
+ * all per-instance storage is sized to CIA402_MAX_NODES.  app_canopen_init()
+ * range-checks cia402_node_count before doing anything else; CO_MAX_RPDO /
+ * CO_MAX_TPDO in canopen.h must each be >= cia402_node_count * 2.
  * ═══════════════════════════════════════════════════════════════════════════ */
-typedef struct {
-    uint8_t  node_id;
-    uint32_t default_accel;   /* [plus/s] */
-    uint32_t default_decel;   /* [plus/s] */
-} erob_cfg_t;
 
-static const erob_cfg_t EROB_NODES[] = {
-    { 0x05U, 50000U, 200000U },
-//    { 0x01U, 5000U, 5000U },
-    /* { 0x06U, 5000U, 5000U }, */
-};
-/* ══════════════════════════════════════════════════════════════════════════ */
-
-#define EROB_N  (sizeof(EROB_NODES) / sizeof(EROB_NODES[0]))
-
-_Static_assert(EROB_N * 2U <= CO_MAX_RPDO,
-    "Too many eRob instances — raise CO_MAX_RPDO and CO_MAX_TPDO in canopen.h");
+_Static_assert(CIA402_MAX_NODES * 2U <= CO_MAX_RPDO,
+    "CIA402_MAX_NODES too high — raise CO_MAX_RPDO and CO_MAX_TPDO in canopen.h");
 
 /* ── CANopen stack instance ───────────────────────────────────────────────── */
 static co_node_t      canopen_node;
@@ -90,67 +86,86 @@ typedef struct {
     uint8_t  subindex;
     uint32_t value;
     uint8_t  size;
-} erob_sdo_entry_t;
+} sdo_entry_t;
 
-#define EROB_SDO_STEPS 28U
-static erob_sdo_entry_t m_sdo_tbl[EROB_N][EROB_SDO_STEPS];
+/* Per-instance startup SDO table.  SDO_STEPS_MAX is the storage
+ * dimension; the actual entry count varies by driver_type and is recorded in
+ * m_sdo_steps[i] so sdo_cfg_run() knows when it has reached the end. */
+#define SDO_STEPS_MAX 28U
+static sdo_entry_t m_sdo_tbl[CIA402_MAX_NODES][SDO_STEPS_MAX];
+static uint8_t          m_sdo_steps[CIA402_MAX_NODES];
 
-static void erob_build_sdo_table(uint8_t i)
+static void build_sdo_table(uint8_t i)
 {
-    const uint8_t  nid = EROB_NODES[i].node_id;
-    const uint32_t r1d = 0x80000000UL | (0x200UL + nid);
-    const uint32_t r1e =                 0x200UL + nid;
-    const uint32_t t1d = 0x80000000UL | (0x180UL + nid);
-    const uint32_t t1e =                 0x180UL + nid;
-    const uint32_t t2d = 0x80000000UL | (0x280UL + nid);
-    const uint32_t t2e =                 0x280UL + nid;
-    erob_sdo_entry_t *t = m_sdo_tbl[i];
+    const uint8_t  nid = cia402_nodes[i].node_id;
+    sdo_entry_t *t = m_sdo_tbl[i];
     uint32_t n = 0U;
 
-    /* eRob RPDO1 */
-    t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x01U, r1d,          4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x02U, 0xFFU,         1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x00U, 0U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x01U, 0x60400010UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x02U, 0x60600008UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x03U, 0x60FF0020UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1600U, 0x00U, 3U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x01U, r1e,           4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1400U, 0x05U, 500U,          2U };
-    /* eRob TPDO1 */
-    t[n++] = (erob_sdo_entry_t){ 0x1800U, 0x01U, t1d,          4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1800U, 0x02U, 0x01U,         1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A00U, 0x00U, 0U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A00U, 0x01U, 0x60410010UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A00U, 0x02U, 0x60610008UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A00U, 0x03U, 0x606C0020UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A00U, 0x00U, 3U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1800U, 0x01U, t1e,           4U };
-    /* eRob TPDO2 */
-    t[n++] = (erob_sdo_entry_t){ 0x1801U, 0x01U, t2d,          4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1801U, 0x02U, 0x01U,         1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x00U, 0U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x01U, 0x60640020UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x02U, 0x60770010UL, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x1A01U, 0x00U, 2U,            1U };
-    t[n++] = (erob_sdo_entry_t){ 0x1801U, 0x01U, t2e,           4U };
-    /* Profile ramp — written once; accel/decel are no longer PDO-mapped */
-    t[n++] = (erob_sdo_entry_t){ 0x6083U, 0x00U, EROB_NODES[i].default_accel, 4U };
-    t[n++] = (erob_sdo_entry_t){ 0x6084U, 0x00U, EROB_NODES[i].default_decel, 4U };
-    /* Heartbeat */
-    t[n++] = (erob_sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
-    t[n++] = (erob_sdo_entry_t){ 0x1016U, 0x01U,
-                                  ((uint32_t)MASTER_NODE_ID << 16) | 150U, 4U };
+    if (cia402_nodes[i].driver_type == DRIVER_CIA402) {
+        const uint32_t r1d = 0x80000000UL | (0x200UL + nid);
+        const uint32_t r1e =                 0x200UL + nid;
+        const uint32_t t1d = 0x80000000UL | (0x180UL + nid);
+        const uint32_t t1e =                 0x180UL + nid;
+        const uint32_t t2d = 0x80000000UL | (0x280UL + nid);
+        const uint32_t t2e =                 0x280UL + nid;
+
+        /* slave RPDO1 */
+        t[n++] = (sdo_entry_t){ 0x1400U, 0x01U, r1d,          4U };
+        t[n++] = (sdo_entry_t){ 0x1400U, 0x02U, 0xFFU,         1U };
+        t[n++] = (sdo_entry_t){ 0x1600U, 0x00U, 0U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1600U, 0x01U, 0x60400010UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1600U, 0x02U, 0x60600008UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1600U, 0x03U, 0x60FF0020UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1600U, 0x00U, 3U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1400U, 0x01U, r1e,           4U };
+        t[n++] = (sdo_entry_t){ 0x1400U, 0x05U, 500U,          2U };
+        /* slave TPDO1 */
+        t[n++] = (sdo_entry_t){ 0x1800U, 0x01U, t1d,          4U };
+        t[n++] = (sdo_entry_t){ 0x1800U, 0x02U, 0x01U,         1U };
+        t[n++] = (sdo_entry_t){ 0x1A00U, 0x00U, 0U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1A00U, 0x01U, 0x60410010UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1A00U, 0x02U, 0x60610008UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1A00U, 0x03U, 0x606C0020UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1A00U, 0x00U, 3U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1800U, 0x01U, t1e,           4U };
+        /* slave TPDO2 */
+        t[n++] = (sdo_entry_t){ 0x1801U, 0x01U, t2d,          4U };
+        t[n++] = (sdo_entry_t){ 0x1801U, 0x02U, 0x01U,         1U };
+        t[n++] = (sdo_entry_t){ 0x1A01U, 0x00U, 0U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1A01U, 0x01U, 0x60640020UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1A01U, 0x02U, 0x60770010UL, 4U };
+        t[n++] = (sdo_entry_t){ 0x1A01U, 0x00U, 2U,            1U };
+        t[n++] = (sdo_entry_t){ 0x1801U, 0x01U, t2e,           4U };
+        /* Profile ramp — written once; accel/decel are no longer PDO-mapped */
+        t[n++] = (sdo_entry_t){ 0x6083U, 0x00U, cia402_nodes[i].default_accel, 4U };
+        t[n++] = (sdo_entry_t){ 0x6084U, 0x00U, cia402_nodes[i].default_decel, 4U };
+        /* Heartbeat */
+        t[n++] = (sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
+        t[n++] = (sdo_entry_t){ 0x1016U, 0x01U,
+                                      ((uint32_t)MASTER_NODE_ID << 16) | 150U, 4U };
+    } else {
+        /* DRIVER_WAT — placeholder.  Bring the slave online with the bare
+         * minimum every CANopen drive needs: a heartbeat producer the master
+         * can monitor, and a HB consumer entry pointing back at the master.
+         * No PDO mapping is configured here — the application will need to
+         * extend this branch (and the PDO setup in app_canopen_init) once
+         * the WAT object dictionary is known. */
+        t[n++] = (sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
+        t[n++] = (sdo_entry_t){ 0x1016U, 0x01U,
+                                      ((uint32_t)MASTER_NODE_ID << 16) | 150U, 4U };
+    }
+
+    m_sdo_steps[i] = (uint8_t)n;
 }
 
 /* ── Per-instance runtime state ──────────────────────────────────────────── */
 typedef enum {
-    EROB_SDO_CFG_IDLE = 0,
-    EROB_SDO_CFG_RESET_DELAY,
-    EROB_SDO_CFG_NMT_DELAY,
-    EROB_SDO_CFG_WAIT_RESPONSE,
-    EROB_SDO_CFG_DONE,
-} erob_sdo_cfg_state_t;
+    SDO_CFG_IDLE = 0,
+    SDO_CFG_RESET_DELAY,
+    SDO_CFG_NMT_DELAY,
+    SDO_CFG_WAIT_RESPONSE,
+    SDO_CFG_DONE,
+} sdo_cfg_state_t;
 
 typedef enum {
     MASTER_CIA402_IDLE = 0,
@@ -168,9 +183,9 @@ typedef enum {
  * Sized to capture the full enable sequence plus a few faults without
  * wrapping during a postmortem on a "stuck in SOD" / fault-reset-loop event.
  * Compiled in only under -DDEBUG so release builds pay no flash, RAM, or
- * runtime cost; release-build erob_log_transition() collapses to a single
+ * runtime cost; release-build cia402_log_transition() collapses to a single
  * drive_state assignment (see below). */
-#define EROB_TRANSITION_LOG_SIZE 16U
+#define CIA402_TRANSITION_LOG_SIZE 16U
 
 typedef struct {
     uint32_t ts_ms;        /* now_ms() at the moment of the transition */
@@ -178,31 +193,31 @@ typedef struct {
                               for "stuck in SOD" investigations) */
     uint8_t  from;         /* master_cia402_state_t before the transition */
     uint8_t  to;           /* master_cia402_state_t after the transition  */
-} erob_transition_t;
+} cia402_transition_t;
 #endif
 
 typedef struct {
-    /* OD backing: TPDO1 — master → eRob commands */
+    /* OD backing: TPDO1 — master → slave commands */
     uint16_t controlword;
     int8_t   mode_of_op;
     int32_t  target_vel;
-    /* OD backing: RPDO1 — eRob → master feedback */
+    /* OD backing: RPDO1 — slave → master feedback */
     uint16_t statusword;
     int8_t   mode_display;
     int32_t  velocity_act;
-    /* OD backing: RPDO2 — eRob → master position/torque */
+    /* OD backing: RPDO2 — slave → master position/torque */
     int32_t  position_act;
     int16_t  torque_act;
 
-    erob_sdo_cfg_state_t sdo_cfg_state;
+    sdo_cfg_state_t sdo_cfg_state;
     uint32_t             sdo_cfg_step;
     uint32_t             sdo_cfg_step_ms;
     bool                 sdo_cfg_resp_ok;
 
-    /* Runtime SDO write queue — filled by erob_set_accel() etc., drained by
-     * erob_sdo_rt_run() one entry per response cycle.  Only active after
+    /* Runtime SDO write queue — filled by cia402_set_accel() etc., drained by
+     * sdo_rt_run() one entry per response cycle.  Only active after
      * master_started = true (startup config is complete). */
-    erob_sdo_entry_t sdo_rt_queue[EROB_SDO_RT_QUEUE_SIZE];
+    sdo_entry_t sdo_rt_queue[SDO_RT_QUEUE_SIZE];
     uint8_t          sdo_rt_head;     /* next write slot */
     uint8_t          sdo_rt_tail;     /* next read slot  */
     bool             sdo_rt_active;   /* waiting for response to current entry */
@@ -217,8 +232,8 @@ typedef struct {
     /* Last SDO abort observed on the runtime path.  Non-zero means the most
      * recent runtime SDO write was rejected by the drive; data[4..7] of the
      * abort frame, plus the index/subindex of the entry that failed.  Cleared
-     * on full instance reset; mirrored to g_erob_sdo_rt_abort_code[] so it is
-     * visible without walking m_erob[]. */
+     * on full instance reset; mirrored to g_sdo_rt_abort_code[] so it is
+     * visible without walking m_node[]. */
     uint32_t         sdo_rt_abort_code;
     uint16_t         sdo_rt_abort_index;
     uint8_t          sdo_rt_abort_subindex;
@@ -231,41 +246,52 @@ typedef struct {
     bool           hb_lost;
     co_nmt_state_t nmt_state;
 
-    /* PRE_OP debounce.  Armed by on_erob_nmt_change when a started drive
+    /* PRE_OP debounce.  Armed by on_slave_nmt_change when a started drive
      * reports PRE_OPERATIONAL; cleared on return to OPERATIONAL or when the
-     * main loop confirms the drop after EROB_NMT_PREOP_DEBOUNCE_MS. */
+     * main loop confirms the drop after NMT_PREOP_DEBOUNCE_MS. */
     bool           pre_op_pending;
     uint32_t       pre_op_entry_ms;
 
+    /* Per-instance encoder constants derived from cia402_nodes[i] at
+     * app_canopen_init() time.
+     *   counts_per_rev   = 1 << encoder_resolution;
+     *   counts_per_rpm_s = counts_per_rev * reductor_ratio / 60   (counts/s
+     *                      per output-shaft RPM).
+     * Cached once so the SYNC-tick conversion in
+     * cia402_apply_target_internal() and the float math in cia402_get_pos_vel()
+     * don't recompute them every call. */
+    int32_t        encoder_counts_per_rev;
+    int32_t        counts_per_rpm_s;
+
 #ifdef DEBUG
-    /* CiA 402 transition history.  Written by erob_log_transition() on every
+    /* CiA 402 transition history.  Written by cia402_log_transition() on every
      * drive_state change; the most recent entry is at
      * (transition_log_head - 1) & (SIZE - 1).  count saturates at SIZE and
      * lets a debugger distinguish "log not yet wrapped" from "log full".
-     * Not cleared by erob_reset() — surviving the reset is the whole point;
+     * Not cleared by node_reset() — surviving the reset is the whole point;
      * postmortem of "why did we end up back at IDLE" needs the prior state. */
-    erob_transition_t transition_log[EROB_TRANSITION_LOG_SIZE];
+    cia402_transition_t transition_log[CIA402_TRANSITION_LOG_SIZE];
     uint8_t           transition_log_head;
     uint8_t           transition_log_count;
 #endif
-} erob_state_t;
+} node_state_t;
 
-static erob_state_t m_erob[EROB_N];
+static node_state_t m_node[CIA402_MAX_NODES];
 
 /* Last EMCY per instance — inspect in debugger to identify faults. */
-volatile uint16_t g_erob_emcy_code[EROB_N];
-volatile uint8_t  g_erob_emcy_reg[EROB_N];
+volatile uint16_t g_emcy_code[CIA402_MAX_NODES];
+volatile uint8_t  g_emcy_reg[CIA402_MAX_NODES];
 
 /* Last runtime-SDO abort per instance.  Non-zero abort_code means a runtime
- * write (e.g. erob_set_accel) was rejected; the index/subindex identify the
+ * write (e.g. cia402_set_accel) was rejected; the index/subindex identify the
  * entry that failed.  Sticky until cleared by the application or instance
  * reset. */
-volatile uint32_t g_erob_sdo_rt_abort_code[EROB_N];
-volatile uint16_t g_erob_sdo_rt_abort_index[EROB_N];
-volatile uint8_t  g_erob_sdo_rt_abort_subindex[EROB_N];
+volatile uint32_t g_sdo_rt_abort_code[CIA402_MAX_NODES];
+volatile uint16_t g_sdo_rt_abort_index[CIA402_MAX_NODES];
+volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
 
 /* Per-instance target RPM set from any task context. */
-volatile int32_t g_target_rpm[EROB_N];
+volatile int32_t g_target_rpm[CIA402_MAX_NODES];
 
 /* ── CiA 402 statusword helpers ──────────────────────────────────────────── */
 #define SW_RTSO  0x0001U
@@ -276,24 +302,24 @@ volatile int32_t g_target_rpm[EROB_N];
 #define SW_SOD   0x0040U
 #define SW_MASK  (SW_RTSO | SW_SO | SW_OE | SW_FAULT | SW_QS | SW_SOD)
 
-static inline bool erob_sw_fault_reaction_active(uint16_t sw)
+static inline bool cia402_sw_fault_reaction_active(uint16_t sw)
 {
     return (sw & (SW_FAULT | SW_OE | SW_SO | SW_RTSO))
                == (SW_FAULT | SW_OE | SW_SO | SW_RTSO);
 }
-static inline bool erob_sw_ready_to_switch_on(uint16_t sw)
+static inline bool cia402_sw_ready_to_switch_on(uint16_t sw)
 {
     return (sw & SW_MASK) == (SW_RTSO | SW_QS);
 }
-static inline bool erob_sw_switched_on(uint16_t sw)
+static inline bool cia402_sw_switched_on(uint16_t sw)
 {
     return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_QS);
 }
-static inline bool erob_sw_operation_enabled(uint16_t sw)
+static inline bool cia402_sw_operation_enabled(uint16_t sw)
 {
     return (sw & SW_MASK) == (SW_RTSO | SW_SO | SW_OE | SW_QS);
 }
-static inline bool erob_sw_fault(uint16_t sw) { return (sw & SW_FAULT) != 0U; }
+static inline bool cia402_sw_fault(uint16_t sw) { return (sw & SW_FAULT) != 0U; }
 
 static inline uint32_t now_ms(void)
 {
@@ -303,7 +329,7 @@ static inline uint32_t now_ms(void)
 /* ── Primitive critical section ──────────────────────────────────────────── */
 /* Save-and-restore PRIMASK guard — three Cortex-M instructions per side and,
  * unlike a mutex, callable from ISR context.  Used to make the producer-side
- * updates in erob_sdo_rt_enqueue() and erob_set_target_rpm() atomic against
+ * updates in sdo_rt_enqueue() and cia402_set_target_rpm() atomic against
  * any other priority that might also produce into them, including a higher-
  * priority ISR preempting an RTOS task mid-update.  Saving PRIMASK (rather
  * than blindly enabling on exit) keeps the helpers nest-safe: a critical
@@ -321,10 +347,10 @@ static inline void co_exit_critical(uint32_t saved_primask)
 }
 
 /* ── Instance lookup ─────────────────────────────────────────────────────── */
-static int8_t erob_find(uint8_t node_id)
+static int8_t node_find(uint8_t node_id)
 {
-    for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-        if (EROB_NODES[i].node_id == node_id) { return (int8_t)i; }
+    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+        if (cia402_nodes[i].node_id == node_id) { return (int8_t)i; }
     }
     return -1;
 }
@@ -338,49 +364,49 @@ static int8_t erob_find(uint8_t node_id)
  *
  * Release builds (-DDEBUG not set) collapse this to a single field
  * assignment — no ring storage, no now_ms() call, no branch — so the call
- * sites scattered through erob_cia402_step / on_hb_event / the main loop
+ * sites scattered through cia402_step / on_hb_event / the main loop
  * don't need their own #ifdef wrappers. */
 #ifdef DEBUG
-static void erob_log_transition(uint8_t i, master_cia402_state_t to)
+static void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 {
-    erob_state_t *e = &m_erob[i];
+    node_state_t *e = &m_node[i];
     if (e->drive_state == to) { return; }
 
-    erob_transition_t *r = &e->transition_log[e->transition_log_head];
+    cia402_transition_t *r = &e->transition_log[e->transition_log_head];
     r->ts_ms      = now_ms();
     r->statusword = e->statusword;
     r->from       = (uint8_t)e->drive_state;
     r->to         = (uint8_t)to;
 
     e->transition_log_head =
-        (uint8_t)((e->transition_log_head + 1U) & (EROB_TRANSITION_LOG_SIZE - 1U));
-    if (e->transition_log_count < EROB_TRANSITION_LOG_SIZE) {
+        (uint8_t)((e->transition_log_head + 1U) & (CIA402_TRANSITION_LOG_SIZE - 1U));
+    if (e->transition_log_count < CIA402_TRANSITION_LOG_SIZE) {
         e->transition_log_count++;
     }
     e->drive_state = to;
 }
 #else
-static inline void erob_log_transition(uint8_t i, master_cia402_state_t to)
+static inline void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 {
-    m_erob[i].drive_state = to;
+    m_node[i].drive_state = to;
 }
 #endif
 
 /* ── Instance reset ──────────────────────────────────────────────────────── */
-static void erob_reset(uint8_t i, bool full)
+static void node_reset(uint8_t i, bool full)
 {
-    m_erob[i].target_vel     = 0;
-    m_erob[i].controlword    = CW_SHUTDOWN;
-    erob_log_transition(i, MASTER_CIA402_IDLE);
-    m_erob[i].master_started = false;
-    m_erob[i].sdo_rt_head    = 0U;
-    m_erob[i].sdo_rt_tail    = 0U;
-    m_erob[i].sdo_rt_active  = false;
-    m_erob[i].pre_op_pending = false;
+    m_node[i].target_vel     = 0;
+    m_node[i].controlword    = CW_SHUTDOWN;
+    cia402_log_transition(i, MASTER_CIA402_IDLE);
+    m_node[i].master_started = false;
+    m_node[i].sdo_rt_head    = 0U;
+    m_node[i].sdo_rt_tail    = 0U;
+    m_node[i].sdo_rt_active  = false;
+    m_node[i].pre_op_pending = false;
     if (full) {
-        m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
-        m_erob[i].sdo_cfg_step  = 0U;
-        m_erob[i].hb_lost       = false;
+        m_node[i].sdo_cfg_state = SDO_CFG_IDLE;
+        m_node[i].sdo_cfg_step  = 0U;
+        m_node[i].hb_lost       = false;
     }
 }
 
@@ -389,25 +415,25 @@ static void erob_reset(uint8_t i, bool full)
  * disable-IRQ critical section so a higher-priority preemptor cannot observe
  * or produce a torn value, and the volatile guarantees co_transmit_process()
  * picks up the latched value on the next SYNC tick. */
-void erob_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
+void cia402_set_target_rpm(uint16_t node_id_u16, int32_t target_rpm_i32)
 {
-    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
     const uint32_t pm = co_enter_critical();
     g_target_rpm[idx] = target_rpm_i32;
     co_exit_critical(pm);
 }
 
-static void erob_apply_target_internal(uint8_t instance, int32_t rpm)
+static void cia402_apply_target_internal(uint8_t instance, int32_t rpm)
 {
-    if (instance >= (uint8_t)EROB_N) { return; }
-    if (rpm >  EROB_MAX_VEL_RPM) { rpm =  EROB_MAX_VEL_RPM; }
-    if (rpm < -EROB_MAX_VEL_RPM) { rpm = -EROB_MAX_VEL_RPM; }
-    m_erob[instance].target_vel = rpm * EROB_ENCODER_RPM_TO_PLUS;
+    if (instance >= cia402_node_count) { return; }
+    if (rpm >  CIA402_MAX_VEL_RPM) { rpm =  CIA402_MAX_VEL_RPM; }
+    if (rpm < -CIA402_MAX_VEL_RPM) { rpm = -CIA402_MAX_VEL_RPM; }
+    m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
 }
 
 /* ── SDO send helper ─────────────────────────────────────────────────────── */
-static void erob_sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
+static void sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
                           uint32_t value, uint8_t size)
 {
     uint8_t cmd;
@@ -432,37 +458,37 @@ static void erob_sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
 }
 
 /* ── NMT state change ────────────────────────────────────────────────────── */
-static void on_erob_nmt_change(uint8_t i, co_nmt_state_t st)
+static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
 {
     switch (st) {
     case CO_NMT_INITIALIZING:
-        if (m_erob[i].sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) { break; }
-        erob_reset(i, true);
+        if (m_node[i].sdo_cfg_state == SDO_CFG_RESET_DELAY) { break; }
+        node_reset(i, true);
         break;
     case CO_NMT_PRE_OPERATIONAL:
         /* Expected during our own startup (we just sent NMT reset / 0x80) —
          * leave the in-flight cfg sequence alone. */
-        if (m_erob[i].sdo_cfg_state == EROB_SDO_CFG_NMT_DELAY ||
-            m_erob[i].sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
+        if (m_node[i].sdo_cfg_state == SDO_CFG_NMT_DELAY ||
+            m_node[i].sdo_cfg_state == SDO_CFG_RESET_DELAY) {
             break;
         }
         /* Unexpected drop from a started drive — arm the debounce instead of
          * tearing down state.  If the slave returns to OPERATIONAL within
-         * EROB_NMT_PREOP_DEBOUNCE_MS this is treated as a transient HB and
+         * NMT_PREOP_DEBOUNCE_MS this is treated as a transient HB and
          * the master continues uninterrupted; otherwise the main loop will
          * commit to a full re-config.  Idempotent: a second PRE_OP transition
          * inside the window does not restart the timer. */
-        if (!m_erob[i].pre_op_pending) {
-            m_erob[i].pre_op_pending  = true;
-            m_erob[i].pre_op_entry_ms = now_ms();
+        if (!m_node[i].pre_op_pending) {
+            m_node[i].pre_op_pending  = true;
+            m_node[i].pre_op_entry_ms = now_ms();
         }
         break;
     case CO_NMT_STOPPED:
-        erob_reset(i, true);
+        node_reset(i, true);
         break;
     case CO_NMT_OPERATIONAL:
         /* Slave returned to OP — cancel any pending re-config. */
-        m_erob[i].pre_op_pending = false;
+        m_node[i].pre_op_pending = false;
         break;
     }
 }
@@ -475,12 +501,12 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     /* Heartbeat: track per-instance NMT state */
     if (frame->cob_id >= 0x701U && frame->cob_id <= 0x77FU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x700U);
-        const int8_t  idx = erob_find(nid);
+        const int8_t  idx = node_find(nid);
         if (idx >= 0) {
             const co_nmt_state_t st = (co_nmt_state_t)(frame->data[0] & 0x7FU);
-            if (st != m_erob[idx].nmt_state) {
-                m_erob[idx].nmt_state = st;
-                on_erob_nmt_change((uint8_t)idx, st);
+            if (st != m_node[idx].nmt_state) {
+                m_node[idx].nmt_state = st;
+                on_slave_nmt_change((uint8_t)idx, st);
             }
         }
         return;
@@ -489,11 +515,11 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     /* EMCY (COB-ID = 0x080 + node_id): capture fault code per instance */
     if (frame->cob_id >= 0x081U && frame->cob_id <= 0x0FFU && frame->len >= 3U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x080U);
-        const int8_t  idx = erob_find(nid);
+        const int8_t  idx = node_find(nid);
         if (idx >= 0) {
-            g_erob_emcy_code[idx] = (uint16_t)frame->data[0]
+            g_emcy_code[idx] = (uint16_t)frame->data[0]
                                   | ((uint16_t)frame->data[1] << 8);
-            g_erob_emcy_reg[idx]  = frame->data[2];
+            g_emcy_reg[idx]  = frame->data[2];
         }
         return;
     }
@@ -509,7 +535,7 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
      * Aborts must NOT be treated as success silently: the rt queue would
      * advance with the caller none the wiser.  Capture the 4-byte abort code
      * (data[4..7]) and the failing entry's index/subindex into per-instance
-     * fields and the g_erob_sdo_rt_abort_*[] surfaces.  The queue still
+     * fields and the g_sdo_rt_abort_*[] surfaces.  The queue still
      * advances on abort — retrying would produce the same code — but the
      * failure is now observable.
      *
@@ -518,37 +544,37 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
      * before the queue advances and the entry is overwritten. */
     if (frame->cob_id >= 0x581U && frame->cob_id <= 0x5FFU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x580U);
-        const int8_t  idx = erob_find(nid);
+        const int8_t  idx = node_find(nid);
         if (idx >= 0) {
             const uint8_t scs           = (uint8_t)(frame->data[0] & 0xE0U);
             const bool    is_dl_confirm = (scs == 0x60U);
             const bool    is_ul_confirm = (scs == 0x40U);
             const bool    is_abort      = (frame->data[0] == 0x80U);
             if (is_dl_confirm || is_ul_confirm || is_abort) {
-                if (m_erob[idx].sdo_cfg_state == EROB_SDO_CFG_WAIT_RESPONSE) {
-                    m_erob[idx].sdo_cfg_resp_ok = true;
-                } else if (m_erob[idx].sdo_rt_active) {
+                if (m_node[idx].sdo_cfg_state == SDO_CFG_WAIT_RESPONSE) {
+                    m_node[idx].sdo_cfg_resp_ok = true;
+                } else if (m_node[idx].sdo_rt_active) {
                     if (is_abort && frame->len >= 8U) {
                         const uint32_t code = (uint32_t)frame->data[4]
                                             | ((uint32_t)frame->data[5] << 8)
                                             | ((uint32_t)frame->data[6] << 16)
                                             | ((uint32_t)frame->data[7] << 24);
-                        const erob_sdo_entry_t *w =
-                            &m_erob[idx].sdo_rt_queue[m_erob[idx].sdo_rt_tail];
-                        m_erob[idx].sdo_rt_abort_code     = code;
-                        m_erob[idx].sdo_rt_abort_index    = w->index;
-                        m_erob[idx].sdo_rt_abort_subindex = w->subindex;
-                        g_erob_sdo_rt_abort_code[idx]     = code;
-                        g_erob_sdo_rt_abort_index[idx]    = w->index;
-                        g_erob_sdo_rt_abort_subindex[idx] = w->subindex;
+                        const sdo_entry_t *w =
+                            &m_node[idx].sdo_rt_queue[m_node[idx].sdo_rt_tail];
+                        m_node[idx].sdo_rt_abort_code     = code;
+                        m_node[idx].sdo_rt_abort_index    = w->index;
+                        m_node[idx].sdo_rt_abort_subindex = w->subindex;
+                        g_sdo_rt_abort_code[idx]     = code;
+                        g_sdo_rt_abort_index[idx]    = w->index;
+                        g_sdo_rt_abort_subindex[idx] = w->subindex;
                     } else if (is_ul_confirm && frame->len >= 8U) {
-                        m_erob[idx].sdo_rt_resp_value =
+                        m_node[idx].sdo_rt_resp_value =
                               (uint32_t)frame->data[4]
                             | ((uint32_t)frame->data[5] << 8)
                             | ((uint32_t)frame->data[6] << 16)
                             | ((uint32_t)frame->data[7] << 24);
                     }
-                    m_erob[idx].sdo_rt_resp_ok = true;
+                    m_node[idx].sdo_rt_resp_ok = true;
                 }
             }
         }
@@ -556,44 +582,44 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
 }
 
 /* ── SDO config state machine (per instance) ─────────────────────────────── */
-static bool erob_sdo_cfg_run(uint8_t i)
+static bool sdo_cfg_run(uint8_t i)
 {
-    erob_state_t *e  = &m_erob[i];
-    if (e->sdo_cfg_state == EROB_SDO_CFG_DONE) { return true; }
+    node_state_t *e  = &m_node[i];
+    if (e->sdo_cfg_state == SDO_CFG_DONE) { return true; }
 
     const uint32_t t   = now_ms();
-    const uint8_t  nid = EROB_NODES[i].node_id;
+    const uint8_t  nid = cia402_nodes[i].node_id;
 
-    if (e->sdo_cfg_state == EROB_SDO_CFG_IDLE) {
+    if (e->sdo_cfg_state == SDO_CFG_IDLE) {
         (void)co_nmt_master_send(&canopen_node, 0x82U, nid);
         e->sdo_cfg_step    = 0U;
         e->sdo_cfg_resp_ok = false;
         e->sdo_cfg_step_ms = t;
-        e->sdo_cfg_state   = EROB_SDO_CFG_RESET_DELAY;
+        e->sdo_cfg_state   = SDO_CFG_RESET_DELAY;
         return false;
     }
 
-    if (e->sdo_cfg_state == EROB_SDO_CFG_RESET_DELAY) {
-        if ((t - e->sdo_cfg_step_ms) < EROB_NMT_RESET_DELAY_MS) { return false; }
+    if (e->sdo_cfg_state == SDO_CFG_RESET_DELAY) {
+        if ((t - e->sdo_cfg_step_ms) < NMT_RESET_DELAY_MS) { return false; }
         (void)co_nmt_master_send(&canopen_node, 0x80U, nid);
         e->sdo_cfg_step_ms = t;
-        e->sdo_cfg_state   = EROB_SDO_CFG_NMT_DELAY;
+        e->sdo_cfg_state   = SDO_CFG_NMT_DELAY;
         return false;
     }
 
-    if (e->sdo_cfg_state == EROB_SDO_CFG_NMT_DELAY) {
-        if ((t - e->sdo_cfg_step_ms) < EROB_NMT_PREOP_DELAY_MS) { return false; }
+    if (e->sdo_cfg_state == SDO_CFG_NMT_DELAY) {
+        if ((t - e->sdo_cfg_step_ms) < NMT_PREOP_DELAY_MS) { return false; }
         e->sdo_cfg_step_ms = t;
-        e->sdo_cfg_state   = EROB_SDO_CFG_WAIT_RESPONSE;
-        const erob_sdo_entry_t *w = &m_sdo_tbl[i][0];
-        erob_sdo_send(nid, w->index, w->subindex, w->value, w->size);
+        e->sdo_cfg_state   = SDO_CFG_WAIT_RESPONSE;
+        const sdo_entry_t *w = &m_sdo_tbl[i][0];
+        sdo_send(nid, w->index, w->subindex, w->value, w->size);
         return false;
     }
 
-    /* EROB_SDO_CFG_WAIT_RESPONSE */
+    /* SDO_CFG_WAIT_RESPONSE */
     if (!e->sdo_cfg_resp_ok) {
-        if ((t - e->sdo_cfg_step_ms) >= EROB_SDO_TIMEOUT_MS) {
-            e->sdo_cfg_state = EROB_SDO_CFG_IDLE;
+        if ((t - e->sdo_cfg_step_ms) >= SDO_TIMEOUT_MS) {
+            e->sdo_cfg_state = SDO_CFG_IDLE;
             e->sdo_cfg_step  = 0U;
         }
         return false;
@@ -601,19 +627,19 @@ static bool erob_sdo_cfg_run(uint8_t i)
 
     e->sdo_cfg_resp_ok = false;
     e->sdo_cfg_step++;
-    if (e->sdo_cfg_step >= EROB_SDO_STEPS) {
-        e->sdo_cfg_state = EROB_SDO_CFG_DONE;
+    if (e->sdo_cfg_step >= m_sdo_steps[i]) {
+        e->sdo_cfg_state = SDO_CFG_DONE;
         return true;
     }
     e->sdo_cfg_step_ms = t;
-    const erob_sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
-    erob_sdo_send(nid, w->index, w->subindex, w->value, w->size);
+    const sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
+    sdo_send(nid, w->index, w->subindex, w->value, w->size);
     return false;
 }
 
 /* ── Runtime SDO write queue ─────────────────────────────────────────────────
- * erob_sdo_rt_enqueue() is called from public API (e.g. erob_set_accel).
- * erob_sdo_rt_run() is called every main-loop tick; it sends one entry at a
+ * sdo_rt_enqueue() is called from public API (e.g. cia402_set_accel).
+ * sdo_rt_run() is called every main-loop tick; it sends one entry at a
  * time and waits for the SDO response before advancing to the next.
  * Only operates when master_started = true so it never races with the startup
  * config sequence, which uses the same SDO channel. */
@@ -622,29 +648,29 @@ static bool erob_sdo_cfg_run(uint8_t i)
  * wrapped in a disable-IRQ critical section so concurrent producers from any
  * priority — including an ISR preempting an RTOS-task caller mid-update —
  * cannot interleave their writes onto the same slot or lose an enqueue by
- * racing the head pointer.  The consumer (erob_sdo_rt_run()) only mutates
+ * racing the head pointer.  The consumer (sdo_rt_run()) only mutates
  * tail and so does not need the guard, but it does benefit from it: any
  * head value it reads is fully published. */
-static bool erob_sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
+static bool sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
                                  uint32_t value, uint8_t size)
 {
-    erob_state_t *e   = &m_erob[i];
+    node_state_t *e   = &m_node[i];
     const uint32_t pm = co_enter_critical();
-    const uint8_t next = (uint8_t)((e->sdo_rt_head + 1U) % EROB_SDO_RT_QUEUE_SIZE);
+    const uint8_t next = (uint8_t)((e->sdo_rt_head + 1U) % SDO_RT_QUEUE_SIZE);
     if (next == e->sdo_rt_tail) {
         co_exit_critical(pm);
         return false;                                   /* full — caller should retry */
     }
     e->sdo_rt_queue[e->sdo_rt_head] =
-        (erob_sdo_entry_t){ index, subindex, value, size };
+        (sdo_entry_t){ index, subindex, value, size };
     e->sdo_rt_head = next;
     co_exit_critical(pm);
     return true;
 }
 
-static void erob_sdo_rt_run(uint8_t i)
+static void sdo_rt_run(uint8_t i)
 {
-    erob_state_t *e = &m_erob[i];
+    node_state_t *e = &m_node[i];
     if (!e->master_started) { return; }
 
     const uint32_t t = now_ms();
@@ -654,39 +680,39 @@ static void erob_sdo_rt_run(uint8_t i)
             /* Response received — consume entry and move on. */
             e->sdo_rt_resp_ok = false;
             e->sdo_rt_active  = false;
-            e->sdo_rt_tail    = (uint8_t)((e->sdo_rt_tail + 1U) % EROB_SDO_RT_QUEUE_SIZE);
-        } else if ((t - e->sdo_rt_ms) >= EROB_SDO_TIMEOUT_MS) {
+            e->sdo_rt_tail    = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
+        } else if ((t - e->sdo_rt_ms) >= SDO_TIMEOUT_MS) {
             /* Timeout — drop entry and continue with the rest. */
             e->sdo_rt_active = false;
-            e->sdo_rt_tail   = (uint8_t)((e->sdo_rt_tail + 1U) % EROB_SDO_RT_QUEUE_SIZE);
+            e->sdo_rt_tail   = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
         }
         return;
     }
 
     if (e->sdo_rt_tail == e->sdo_rt_head) { return; }  /* queue empty */
 
-    const erob_sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
-    erob_sdo_send(EROB_NODES[i].node_id, w->index, w->subindex, w->value, w->size);
+    const sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
+    sdo_send(cia402_nodes[i].node_id, w->index, w->subindex, w->value, w->size);
     e->sdo_rt_active  = true;
     e->sdo_rt_resp_ok = false;
     e->sdo_rt_ms      = t;
 }
 
 /* ── CiA 402 state machine (per instance) ────────────────────────────────── */
-static void erob_cia402_step(uint8_t i)
+static void cia402_step(uint8_t i)
 {
-    erob_state_t *e   = &m_erob[i];
+    node_state_t *e   = &m_node[i];
     const uint32_t t  = now_ms();
     const uint16_t sw = e->statusword;
 
     switch (e->drive_state) {
 
     case MASTER_CIA402_IDLE:
-        if (erob_sw_fault_reaction_active(sw)) {
+        if (cia402_sw_fault_reaction_active(sw)) {
             break;
-        } else if (erob_sw_fault(sw)) {
+        } else if (cia402_sw_fault(sw)) {
             e->controlword    = CW_FAULT_RESET;
-            erob_log_transition(i, MASTER_CIA402_FAULT_RESET);
+            cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else if (sw != 0U) {
             /* Any non-zero, non-fault statusword including Quick Stop Active
@@ -698,15 +724,15 @@ static void erob_cia402_step(uint8_t i)
              * one event-timer cycle, which is the typical cause of the drive
              * "lingering" in Switch On Disabled. */
             e->controlword    = CW_SHUTDOWN;
-            erob_log_transition(i, MASTER_CIA402_SHUTDOWN);
+            cia402_log_transition(i, MASTER_CIA402_SHUTDOWN);
             e->state_entry_ms = t;
         }
         break;
 
     case MASTER_CIA402_FAULT_RESET:
-        if ((t - e->state_entry_ms) >= EROB_FAULT_RESET_MS) {
+        if ((t - e->state_entry_ms) >= CIA402_FAULT_RESET_MS) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
-            erob_log_transition(i, MASTER_CIA402_WAIT_FAULT_CLEAR);
+            cia402_log_transition(i, MASTER_CIA402_WAIT_FAULT_CLEAR);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_FAULT_RESET;
@@ -714,13 +740,13 @@ static void erob_cia402_step(uint8_t i)
         break;
 
     case MASTER_CIA402_WAIT_FAULT_CLEAR:
-        if (!erob_sw_fault(sw)) {
+        if (!cia402_sw_fault(sw)) {
             e->controlword    = CW_SHUTDOWN;
-            erob_log_transition(i, MASTER_CIA402_SHUTDOWN);
+            cia402_log_transition(i, MASTER_CIA402_SHUTDOWN);
             e->state_entry_ms = t;
-        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+        } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
             e->controlword    = CW_FAULT_RESET;
-            erob_log_transition(i, MASTER_CIA402_FAULT_RESET);
+            cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_FAULT_RESET_CLEAR;
@@ -728,17 +754,17 @@ static void erob_cia402_step(uint8_t i)
         break;
 
     case MASTER_CIA402_SHUTDOWN:
-        if (erob_sw_ready_to_switch_on(sw)) {
+        if (cia402_sw_ready_to_switch_on(sw)) {
             e->controlword    = CW_SWITCH_ON;
-            erob_log_transition(i, MASTER_CIA402_SWITCH_ON);
+            cia402_log_transition(i, MASTER_CIA402_SWITCH_ON);
             e->state_entry_ms = t;
-        } else if (erob_sw_fault(sw)) {
+        } else if (cia402_sw_fault(sw)) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
-            erob_log_transition(i, MASTER_CIA402_FAULT);
+            cia402_log_transition(i, MASTER_CIA402_FAULT);
             e->state_entry_ms = t;
-        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+        } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
             e->controlword    = CW_FAULT_RESET;
-            erob_log_transition(i, MASTER_CIA402_FAULT_RESET);
+            cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_SHUTDOWN;
@@ -746,17 +772,17 @@ static void erob_cia402_step(uint8_t i)
         break;
 
     case MASTER_CIA402_SWITCH_ON:
-        if (erob_sw_switched_on(sw)) {
+        if (cia402_sw_switched_on(sw)) {
             e->controlword    = CW_ENABLE_OPERATION;
-            erob_log_transition(i, MASTER_CIA402_ENABLE);
+            cia402_log_transition(i, MASTER_CIA402_ENABLE);
             e->state_entry_ms = t;
-        } else if (erob_sw_fault(sw)) {
+        } else if (cia402_sw_fault(sw)) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
-            erob_log_transition(i, MASTER_CIA402_FAULT);
+            cia402_log_transition(i, MASTER_CIA402_FAULT);
             e->state_entry_ms = t;
-        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+        } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
             e->controlword    = CW_FAULT_RESET;
-            erob_log_transition(i, MASTER_CIA402_FAULT_RESET);
+            cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_SWITCH_ON;
@@ -764,17 +790,17 @@ static void erob_cia402_step(uint8_t i)
         break;
 
     case MASTER_CIA402_ENABLE:
-        if (erob_sw_operation_enabled(sw)) {
-            erob_log_transition(i, MASTER_CIA402_RUNNING);
+        if (cia402_sw_operation_enabled(sw)) {
+            cia402_log_transition(i, MASTER_CIA402_RUNNING);
             e->state_entry_ms = t;
             e->controlword    = CW_ENABLE_OPERATION;
-        } else if (erob_sw_fault(sw)) {
+        } else if (cia402_sw_fault(sw)) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
-            erob_log_transition(i, MASTER_CIA402_FAULT);
+            cia402_log_transition(i, MASTER_CIA402_FAULT);
             e->state_entry_ms = t;
-        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+        } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
             e->controlword    = CW_FAULT_RESET;
-            erob_log_transition(i, MASTER_CIA402_FAULT_RESET);
+            cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_ENABLE_OPERATION;
@@ -782,12 +808,12 @@ static void erob_cia402_step(uint8_t i)
         break;
 
     case MASTER_CIA402_RUNNING:
-        if (erob_sw_fault(sw)) {
+        if (cia402_sw_fault(sw)) {
             e->target_vel     = 0;
             e->controlword    = CW_FAULT_RESET_CLEAR;
-            erob_log_transition(i, MASTER_CIA402_FAULT);
+            cia402_log_transition(i, MASTER_CIA402_FAULT);
             e->state_entry_ms = t;
-        } else if (!erob_sw_operation_enabled(sw)) {
+        } else if (!cia402_sw_operation_enabled(sw)) {
             /* Drive dropped out of Operation Enabled without asserting Fault
              * (e.g. Quick Stop Active, Switch On Disabled after cable-replug,
              * or an inhibit input).  Zero velocity and fall back to IDLE so
@@ -795,7 +821,7 @@ static void erob_cia402_step(uint8_t i)
              * RPDO1 and runs the correct CiA 402 re-enable sequence. */
             e->target_vel     = 0;
             e->controlword    = CW_SHUTDOWN;
-            erob_log_transition(i, MASTER_CIA402_IDLE);
+            cia402_log_transition(i, MASTER_CIA402_IDLE);
             e->state_entry_ms = t;
         } else {
             e->controlword = CW_ENABLE_OPERATION;
@@ -804,18 +830,18 @@ static void erob_cia402_step(uint8_t i)
 
     case MASTER_CIA402_FAULT:
         e->target_vel = 0;
-        if (erob_sw_fault_reaction_active(sw)) {
+        if (cia402_sw_fault_reaction_active(sw)) {
             e->controlword    = CW_FAULT_RESET_CLEAR;
             e->state_entry_ms = t;
             break;
         }
-        if ((t - e->state_entry_ms) < EROB_FAULT_RESET_MS) {
+        if ((t - e->state_entry_ms) < CIA402_FAULT_RESET_MS) {
             e->controlword = CW_FAULT_RESET;
-        } else if (!erob_sw_fault(sw)) {
+        } else if (!cia402_sw_fault(sw)) {
             e->controlword    = CW_SHUTDOWN;
-            erob_log_transition(i, MASTER_CIA402_SHUTDOWN);
+            cia402_log_transition(i, MASTER_CIA402_SHUTDOWN);
             e->state_entry_ms = t;
-        } else if ((t - e->state_entry_ms) >= EROB_STATE_TIMEOUT_MS) {
+        } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
             /* Restart fault-reset cycle. */
             e->controlword    = CW_FAULT_RESET;
             e->state_entry_ms = t;
@@ -831,10 +857,11 @@ static void on_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
 {
     (void)node; (void)user;
     const uint8_t i = rpdo_num / 2U;
-    if (i >= (uint8_t)EROB_N) { return; }
+    if (i >= cia402_node_count) { return; }
+    if (cia402_nodes[i].driver_type != DRIVER_CIA402) { return; }
     if (rpdo_num % 2U == 0U) {   /* RPDO1: statusword + mode + velocity */
-        m_erob[i].last_rpdo1_ms = now_ms();
-        erob_cia402_step(i);
+        m_node[i].last_rpdo1_ms = now_ms();
+        cia402_step(i);
     }
     /* RPDO2 (position + torque) needs no immediate action */
 }
@@ -844,36 +871,36 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
                         co_hb_event_t event, void *user)
 {
     (void)node; (void)user;
-    const int8_t idx = erob_find(slave_node_id);
+    const int8_t idx = node_find(slave_node_id);
     if (idx < 0) { return; }
     const uint8_t i = (uint8_t)idx;
 
     if (event == CO_HB_EVENT_TIMEOUT) {
         /* Ignore timeouts that fire before the drive has been started.
-         * erob_sdo_cfg_run() issues an NMT reset (0x82) as its first step,
+         * sdo_cfg_run() issues an NMT reset (0x82) as its first step,
          * which takes the drive offline for ~500 ms — longer than
-         * EROB_HB_TIMEOUT_MS.  That expected gap must not disrupt the SDO
+         * SLAVE_HB_TIMEOUT_MS.  That expected gap must not disrupt the SDO
          * config sequence.  Recovery for drives that never completed startup
-         * is handled by on_erob_nmt_change() via the NMT heartbeat callbacks,
+         * is handled by on_slave_nmt_change() via the NMT heartbeat callbacks,
          * not through this path. */
-        if (!m_erob[i].master_started) { return; }
-        m_erob[i].target_vel  = 0;
-        m_erob[i].controlword = CW_QUICK_STOP;
+        if (!m_node[i].master_started) { return; }
+        m_node[i].target_vel  = 0;
+        m_node[i].controlword = CW_QUICK_STOP;
         (void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
-        m_erob[i].controlword    = CW_SHUTDOWN;
-        erob_log_transition(i, MASTER_CIA402_IDLE);
-        m_erob[i].sdo_cfg_state  = EROB_SDO_CFG_IDLE;
-        m_erob[i].sdo_cfg_step   = 0U;
-        m_erob[i].master_started = false;
-        m_erob[i].hb_lost        = true;
+        m_node[i].controlword    = CW_SHUTDOWN;
+        cia402_log_transition(i, MASTER_CIA402_IDLE);
+        m_node[i].sdo_cfg_state  = SDO_CFG_IDLE;
+        m_node[i].sdo_cfg_step   = 0U;
+        m_node[i].master_started = false;
+        m_node[i].hb_lost        = true;
     } else {
-        if (!m_erob[i].hb_lost) { return; }
-        m_erob[i].hb_lost        = false;
-        m_erob[i].sdo_cfg_state  = EROB_SDO_CFG_IDLE;
-        m_erob[i].sdo_cfg_step   = 0U;
-        m_erob[i].master_started = false;
-        erob_log_transition(i, MASTER_CIA402_IDLE);
-        m_erob[i].state_entry_ms = now_ms();
+        if (!m_node[i].hb_lost) { return; }
+        m_node[i].hb_lost        = false;
+        m_node[i].sdo_cfg_state  = SDO_CFG_IDLE;
+        m_node[i].sdo_cfg_step   = 0U;
+        m_node[i].master_started = false;
+        cia402_log_transition(i, MASTER_CIA402_IDLE);
+        m_node[i].state_entry_ms = now_ms();
     }
 }
 
@@ -881,48 +908,48 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
 static void on_reset_communication(void *user)
 {
     (void)user;
-    for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-        erob_reset(i, true);
+    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+        node_reset(i, true);
     }
 }
 
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
-/* Threading: any context.  Reads m_erob[] PDO feedback fields written from
+/* Threading: any context.  Reads m_node[] PDO feedback fields written from
  * the main-loop RPDO callback path; 32-bit reads of position/velocity can
  * tear relative to a concurrent RPDO update.  Suitable for telemetry, not
  * for sub-cycle synchronization. */
-void erob_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
+void cia402_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
                       float *const p_vel_rpm_f32, float *const p_torque_pct_f32)
 {
-    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
-    /* Wrap signed encoder counts into [0, COUNTS_PER_REV) before scaling.
+    const int32_t cpr = m_node[idx].encoder_counts_per_rev;
+    /* Wrap signed encoder counts into [0, counts_per_rev) before scaling.
      * C truncates negative modulo toward zero, so an explicit add-back is
      * needed for the result to land in [0, 360) for both signs. */
-    int32_t mod_counts = m_erob[idx].position_act % (int32_t)EROB_COUNTS_PER_REV;
-    if (mod_counts < 0) { mod_counts += (int32_t)EROB_COUNTS_PER_REV; }
-    *p_pos_deg_f32 = (float)mod_counts
-                     * (360.0f / (float)EROB_COUNTS_PER_REV);
-    /* velocity: counts/s ÷ (524288/60) = RPM */
-    *p_vel_rpm_f32    = (float)m_erob[idx].velocity_act
-                        / (float)EROB_ENCODER_RPM_TO_PLUS;
+    int32_t mod_counts = m_node[idx].position_act % cpr;
+    if (mod_counts < 0) { mod_counts += cpr; }
+    *p_pos_deg_f32 = (float)mod_counts * (360.0f / (float)cpr);
+    /* velocity: counts/s ÷ counts_per_rpm_s = RPM */
+    *p_vel_rpm_f32    = (float)m_node[idx].velocity_act
+                        / (float)m_node[idx].counts_per_rpm_s;
     /* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
-    *p_torque_pct_f32 = (float)m_erob[idx].torque_act * 0.1f;
+    *p_torque_pct_f32 = (float)m_node[idx].torque_act * 0.1f;
 }
 
 /* Threading: any context (ISR, RTOS task, main loop).  Concurrent callers
  * are serialised by the disable-IRQ critical section in
- * erob_sdo_rt_enqueue(), so two producers cannot race the head pointer; the
- * consumer (erob_sdo_rt_run() in app_canopen_loop()) only mutates tail and
+ * sdo_rt_enqueue(), so two producers cannot race the head pointer; the
+ * consumer (sdo_rt_run() in app_canopen_loop()) only mutates tail and
  * so never contends with this path. */
-void erob_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_plus_s)
+void cia402_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_plus_s)
 {
-    const int8_t idx = erob_find((uint8_t)node_id_u16);
+    const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
-    (void)erob_sdo_rt_enqueue((uint8_t)idx, 0x6083U, 0x00U, accel_plus_s, 4U);
-    (void)erob_sdo_rt_enqueue((uint8_t)idx, 0x6084U, 0x00U, decel_plus_s, 4U);
+    (void)sdo_rt_enqueue((uint8_t)idx, 0x6083U, 0x00U, accel_plus_s, 4U);
+    (void)sdo_rt_enqueue((uint8_t)idx, 0x6084U, 0x00U, decel_plus_s, 4U);
 }
 
 /* ── Initialization ──────────────────────────────────────────────────────── */
@@ -932,18 +959,47 @@ co_error_t app_canopen_init(void)
 {
     co_error_t err;
 
+    /* Range-check the application-supplied table before we walk it.  The
+     * count comes from a different translation unit so the storage cap can
+     * only be enforced at startup, not by the compiler. */
+    if (cia402_node_count == 0U || cia402_node_count > CIA402_MAX_NODES) {
+        return CO_ERROR_INVALID_ARGS;
+    }
+
     co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx,
                     MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
     canopen_node.iface.on_reset_communication = on_reset_communication;
     canopen_node.iface.on_rx_frame            = on_rx_frame;
 
-    for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-        erob_build_sdo_table(i);
+    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+        build_sdo_table(i);
 
-        m_erob[i].controlword = CW_SHUTDOWN;
-        m_erob[i].mode_of_op  = EROB_MODE_PROFILE_VEL;
-        m_erob[i].drive_state = MASTER_CIA402_IDLE;
-        m_erob[i].nmt_state     = CO_NMT_INITIALIZING;
+        /* Cache the encoder constants once.  counts_per_rpm_s folds the gear
+         * reduction into the RPM↔counts conversion so values supplied to
+         * the public API are interpreted on the OUTPUT shaft:
+         *   counts/s @ 1 RPM_out = counts_per_rev * reductor_ratio / 60.
+         * 64-bit intermediate guards against overflow at large
+         * resolution × ratio products; the result still fits int32_t for any
+         * realistic actuator. */
+        const int32_t  cpr   = (int32_t)(1UL << cia402_nodes[i].encoder_resolution);
+        const uint16_t ratio = cia402_nodes[i].reductor_ratio;
+        m_node[i].encoder_counts_per_rev = cpr;
+        m_node[i].counts_per_rpm_s       =
+            (int32_t)(((uint64_t)(uint32_t)cpr * (uint64_t)ratio) / 60U);
+
+        m_node[i].controlword = CW_SHUTDOWN;
+        m_node[i].mode_of_op  = CIA402_MODE_PROFILE_VEL;
+        m_node[i].drive_state = MASTER_CIA402_IDLE;
+        m_node[i].nmt_state     = CO_NMT_INITIALIZING;
+
+        /* OD backing storage and PDO mapping below assume the CiA 402 layout
+         * (controlword 0x6040, statusword 0x6041, target velocity 0x60FF,
+         * etc.).  A non-CiA-402 driver gets a stub heartbeat-only SDO table
+         * from build_sdo_table() and is otherwise left untouched —
+         * extend this branch when the alternative driver's OD is defined. */
+        if (cia402_nodes[i].driver_type != DRIVER_CIA402) {
+            continue;
+        }
 
         /* Vendor-specific OD indices avoid collision between instances.
          * Instance i TPDO data: 0x4000+i,  RPDO data: 0x4100+i  (sub 1–5) */
@@ -951,36 +1007,36 @@ co_error_t app_canopen_init(void)
         const uint16_t ri = (uint16_t)(0x4100U + i);
 
         err = co_od_add(&canopen_node, ti, 0x01U,
-                        (uint8_t *)&m_erob[i].controlword,   2U, true, true);
+                        (uint8_t *)&m_node[i].controlword,   2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ti, 0x02U,
-                        (uint8_t *)&m_erob[i].mode_of_op,    1U, true, true);
+                        (uint8_t *)&m_node[i].mode_of_op,    1U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ti, 0x03U,
-                        (uint8_t *)&m_erob[i].target_vel,    4U, true, true);
+                        (uint8_t *)&m_node[i].target_vel,    4U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
 
         err = co_od_add(&canopen_node, ri, 0x01U,
-                        (uint8_t *)&m_erob[i].statusword,    2U, true, true);
+                        (uint8_t *)&m_node[i].statusword,    2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ri, 0x02U,
-                        (uint8_t *)&m_erob[i].mode_display,  1U, true, true);
+                        (uint8_t *)&m_node[i].mode_display,  1U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ri, 0x03U,
-                        (uint8_t *)&m_erob[i].velocity_act,  4U, true, true);
+                        (uint8_t *)&m_node[i].velocity_act,  4U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ri, 0x04U,
-                        (uint8_t *)&m_erob[i].position_act,  4U, true, true);
+                        (uint8_t *)&m_node[i].position_act,  4U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
         err = co_od_add(&canopen_node, ri, 0x05U,
-                        (uint8_t *)&m_erob[i].torque_act,    2U, true, true);
+                        (uint8_t *)&m_node[i].torque_act,    2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
 
         /* RPDO comm + mapping.  Instance i uses rpdo_num = i*2 and i*2+1. */
         const uint8_t  rn0      = (uint8_t)(i * 2U);
         const uint8_t  rn1      = (uint8_t)(i * 2U + 1U);
-        const uint32_t rcob0    = 0x180UL + EROB_NODES[i].node_id;
-        const uint32_t rcob1    = 0x280UL + EROB_NODES[i].node_id;
+        const uint32_t rcob0    = 0x180UL + cia402_nodes[i].node_id;
+        const uint32_t rcob1    = 0x280UL + cia402_nodes[i].node_id;
         const uint8_t  rpdo_syn = 0x01U;
         const uint8_t  z = 0U, two = 2U, three = 3U;
 
@@ -1012,7 +1068,7 @@ co_error_t app_canopen_init(void)
 
         /* TPDO comm + mapping.  Instance i uses tpdo_num = i*2 only. */
         const uint8_t  tn0   = (uint8_t)(i * 2U);
-        const uint32_t tcob0 = 0x200UL + EROB_NODES[i].node_id;
+        const uint32_t tcob0 = 0x200UL + cia402_nodes[i].node_id;
         const uint8_t  tev   = 0xFFU;
         const uint16_t tms   = 1U;
 
@@ -1043,13 +1099,13 @@ co_error_t app_canopen_init(void)
     if (co_od_write(&canopen_node, 0x1006U, 0x00U,
                     (const uint8_t *)&sync_cycle_us, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-    /* Heartbeat consumer: one sub-index per eRob instance */
-    const uint8_t hb_count = (uint8_t)EROB_N;
+    /* Heartbeat consumer: one sub-index per slave instance */
+    const uint8_t hb_count = cia402_node_count;
     if (co_od_write(&canopen_node, 0x1016U, 0x00U,
                     &hb_count, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-    for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-        const uint32_t hb = ((uint32_t)EROB_NODES[i].node_id << 16)
-                          | (uint32_t)EROB_HB_TIMEOUT_MS;
+    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+        const uint32_t hb = ((uint32_t)cia402_nodes[i].node_id << 16)
+                          | (uint32_t)SLAVE_HB_TIMEOUT_MS;
         if (co_od_write(&canopen_node, 0x1016U, (uint8_t)(i + 1U),
                         (const uint8_t *)&hb, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
     }
@@ -1073,7 +1129,7 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 /* ── Main loop ───────────────────────────────────────────────────────────── */
 /* Threading: main-loop / single task context only.  Not reentrant.  Consumes
  * the SPSC ring filled by HAL_FDCAN_RxFifo0Callback() and owns every
- * m_erob[] mutation outside of the ISR heartbeat-timestamp fast path; must
+ * m_node[] mutation outside of the ISR heartbeat-timestamp fast path; must
  * therefore be the sole context driving the CiA 402 state machine. */
 void app_canopen_loop(void)
 {
@@ -1087,57 +1143,60 @@ void app_canopen_loop(void)
 
 	/* 3. Per-instance startup: SDO config → NMT Start. */
 	if (canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
-		for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-			if (!m_erob[i].master_started && erob_sdo_cfg_run(i)) {
+		for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+			if (!m_node[i].master_started && sdo_cfg_run(i)) {
 				(void)co_nmt_master_send(&canopen_node, 0x01U,
-										EROB_NODES[i].node_id);
-				m_erob[i].master_started = true;
+										cia402_nodes[i].node_id);
+				m_node[i].master_started = true;
 			}
 		}
 	}
 
-	/* 4. Tick the CiA 402 enable sequence for every started instance.
+	/* 4. Tick the CiA 402 enable sequence for every started CiA 402 instance.
 	 *    on_rpdo_frame() also invokes this on RPDO1 receipt for fast response,
 	 *    but driving it from the main loop guarantees forward progress and
 	 *    timeout handling even if RPDO1 frames are missed (e.g. drive slow to
 	 *    leave SOD).  The state machine is idempotent — repeated calls with
-	 *    the same statusword and state are safe. */
-	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-		if (m_erob[i].master_started) {
-			erob_cia402_step(i);
+	 *    the same statusword and state are safe.  Non-CiA-402 instances are
+	 *    skipped here; their state machine, if any, is the application's
+	 *    responsibility. */
+	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+		if (m_node[i].master_started &&
+		    cia402_nodes[i].driver_type == DRIVER_CIA402) {
+			cia402_step(i);
 		}
 	}
 
-	/* 5. RPDO watchdog: if RUNNING but no RPDO1 for EROB_RPDO_WATCHDOG_MS,
+	/* 5. RPDO watchdog: if RUNNING but no RPDO1 for CIA402_RPDO_WATCHDOG_MS,
 	 *    send Quick Stop; drive's own event timer provides redundant stop. */
 	const uint32_t now = now_ms();
-	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-		if (m_erob[i].master_started &&
-			m_erob[i].drive_state == MASTER_CIA402_RUNNING &&
-			(now - m_erob[i].last_rpdo1_ms) >= EROB_RPDO_WATCHDOG_MS) {
-			m_erob[i].target_vel  = 0;
-			m_erob[i].controlword = CW_QUICK_STOP;
+	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+		if (m_node[i].master_started &&
+			m_node[i].drive_state == MASTER_CIA402_RUNNING &&
+			(now - m_node[i].last_rpdo1_ms) >= CIA402_RPDO_WATCHDOG_MS) {
+			m_node[i].target_vel  = 0;
+			m_node[i].controlword = CW_QUICK_STOP;
 			(void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
-			erob_log_transition(i, MASTER_CIA402_IDLE);
+			cia402_log_transition(i, MASTER_CIA402_IDLE);
 		}
 	}
 
 	/* 5b. PRE_OP debounce.  Confirmed slave drop (PRE_OP held past the
 	 *     debounce window) → tear down state and replay the SDO config.
 	 *     Transient drops that resolve back to OP inside the window are
-	 *     cleared by on_erob_nmt_change and never reach this branch. */
-	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-		if (m_erob[i].pre_op_pending &&
-			(now - m_erob[i].pre_op_entry_ms) >= EROB_NMT_PREOP_DEBOUNCE_MS) {
-			erob_reset(i, false);                       /* clears pre_op_pending */
-			m_erob[i].sdo_cfg_state = EROB_SDO_CFG_IDLE;
-			m_erob[i].sdo_cfg_step  = 0U;
+	 *     cleared by on_slave_nmt_change and never reach this branch. */
+	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+		if (m_node[i].pre_op_pending &&
+			(now - m_node[i].pre_op_entry_ms) >= NMT_PREOP_DEBOUNCE_MS) {
+			node_reset(i, false);                       /* clears pre_op_pending */
+			m_node[i].sdo_cfg_state = SDO_CFG_IDLE;
+			m_node[i].sdo_cfg_step  = 0U;
 		}
 	}
 
 	/* 6. Drain runtime SDO write queue for each instance. */
-	for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-		erob_sdo_rt_run(i);
+	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+		sdo_rt_run(i);
 	}
 }
 
@@ -1158,9 +1217,9 @@ void app_canopen_loop(void)
  *     SYNC period and reproduce the symptoms above.
  *
  *   • MUST share its execution context with app_canopen_loop() — both
- *     touch m_erob[] and the canopen_node SDO/PDO state without locks, so
+ *     touch m_node[] and the canopen_node SDO/PDO state without locks, so
  *     they cannot preempt each other.  In practice this means: either run
- *     both from the same timer/task, or guard m_erob[] and canopen_node
+ *     both from the same timer/task, or guard m_node[] and canopen_node
  *     with a critical section / mutex if they live on different priorities.
  */
 void co_transmit_process(void)
@@ -1168,8 +1227,8 @@ void co_transmit_process(void)
     /* 5. Forward application target velocities on each SYNC tick. */
     if (canopen_node.sync_event_pending) {
         canopen_node.sync_event_pending = false;
-        for (uint8_t i = 0U; i < (uint8_t)EROB_N; ++i) {
-            erob_apply_target_internal(i, (int32_t)g_target_rpm[i]);
+        for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+            cia402_apply_target_internal(i, (int32_t)g_target_rpm[i]);
         }
     }
 
