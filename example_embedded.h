@@ -56,8 +56,8 @@ typedef struct {
 /* Yapilandirma tablosu — uygulamanizda bir kez tanimlayin, orn.:
  *
  *   const cia402_cfg_t cia402_nodes[] = {
- *       { 0x05U, 50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  /* ZeroErr 19-bit */
- *       { 0x06U, 50000U, 200000U, 16777216U, 1U, DRIVER_DELTA   },  /* Delta ASDA-B3 24-bit */
+ *       { 0x05U, 50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  // ZeroErr 19-bit
+ *       { 0x06U, 50000U, 200000U, 16777216U, 1U, DRIVER_DELTA   },  // Delta ASDA-B3 24-bit 
  *   };
  *   const uint8_t cia402_node_count =
  *       (uint8_t)(sizeof(cia402_nodes) / sizeof(cia402_nodes[0]));
