@@ -76,9 +76,27 @@
 _Static_assert(CIA402_MAX_NODES * 2U <= CO_MAX_RPDO,
     "CIA402_MAX_NODES too high — raise CO_MAX_RPDO and CO_MAX_TPDO in canopen.h");
 
-/* ── CANopen stack ornegi ────────────────────────────────────────────────── */
-static co_node_t      canopen_node;
-static co_port_ctx_t  can_ctx;
+/* ── CAN veri yolu havuzu ────────────────────────────────────────────────── */
+/* Her benzersiz co_port_handle_t (donanim cevre birimi) bir veri yoluna karsilik
+ * gelir ve kendi co_node_t + co_port_ctx_t ciftini alir. Bu sayede farkli CAN
+ * cevre birimlerine (orn. FDCAN1, FDCAN2) bagli koleler bagimsiz olarak
+ * yonetilebilir. Ayni cevre birimini paylasan koleler ayni bus'i paylasilir. */
+#define CO_PORT_MAX_BUSES  4U
+
+typedef struct {
+    co_node_t        node;
+    co_port_ctx_t    ctx;
+    co_port_handle_t handle;
+    uint8_t          slave_idx[CIA402_MAX_NODES]; /* bu bus'taki kole global indeksleri */
+    uint8_t          slave_count;
+} co_bus_t;
+
+static co_bus_t  s_buses[CO_PORT_MAX_BUSES];
+static uint8_t   s_bus_count;
+
+/* Ornek basina veri yolu yonlendirme: hangi bus ornegi hangi koleye ait */
+static uint8_t   m_node_bus[CIA402_MAX_NODES];   /* global kole i → bus indeksi */
+static uint8_t   m_node_local[CIA402_MAX_NODES]; /* global kole i → bus icindeki yerel indeks */
 
 /* ── Ornek basina uzak SDO yapilandirma tablolari ────────────────────────── */
 typedef struct {
@@ -325,7 +343,7 @@ static inline bool cia402_sw_fault(uint16_t sw) { return (sw & SW_FAULT) != 0U; 
 
 static inline uint32_t now_ms(void)
 {
-    return canopen_node.iface.millis(canopen_node.iface.user);
+    return s_buses[0].node.iface.millis(s_buses[0].node.iface.user);
 }
 
 /* ── Temel kritik bolum ──────────────────────────────────────────────────── */
@@ -355,6 +373,16 @@ static int8_t node_find(uint8_t node_id)
         if (cia402_nodes[i].node_id == node_id) { return (int8_t)i; }
     }
     return -1;
+}
+
+/* co_node_t isaret ediciyle eslestirilmis bus indeksini dondurur.
+ * RPDO / HB geri cagirimlarinda hangi veri yolunun tetikledigini belirlemek icin kullanilir. */
+static uint8_t bus_find_by_node(const co_node_t *node)
+{
+    for (uint8_t b = 0U; b < s_bus_count; ++b) {
+        if (&s_buses[b].node == node) { return b; }
+    }
+    return 0U;
 }
 
 /* ── Gecis kaydi ─────────────────────────────────────────────────────────── */
@@ -441,8 +469,9 @@ static void cia402_apply_target_internal(uint8_t instance, float rpm)
 }
 
 /* ── SDO gonderme yardimcisi ─────────────────────────────────────────────── */
-static void sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
-                          uint32_t value, uint8_t size)
+/* bus_idx: koleye ait veri yolu (m_node_bus[i]); mesaj o bus'in node'u uzerinden iletilir. */
+static void sdo_send(uint8_t bus_idx, uint8_t node_id, uint16_t index,
+                     uint8_t subindex, uint32_t value, uint8_t size)
 {
     uint8_t cmd;
     switch (size) {
@@ -462,7 +491,8 @@ static void sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
     f.data[5] = (uint8_t)((value >>  8U) & 0xFFU);
     f.data[6] = (uint8_t)((value >> 16U) & 0xFFU);
     f.data[7] = (uint8_t)((value >> 24U) & 0xFFU);
-    (void)canopen_node.iface.send(canopen_node.iface.user, &f);
+    co_node_t *bus_node = &s_buses[bus_idx].node;
+    (void)bus_node->iface.send(bus_node->iface.user, &f);
 }
 
 /* ── NMT durum degisikligi ───────────────────────────────────────────────── */
@@ -474,6 +504,7 @@ static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
         node_reset(i, true);
         break;
     case CO_NMT_PRE_OPERATIONAL:
+        (void)0; /* suppress -Wdeclaration-after-label */
         /* Kendi baslangicimizda beklenen durum (NMT sifirlama / 0x80 gonderdik) —
          * ucustaki yapilandirma dizisine dokunmayin. */
         if (m_node[i].sdo_cfg_state == SDO_CFG_NMT_DELAY ||
@@ -591,14 +622,16 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
 /* ── SDO yapilandirma durum makinesi (ornek basina) ──────────────────────── */
 static bool sdo_cfg_run(uint8_t i)
 {
-    node_state_t *e  = &m_node[i];
+    node_state_t *e    = &m_node[i];
     if (e->sdo_cfg_state == SDO_CFG_DONE) { return true; }
 
-    const uint32_t t   = now_ms();
-    const uint8_t  nid = cia402_nodes[i].node_id;
+    const uint32_t t    = now_ms();
+    const uint8_t  nid  = cia402_nodes[i].node_id;
+    const uint8_t  bidx = m_node_bus[i];
+    co_node_t     *bus_node = &s_buses[bidx].node;
 
     if (e->sdo_cfg_state == SDO_CFG_IDLE) {
-        (void)co_nmt_master_send(&canopen_node, 0x82U, nid);
+        (void)co_nmt_master_send(bus_node, 0x82U, nid);
         e->sdo_cfg_step    = 0U;
         e->sdo_cfg_resp_ok = false;
         e->sdo_cfg_step_ms = t;
@@ -608,7 +641,7 @@ static bool sdo_cfg_run(uint8_t i)
 
     if (e->sdo_cfg_state == SDO_CFG_RESET_DELAY) {
         if ((t - e->sdo_cfg_step_ms) < NMT_RESET_DELAY_MS) { return false; }
-        (void)co_nmt_master_send(&canopen_node, 0x80U, nid);
+        (void)co_nmt_master_send(bus_node, 0x80U, nid);
         e->sdo_cfg_step_ms = t;
         e->sdo_cfg_state   = SDO_CFG_NMT_DELAY;
         return false;
@@ -619,7 +652,7 @@ static bool sdo_cfg_run(uint8_t i)
         e->sdo_cfg_step_ms = t;
         e->sdo_cfg_state   = SDO_CFG_WAIT_RESPONSE;
         const sdo_entry_t *w = &m_sdo_tbl[i][0];
-        sdo_send(nid, w->index, w->subindex, w->value, w->size);
+        sdo_send(bidx, nid, w->index, w->subindex, w->value, w->size);
         return false;
     }
 
@@ -640,7 +673,7 @@ static bool sdo_cfg_run(uint8_t i)
     }
     e->sdo_cfg_step_ms = t;
     const sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
-    sdo_send(nid, w->index, w->subindex, w->value, w->size);
+    sdo_send(bidx, nid, w->index, w->subindex, w->value, w->size);
     return false;
 }
 
@@ -699,7 +732,8 @@ static void sdo_rt_run(uint8_t i)
     if (e->sdo_rt_tail == e->sdo_rt_head) { return; }  /* kuyruk bos */
 
     const sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
-    sdo_send(cia402_nodes[i].node_id, w->index, w->subindex, w->value, w->size);
+    sdo_send(m_node_bus[i], cia402_nodes[i].node_id,
+             w->index, w->subindex, w->value, w->size);
     e->sdo_rt_active  = true;
     e->sdo_rt_resp_ok = false;
     e->sdo_rt_ms      = t;
@@ -861,11 +895,16 @@ static void cia402_step(uint8_t i)
 }
 
 /* ── RPDO cerceve geri cagirmasi ─────────────────────────────────────────── */
+/* rpdo_num bu bus'a ozgu yerel bir numaradir (0‥slave_count*2-1).
+ * bus_find_by_node() ile hangi bus'in ateslendigini belirleyip global kole
+ * indeksini arar. */
 static void on_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
 {
-    (void)node; (void)user;
-    const uint8_t i = rpdo_num / 2U;
-    if (i >= cia402_node_count) { return; }
+    (void)user;
+    const uint8_t bidx    = bus_find_by_node(node);
+    const uint8_t local_i = rpdo_num / 2U;
+    if (local_i >= s_buses[bidx].slave_count) { return; }
+    const uint8_t i = s_buses[bidx].slave_idx[local_i];
     if (!((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
          (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) { return; }
     if (rpdo_num % 2U == 0U) {   /* RPDO1: statusword + mode + velocity */
@@ -895,7 +934,8 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
         if (!m_node[i].master_started) { return; }
         m_node[i].target_vel  = 0;
         m_node[i].controlword = CW_QUICK_STOP;
-        (void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
+        (void)co_send_tpdo(&s_buses[m_node_bus[i]].node,
+                           (uint8_t)(m_node_local[i] * 2U));
         m_node[i].controlword    = CW_SHUTDOWN;
         cia402_log_transition(i, MASTER_CIA402_IDLE);
         m_node[i].sdo_cfg_state  = SDO_CFG_IDLE;
@@ -914,11 +954,13 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
 }
 
 /* ── NMT Iletisim Sifirlama geri cagirmasi ───────────────────────────────── */
+/* Her bus'in node'una ayri olarak kayitlidir; yalnizca o bus'taki koleleri sifirlar. */
 static void on_reset_communication(void *user)
 {
-    (void)user;
-    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-        node_reset(i, true);
+    const uint8_t bidx = (uint8_t)(uintptr_t)user;
+    const co_bus_t *bus = &s_buses[bidx];
+    for (uint8_t j = 0U; j < bus->slave_count; ++j) {
+        node_reset(bus->slave_idx[j], true);
     }
 }
 
@@ -968,41 +1010,63 @@ void cia402_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t dece
 }
 
 /* ── Baslatma ────────────────────────────────────────────────────────────── */
-/* Is parcacigi: sistem baslatma sirasinda bir kez cagrilir; FDCAN kesmeleri
- * etkinlestirilmeden ve app_canopen_loop() / co_transmit_process() baslamadan once. */
+/* Is parcacigi: sistem baslatma sirasinda bir kez cagrilir; kesmeleri
+ * etkinlestirmeden ve app_canopen_loop() / co_transmit_process() baslamadan once. */
 co_error_t app_canopen_init(void)
 {
     co_error_t err;
 
-    /* Tabloyu dolasmadan once uygulama tarafindan saglanan tabloyu aralik
-     * kontrolunden gecirin. Sayi farkli bir ceviri biriminden gelir; dolayisiyla
-     * depolama siniri yalnizca baslangicta uygulanabilir, derleyici tarafindan degil. */
+    /* Aralik kontrolu. */
     if (cia402_node_count == 0U || cia402_node_count > CIA402_MAX_NODES) {
         return CO_ERROR_INVALID_ARGS;
     }
 
-    co_port_attach(&canopen_node, &can_ctx, MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
-    canopen_node.iface.on_reset_communication = on_reset_communication;
-    canopen_node.iface.on_rx_frame            = on_rx_frame;
+    /* ── 1. Bus havuzunu olustur ────────────────────────────────────────────
+     * cia402_nodes[]'u tarayarak benzersiz CAN cevre birimlerini (can_handle)
+     * bul. Her benzersiz cevre birimine bir bus yuvasi tahsis et; ayni cevre
+     * birimini paylasan koleler ayni bus'i paylasilir.  m_node_bus[i] ve
+     * m_node_local[i] daha sonraki tum yonlendirme kararlarini bilgilendirir. */
+    s_bus_count = 0U;
+    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+        const co_port_handle_t h = cia402_nodes[i].can_handle;
+        uint8_t bidx = s_bus_count;
+        for (uint8_t b = 0U; b < s_bus_count; ++b) {
+            if (s_buses[b].handle == h) { bidx = b; break; }
+        }
+        if (bidx == s_bus_count) {
+            if (s_bus_count >= CO_PORT_MAX_BUSES) { return CO_ERROR_INVALID_ARGS; }
+            s_buses[bidx].handle      = h;
+            s_buses[bidx].slave_count = 0U;
+            s_bus_count++;
+        }
+        m_node_bus[i]   = bidx;
+        m_node_local[i] = s_buses[bidx].slave_count;
+        s_buses[bidx].slave_idx[s_buses[bidx].slave_count++] = i;
+    }
 
+    /* ── 2. Her bus'u baslat ────────────────────────────────────────────────
+     * on_reset_communication user pointer'i bus indeksini tasir; boylece
+     * callback hangi veri yolunun resetlendigini bilir. */
+    for (uint8_t b = 0U; b < s_bus_count; ++b) {
+        co_port_attach(&s_buses[b].node, s_buses[b].handle, &s_buses[b].ctx,
+                       MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
+        s_buses[b].node.iface.on_reset_communication = on_reset_communication;
+        s_buses[b].node.iface.on_rx_frame            = on_rx_frame;
+    }
+
+    /* ── 3. Ornek basina enkoder sabitleri + OD / PDO kurulumu ─────────────
+     * Her kole icin OD girisleri ve PDO haritalamalari bus'a ozgu co_node_t'ye
+     * eklenir. RPDO/TPDO slot numaralari (rn0, rn1, tn0) bus icindeki yerel
+     * indekse (m_node_local[i]) gore belirlenir; boylece her bus'ta PDO
+     * numaralari 0'dan baslar. OD yedek indeksleri (0x4000+, 0x4100+) de
+     * bus icinde benzersiz olmasi yeterlidir. */
     for (uint8_t i = 0U; i < cia402_node_count; ++i) {
         build_sdo_table(i);
 
-        /* Enkoder sabitlerini bir kez onbellege al. counts_per_rpm_s, disli
-         * indirimini RPM↔count donusumune katar; boylece genel API'ye saglanan
-         * degerler CIKIS milinde yorumlanir. 64-bit ara deger, buyuk CPR × oran
-         * carpimlarinda tasmaya karsi korur; sonuc herhangi bir gercekci aktuator
-         * icin int32_t'ye sigar. */
         const uint32_t cpr   = cia402_nodes[i].encoder_counts_per_rev;
         const uint16_t ratio = cia402_nodes[i].reductor_ratio;
         m_node[i].encoder_counts_per_rev = (int32_t)cpr * ratio;
         m_node[i].ratio = ratio;
-        /* counts_per_rpm_s: cikis mili RPM'inden bu surucunun kullandigi hiz
-         * kayit birimine donusum faktoru.
-         *   DRIVER_ZEROERR: 0x60FF / 0x606C enkoder count/s biriminde
-         *     → 1 RPM_cikis = cpr * oran / 60 count/s
-         *   DRIVER_DELTA (ASDA-B3): 0x60FF / 0x606C, 0.1-RPM biriminde
-         *     → 1 RPM_cikis = oran motor RPM = oran * 10, 0.1-RPM biriminde */
         if (cia402_nodes[i].driver_type == DRIVER_DELTA) {
             m_node[i].counts_per_rpm_s = (int32_t)ratio * 10;
         } else {
@@ -1010,128 +1074,119 @@ co_error_t app_canopen_init(void)
                 (int32_t)(((uint64_t)cpr * (uint64_t)ratio) / 60U);
         }
 
-        m_node[i].controlword = CW_SHUTDOWN;
-        m_node[i].mode_of_op  = CIA402_MODE_PROFILE_VEL;
-        m_node[i].drive_state = MASTER_CIA402_IDLE;
-        m_node[i].nmt_state     = CO_NMT_INITIALIZING;
+        m_node[i].controlword    = CW_SHUTDOWN;
+        m_node[i].mode_of_op     = CIA402_MODE_PROFILE_VEL;
+        m_node[i].drive_state    = MASTER_CIA402_IDLE;
+        m_node[i].nmt_state      = CO_NMT_INITIALIZING;
         m_node[i].driver_type_st = cia402_nodes[i].driver_type;
-        /* Asagidaki OD yedek depolama ve PDO haritalama CiA 402 duzenini varsayar
-         * (controlword 0x6040, statusword 0x6041, hedef hiz 0x60FF, vb.).
-         * CiA-402 disi bir surucu, build_sdo_table()'dan yalnizca kalp atisi
-         * iceren bir taslak SDO tablosu alir; aksi hâlde dokunulmaz birakilir —
-         * alternatif surucunun OD'si tanimlandiginda bu dali genisletin. */
+
         if (!((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
               (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) {
             continue;
         }
 
-        /* Saticiya ozgu OD indeksleri ornekler arasindaki cakismayi onler.
-         * Ornek i TPDO verisi: 0x4000+i,  RPDO verisi: 0x4100+i  (alt 1–5) */
-        const uint16_t ti = (uint16_t)(0x4000U + i);
-        const uint16_t ri = (uint16_t)(0x4100U + i);
+        const uint8_t   bidx = m_node_bus[i];
+        const uint8_t   li   = m_node_local[i];  /* bus icindeki yerel indeks */
+        co_node_t      *bn   = &s_buses[bidx].node;
 
-        err = co_od_add(&canopen_node, ti, 0x01U,
-                        (uint8_t *)&m_node[i].controlword,   2U, true, true);
-        if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ti, 0x02U,
-                        (uint8_t *)&m_node[i].mode_of_op,    1U, true, true);
-        if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ti, 0x03U,
-                        (uint8_t *)&m_node[i].target_vel,    4U, true, true);
-        if (err != CO_ERROR_NONE) { return err; }
+        /* OD yedek depolama — bus icinde benzersiz olmasi yeterli */
+        const uint16_t ti = (uint16_t)(0x4000U + li);
+        const uint16_t ri = (uint16_t)(0x4100U + li);
 
-        err = co_od_add(&canopen_node, ri, 0x01U,
-                        (uint8_t *)&m_node[i].statusword,    2U, true, true);
+        err = co_od_add(bn, ti, 0x01U, (uint8_t *)&m_node[i].controlword, 2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ri, 0x02U,
-                        (uint8_t *)&m_node[i].mode_display,  1U, true, true);
+        err = co_od_add(bn, ti, 0x02U, (uint8_t *)&m_node[i].mode_of_op,  1U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ri, 0x03U,
-                        (uint8_t *)&m_node[i].velocity_act,  4U, true, true);
+        err = co_od_add(bn, ti, 0x03U, (uint8_t *)&m_node[i].target_vel,  4U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ri, 0x04U,
-                        (uint8_t *)&m_node[i].position_act,  4U, true, true);
+        err = co_od_add(bn, ri, 0x01U, (uint8_t *)&m_node[i].statusword,  2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
-        err = co_od_add(&canopen_node, ri, 0x05U,
-                        (uint8_t *)&m_node[i].torque_act,    2U, true, true);
+        err = co_od_add(bn, ri, 0x02U, (uint8_t *)&m_node[i].mode_display,1U, true, true);
+        if (err != CO_ERROR_NONE) { return err; }
+        err = co_od_add(bn, ri, 0x03U, (uint8_t *)&m_node[i].velocity_act,4U, true, true);
+        if (err != CO_ERROR_NONE) { return err; }
+        err = co_od_add(bn, ri, 0x04U, (uint8_t *)&m_node[i].position_act,4U, true, true);
+        if (err != CO_ERROR_NONE) { return err; }
+        err = co_od_add(bn, ri, 0x05U, (uint8_t *)&m_node[i].torque_act,  2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
 
-        /* RPDO iletisim + haritalama. Ornek i, rpdo_num = i*2 ve i*2+1 kullanir. */
-        const uint8_t  rn0      = (uint8_t)(i * 2U);
-        const uint8_t  rn1      = (uint8_t)(i * 2U + 1U);
+        /* RPDO: bus icindeki yerel slot = li*2 ve li*2+1 */
+        const uint8_t  rn0      = (uint8_t)(li * 2U);
+        const uint8_t  rn1      = (uint8_t)(li * 2U + 1U);
         const uint32_t rcob0    = 0x180UL + cia402_nodes[i].node_id;
         const uint32_t rcob1    = 0x280UL + cia402_nodes[i].node_id;
         const uint8_t  rpdo_syn = 0x01U;
         const uint8_t  z = 0U, two = 2U, three = 3U;
 
-        if (co_od_write(&canopen_node, 0x1400U + rn0, 0x01U,
-                        (const uint8_t *)&rcob0, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1400U + rn0, 0x02U,
-                        &rpdo_syn, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1400U + rn0, 0x01U, (const uint8_t *)&rcob0, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1400U + rn0, 0x02U, &rpdo_syn, 1U)              != 0U) { return CO_ERROR_INVALID_ARGS; }
 
         const uint32_t r1m1 = ((uint32_t)ri << 16) | (0x01UL << 8) | 16UL;
         const uint32_t r1m2 = ((uint32_t)ri << 16) | (0x02UL << 8) |  8UL;
         const uint32_t r1m3 = ((uint32_t)ri << 16) | (0x03UL << 8) | 32UL;
-        if (co_od_write(&canopen_node, 0x1600U + rn0, 0x00U, &z,    1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn0, 0x01U, (const uint8_t *)&r1m1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn0, 0x02U, (const uint8_t *)&r1m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn0, 0x03U, (const uint8_t *)&r1m3, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn0, 0x00U, &three, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn0, 0x00U, &z,                    1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn0, 0x01U, (const uint8_t *)&r1m1,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn0, 0x02U, (const uint8_t *)&r1m2,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn0, 0x03U, (const uint8_t *)&r1m3,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn0, 0x00U, &three,                1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-        if (co_od_write(&canopen_node, 0x1400U + rn1, 0x01U,
-                        (const uint8_t *)&rcob1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1400U + rn1, 0x02U,
-                        &rpdo_syn, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1400U + rn1, 0x01U, (const uint8_t *)&rcob1,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1400U + rn1, 0x02U, &rpdo_syn,              1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
         const uint32_t r2m1 = ((uint32_t)ri << 16) | (0x04UL << 8) | 32UL;
         const uint32_t r2m2 = ((uint32_t)ri << 16) | (0x05UL << 8) | 16UL;
-        if (co_od_write(&canopen_node, 0x1600U + rn1, 0x00U, &z,   1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn1, 0x01U, (const uint8_t *)&r2m1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn1, 0x02U, (const uint8_t *)&r2m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1600U + rn1, 0x00U, &two,  1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn1, 0x00U, &z,                    1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn1, 0x01U, (const uint8_t *)&r2m1,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn1, 0x02U, (const uint8_t *)&r2m2,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1600U + rn1, 0x00U, &two,                  1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-        /* TPDO iletisim + haritalama. Ornek i yalnizca tpdo_num = i*2 kullanir. */
-        const uint8_t  tn0   = (uint8_t)(i * 2U);
+        /* TPDO: bus icindeki yerel slot = li*2 */
+        const uint8_t  tn0   = (uint8_t)(li * 2U);
         const uint32_t tcob0 = 0x200UL + cia402_nodes[i].node_id;
         const uint8_t  tev   = 0xFFU;
         const uint16_t tms   = 1U;
 
-        if (co_od_write(&canopen_node, 0x1800U + tn0, 0x01U,
-                        (const uint8_t *)&tcob0, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1800U + tn0, 0x02U, &tev, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1800U + tn0, 0x05U,
-                        (const uint8_t *)&tms, 2U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1800U + tn0, 0x01U, (const uint8_t *)&tcob0,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1800U + tn0, 0x02U, &tev,                   1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1800U + tn0, 0x05U, (const uint8_t *)&tms,  2U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
         const uint32_t t1m1 = ((uint32_t)ti << 16) | (0x01UL << 8) | 16UL;
         const uint32_t t1m2 = ((uint32_t)ti << 16) | (0x02UL << 8) |  8UL;
         const uint32_t t1m3 = ((uint32_t)ti << 16) | (0x03UL << 8) | 32UL;
-        if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x00U, &z,    1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x01U, (const uint8_t *)&t1m1, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x02U, (const uint8_t *)&t1m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x03U, (const uint8_t *)&t1m3, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-        if (co_od_write(&canopen_node, 0x1A00U + tn0, 0x00U, &three, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1A00U + tn0, 0x00U, &z,                    1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1A00U + tn0, 0x01U, (const uint8_t *)&t1m1,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1A00U + tn0, 0x02U, (const uint8_t *)&t1m2,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1A00U + tn0, 0x03U, (const uint8_t *)&t1m3,4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1A00U + tn0, 0x00U, &three,                1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
     }
 
-    co_set_rpdo_frame_hook(&canopen_node, on_rpdo_frame, NULL);
-    co_set_hb_event_hook(&canopen_node,  on_hb_event,   NULL);
-
-    /* SYNC ureticisi: master her 1 ms'de COB-ID 0x080 uretir */
+    /* ── 4. Bus basina RPDO/HB kancalari, SYNC ureticisi, HB tuketicisi ────── */
     const uint32_t sync_cob_id   = 0x40000080UL;
     const uint32_t sync_cycle_us = SYNC_PERIOD_US;
-    if (co_od_write(&canopen_node, 0x1005U, 0x00U,
-                    (const uint8_t *)&sync_cob_id,   4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-    if (co_od_write(&canopen_node, 0x1006U, 0x00U,
-                    (const uint8_t *)&sync_cycle_us, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-    /* Kalp atisi tuketicisi: kole ornegi basina bir alt-indeks */
-    const uint8_t hb_count = cia402_node_count;
-    if (co_od_write(&canopen_node, 0x1016U, 0x00U,
-                    &hb_count, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
-    for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-        const uint32_t hb = ((uint32_t)cia402_nodes[i].node_id << 16)
-                          | (uint32_t)SLAVE_HB_TIMEOUT_MS;
-        if (co_od_write(&canopen_node, 0x1016U, (uint8_t)(i + 1U),
-                        (const uint8_t *)&hb, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+    for (uint8_t b = 0U; b < s_bus_count; ++b) {
+        co_node_t *bn = &s_buses[b].node;
+
+        co_set_rpdo_frame_hook(bn, on_rpdo_frame, NULL);
+        co_set_hb_event_hook  (bn, on_hb_event,   NULL);
+
+        /* SYNC ureticisi: her bus kendi SYNC cercevesini uretir */
+        if (co_od_write(bn, 0x1005U, 0x00U,
+                        (const uint8_t *)&sync_cob_id,   4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        if (co_od_write(bn, 0x1006U, 0x00U,
+                        (const uint8_t *)&sync_cycle_us, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+
+        /* HB tuketicisi: yalnizca bu bus'taki koleler icin alt-indeksler */
+        const uint8_t hb_count = s_buses[b].slave_count;
+        if (co_od_write(bn, 0x1016U, 0x00U,
+                        &hb_count, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        for (uint8_t j = 0U; j < s_buses[b].slave_count; ++j) {
+            const uint8_t gi = s_buses[b].slave_idx[j];
+            const uint32_t hb = ((uint32_t)cia402_nodes[gi].node_id << 16)
+                              | (uint32_t)SLAVE_HB_TIMEOUT_MS;
+            if (co_od_write(bn, 0x1016U, (uint8_t)(j + 1U),
+                            (const uint8_t *)&hb, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
+        }
     }
 
     return CO_ERROR_NONE;
@@ -1142,7 +1197,7 @@ co_error_t app_canopen_init(void)
 /* Is parcacigi: yalnizca RX FIFO0 ISR. HAL tarafindan kesme baglamindan
  * cagrilir; gorev kodundan cagirmayin. CAN FIFO'sunu app_canopen_loop()
  * tarafindan tuketilen SPSC halka tamponuna bosaltir. */
-CO_PORT_DEFINE_RX_ISR(canopen_node, can_ctx)
+CO_PORT_DEFINE_RX_ISR(s_buses, s_bus_count)
 
 /* ── Ana dongu ───────────────────────────────────────────────────────────── */
 /* Is parcacigi: yalnizca ana dongu / tek gorev baglami. Yeniden girisli degil.
@@ -1151,32 +1206,30 @@ CO_PORT_DEFINE_RX_ISR(canopen_node, can_ctx)
  * sahiptir; dolayisiyla CiA 402 durum makinesini suren tek baglam olmalidir. */
 void app_canopen_loop(void)
 {
-	/* 1. Kuyruklanmis cerceveleri ilet (kalp atisi zaman damgalari ISR tarafindan zaten guncellendi). */
-	co_port_drain_rx(&canopen_node, &can_ctx);
-
-	/* 2. Master PRE_OPERATIONAL'a ulastiginda kendisini OPERATIONAL'a yukselt. */
-	if (canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
-		co_nmt_set_state(&canopen_node, CO_NMT_OPERATIONAL);
+	/* 1. Tum bus'lardan kuyruklanmis cerceveleri ilet. */
+	for (uint8_t b = 0U; b < s_bus_count; ++b) {
+		co_port_drain_rx(&s_buses[b].node, &s_buses[b].ctx);
 	}
 
-	/* 3. Ornek basina baslangic: SDO yapilandirma → NMT Baslatma. */
-	if (canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
-		for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-			if (!m_node[i].master_started && sdo_cfg_run(i)) {
-				(void)co_nmt_master_send(&canopen_node, 0x01U,
-										cia402_nodes[i].node_id);
-				m_node[i].master_started = true;
-			}
+	/* 2. Her bus master'ini PRE_OPERATIONAL → OPERATIONAL'a yukselt. */
+	for (uint8_t b = 0U; b < s_bus_count; ++b) {
+		if (s_buses[b].node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
+			co_nmt_set_state(&s_buses[b].node, CO_NMT_OPERATIONAL);
 		}
 	}
 
-	/* 4. Baslatilmis her CiA 402 ornegi icin CiA 402 etkinlestirme dizisini ilerlет.
-	 *    on_rpdo_frame() hizli yanit icin RPDO1 alindiginda da bunu cagirir;
-	 *    ancak ana donguden surmek, RPDO1 cerceveleri kacirilsa dahi (orn. surucu
-	 *    SOD'dan cikmakta yavas) ilerlemeyi ve zaman asimi islemeyi garanti eder.
-	 *    Durum makinesi idempotent'tir — ayni statusword ve durumla tekrarlanan
-	 *    cagrilar guvenlidir. CiA-402 disi ornekler burada atlanir; varsa durum
-	 *    makineleri uygulamanin sorumlulugundadir. */
+	/* 3. Ornek basina baslangic: SDO yapilandirma → NMT Baslatma.
+	 *    Her kole icin NMT gonderimi kendi bus node'u uzerinden yapilir. */
+	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
+		co_node_t *bn = &s_buses[m_node_bus[i]].node;
+		if (bn->nmt_state == CO_NMT_OPERATIONAL &&
+		    !m_node[i].master_started && sdo_cfg_run(i)) {
+			(void)co_nmt_master_send(bn, 0x01U, cia402_nodes[i].node_id);
+			m_node[i].master_started = true;
+		}
+	}
+
+	/* 4. CiA 402 etkinlestirme dizisini ilerlet. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if ((m_node[i].master_started                       ) &&
 		    ((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
@@ -1185,9 +1238,8 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 5. RPDO izleme: RUNNING durumunda ancak CIA402_RPDO_WATCHDOG_MS sure
-	 *    RPDO1 alinmadiysa Quick Stop gonder; surucunun kendi olay zamanlayicisi
-	 *    yedek durdurma saglar. */
+	/* 5. RPDO izleme: Quick Stop gerekirse kole'nin bus node'u kullanilir;
+	 *    TPDO numarasi bus icindeki yerel slota gore belirlenir. */
 	const uint32_t now = now_ms();
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if (m_node[i].master_started &&
@@ -1195,25 +1247,23 @@ void app_canopen_loop(void)
 			(now - m_node[i].last_rpdo1_ms) >= CIA402_RPDO_WATCHDOG_MS) {
 			m_node[i].target_vel  = 0;
 			m_node[i].controlword = CW_QUICK_STOP;
-			(void)co_send_tpdo(&canopen_node, (uint8_t)(i * 2U));
+			(void)co_send_tpdo(&s_buses[m_node_bus[i]].node,
+			                   (uint8_t)(m_node_local[i] * 2U));
 			cia402_log_transition(i, MASTER_CIA402_IDLE);
 		}
 	}
 
-	/* 5b. PRE_OP kararli hâle getirme. Onaylanan kole dususu (PRE_OP pencereyi
-	 *     asti) → durumu yik ve SDO yapilandirmasini yeniden oynat.
-	 *     Pencere icinde OP'ye geri donen gecici dususler on_slave_nmt_change
-	 *     tarafindan temizlenir ve bu dala hic ulasmaz. */
+	/* 5b. PRE_OP kararli hâle getirme. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if (m_node[i].pre_op_pending &&
 			(now - m_node[i].pre_op_entry_ms) >= NMT_PREOP_DEBOUNCE_MS) {
-			node_reset(i, false);                       /* clears pre_op_pending */
+			node_reset(i, false);
 			m_node[i].sdo_cfg_state = SDO_CFG_IDLE;
 			m_node[i].sdo_cfg_step  = 0U;
 		}
 	}
 
-	/* 6. Her ornek icin calisma zamani SDO yazma kuyrugunu bosalt. */
+	/* 6. Calisma zamani SDO yazma kuyruklarini bosalt. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		sdo_rt_run(i);
 	}
@@ -1236,21 +1286,23 @@ void app_canopen_loop(void)
  *     SYNC periyodunu titretir ve yukaridaki belirtileri yeniden uretir.
  *
  *   • app_canopen_loop() ile yurutme baglamini paylasmalidir — her ikisi de
- *     kilit olmadan m_node[] ve canopen_node SDO/PDO durumuna erisir; dolayisiyla
+ *     kilit olmadan m_node[] ve s_buses[] SDO/PDO durumuna erisir; dolayisiyla
  *     birbirini onceliklendiremezler. Pratikte bu su anlama gelir: her ikisini
  *     de ayni zamanlayici/gorevden calistirin ya da farkli onceliklerde
- *     yasiyorlarsa m_node[] ve canopen_node'u kritik bolum / mutex ile koruyun.
+ *     yasiyorlarsa m_node[] ve s_buses[]'u kritik bolum / mutex ile koruyun.
  */
 void co_transmit_process(void)
 {
-    /* 5. Her SYNC tick'inde uygulama hedef hizlarini ilet. */
-    if (canopen_node.sync_event_pending) {
-        canopen_node.sync_event_pending = false;
-        for (uint8_t i = 0U; i < cia402_node_count; ++i) {
-            cia402_apply_target_internal(i, g_target_rpm[i]);
+    /* Her bus icin: SYNC atesdlendiyse o bus'taki kolelerin hedef hizlarini
+     * OD'ye kilitle, ardindan stack'i calistir (SYNC, TPDO'lar, HB, zaman asimi). */
+    for (uint8_t b = 0U; b < s_bus_count; ++b) {
+        if (s_buses[b].node.sync_event_pending) {
+            s_buses[b].node.sync_event_pending = false;
+            for (uint8_t j = 0U; j < s_buses[b].slave_count; ++j) {
+                const uint8_t i = s_buses[b].slave_idx[j];
+                cia402_apply_target_internal(i, g_target_rpm[i]);
+            }
         }
+        co_process(&s_buses[b].node);
     }
-
-    /* CANopen stack'i calistir: SYNC, TPDO'lar, kalp atisi, HB tuketici zaman asimi. */
-	co_process(&canopen_node);
 }

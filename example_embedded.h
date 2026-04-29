@@ -2,6 +2,7 @@
 #define __CIA402_APP_H__
 
 #include "canopen.h"
+#include "canopen_port.h"
 #include "app_config.h"
 
 /* ── Surucu tipi ─────────────────────────────────────────────────────────── */
@@ -21,7 +22,13 @@ typedef enum {
 
 /* ── Dugum basina yapilandirma ───────────────────────────────────────────── */
 typedef struct {
-    uint8_t       node_id;             /* CANopen dugum kimligi (1..127) */
+    uint8_t          node_id;          /* CANopen dugum kimligi (1..127) */
+    co_port_handle_t can_handle;       /* Bu dugumun bagli oldugu CAN cevre birimi
+                                          (orn. &hfdcan1, &hfdcan2, &hcan1).
+                                          Ayni handle'a sahip dugumler ayni CAN
+                                          veri yolunu paylaşır; farkli handle'lar
+                                          bagimsiz veri yollarini temsil eder ve
+                                          her biri kendi master CANopen ornegini alir. */
     uint32_t      default_accel;       /* [count/s²] baslangicta 0x6083'e bir kez yazilir;
                                           calisma zamaninda cia402_set_accel() ile guncellenir. */
     uint32_t      default_decel;       /* [count/s²] baslangicta 0x6084'e bir kez yazilir;
@@ -55,9 +62,11 @@ typedef struct {
 
 /* Yapilandirma tablosu — uygulamanizda bir kez tanimlayin, orn.:
  *
+ *   extern FDCAN_HandleTypeDef hfdcan1, hfdcan2;   // or CAN_HandleTypeDef for F4
+ *
  *   const cia402_cfg_t cia402_nodes[] = {
- *       { 0x05U, 50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  // ZeroErr 19-bit
- *       { 0x06U, 50000U, 200000U, 16777216U, 1U, DRIVER_DELTA   },  // Delta ASDA-B3 24-bit 
+ *       { 0x05U, &hfdcan1,  50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  // ZeroErr, bus 1
+ *       { 0x06U, &hfdcan2,  50000U, 200000U, 16777216U, 1U, DRIVER_DELTA   },  // Delta,   bus 2
  *   };
  *   const uint8_t cia402_node_count =
  *       (uint8_t)(sizeof(cia402_nodes) / sizeof(cia402_nodes[0]));
