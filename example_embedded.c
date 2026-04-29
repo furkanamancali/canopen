@@ -1,30 +1,30 @@
 /*
- * CANopen Master — STM32H7 FDCAN (multi-instance)
+ * CANopen Master — STM32H7 FDCAN (cok ornekli)
  *
- * Controls one or more CiA 402 Profile Velocity actuators (and, as a stub,
- * non-CiA-402 drives flagged DRIVER_WAT).
+ * Bir veya daha fazla CiA 402 Profil Hiz aktuatorunu (ve DRIVER_WAT isaretli
+ * CiA-402 disi suruculeri taslak olarak) kontrol eder.
  *
- * Topology
+ * Topoloji
  * ────────
- *   STM32H7 (master, node 0x7F) ←──CAN──→ slave[0] (node 0x05)
- *                                          slave[1] (node 0x06)  ← optional
- *                                          ...
+ *   STM32H7 (master, dugum 0x7F) ←──CAN──→ kole[0] (dugum 0x05)
+ *                                            kole[1] (dugum 0x06)  ← istege bagli
+ *                                            ...
  *
- * The instance table is supplied by the application via the externs declared
- * in example_embedded.h (cia402_nodes[] / cia402_node_count).  This source
- * file no longer owns the configuration array — drop it in any translation
- * unit and the stack picks it up.
+ * Ornek tablosu, example_embedded.h'de bildirilen extern'ler araciligiyla
+ * uygulama tarafindan saglanir (cia402_nodes[] / cia402_node_count).
+ * Bu kaynak dosya artik yapilandirma dizisine sahip degildir — herhangi bir
+ * ceviri biriminde tanimlayin, stack otomatik olarak alir.
  *
- * Each CiA 402 instance uses two TPDOs and two RPDOs on the master:
- *   instance i → tpdo_num = i*2    (controlword, mode, target_vel → slave RPDO1)
- *              → rpdo_num = i*2    (statusword, mode_display, velocity_act ← slave TPDO1)
- *              → rpdo_num = i*2+1  (position_act, torque_act ← slave TPDO2)
- * Accel/decel are written via SDO (0x6083/0x6084): once at startup, and again
- * at runtime via cia402_set_accel() which queues writes through sdo_rt_run().
+ * Her CiA 402 ornegi master'da iki TPDO ve iki RPDO kullanir:
+ *   ornek i → tpdo_num = i*2    (controlword, mod, hedef_hiz → kole RPDO1)
+ *           → rpdo_num = i*2    (statusword, mod_goster, hiz_gercek ← kole TPDO1)
+ *           → rpdo_num = i*2+1  (konum_gercek, tork_gercek ← kole TPDO2)
+ * Ivme/yavaslama SDO ile yazilir (0x6083/0x6084): baslangicta bir kez,
+ * calisma zamaninda cia402_set_accel() ile sdo_rt_run() uzerinden kuyruklanir.
  *
- * OD backing storage uses vendor-specific indices so instances never collide:
- *   TPDO data for instance i: OD index 0x4000 + i  (sub 1–5)
- *   RPDO data for instance i: OD index 0x4100 + i  (sub 1–5)
+ * OD yedek depolamasi orneklerin cakismamasi icin saticiya ozgu indeksler kullanir:
+ *   Ornek i TPDO verisi: OD indeks 0x4000 + i  (alt 1–5)
+ *   Ornek i RPDO verisi: OD indeks 0x4100 + i  (alt 1–5)
  */
 
 #include "canopen.h"
@@ -34,7 +34,7 @@
 
 extern FDCAN_HandleTypeDef hfdcan1;
 
-/* ── Master configuration ────────────────────────────────────────────────── */
+/* ── Master yapilandirmasi ───────────────────────────────────────────────── */
 #define MASTER_NODE_ID              0x7FU
 #define MASTER_HEARTBEAT_MS         50U
 #define SLAVE_HB_TIMEOUT_MS          150U
@@ -45,14 +45,15 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define CIA402_RPDO_WATCHDOG_MS       100U
 #define NMT_RESET_DELAY_MS     500U
 #define NMT_PREOP_DELAY_MS     100U
-/* Minimum time PRE_OPERATIONAL must persist after the master has finished
- * configuring the drive before we treat it as a real slave drop and re-run
- * the SDO config.  Set well above the heartbeat period so a single anomalous
- * HB carrying PRE_OP (e.g. one missed/garbled frame between two OP frames)
- * cannot, on its own, destroy master_started and replay the 28-step sequence. */
+/* Surucu yapilandirildiktan sonra PRE_OPERATIONAL durumunun gercek bir kole
+ * dususu sayilmasi icin en az bu kadar sure devam etmesi gerekir; aksi hâlde
+ * SDO yapilandirmasi yeniden calistirilmaz. Deger kalp atisi periyodunun cok
+ * uzerinde tutulur; boylece iki OP cercevesi arasindaki tek bir bozuk/kayip
+ * PRE_OP kalp atisi tek basina master_started'i sifirlayip 28 adimli SDO
+ * dizisini yeniden baslatamaz. */
 #define NMT_PREOP_DEBOUNCE_MS  150U
 #define SDO_TIMEOUT_MS         500U
-#define SDO_RT_QUEUE_SIZE      4U   /* max queued runtime SDO writes per instance */
+#define SDO_RT_QUEUE_SIZE      4U   /* ornek basina maksimum kuyruklanmis calisma zamani SDO yazmasi */
 
 #define CW_SHUTDOWN             0x0006U
 #define CW_SWITCH_ON            0x0007U
@@ -63,24 +64,25 @@ extern FDCAN_HandleTypeDef hfdcan1;
 #define CIA402_MODE_PROFILE_VEL   ((int8_t)3)
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * INSTANCE CONFIGURATION
+ * ORNEK YAPILANDIRMASI
  *
- * The cia402_nodes[] / cia402_node_count externs (declared in
- * example_embedded.h) come from the application — see that header for the
- * recommended pattern.  All loops in this file use cia402_node_count, and
- * all per-instance storage is sized to CIA402_MAX_NODES.  app_canopen_init()
- * range-checks cia402_node_count before doing anything else; CO_MAX_RPDO /
- * CO_MAX_TPDO in canopen.h must each be >= cia402_node_count * 2.
+ * cia402_nodes[] / cia402_node_count extern'leri (example_embedded.h'de
+ * bildirilen) uygulamadan gelir — onerilen kalip icin o basliga bakin.
+ * Bu dosyadaki tum donguler cia402_node_count kullanir; ornek basina tum
+ * depolama CIA402_MAX_NODES'a gore boyutlandirilir. app_canopen_init()
+ * baska bir sey yapmadan once cia402_node_count'u aralik kontrolunden gecirir;
+ * canopen.h icindeki CO_MAX_RPDO / CO_MAX_TPDO her biri
+ * >= cia402_node_count * 2 olmalidir.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 _Static_assert(CIA402_MAX_NODES * 2U <= CO_MAX_RPDO,
     "CIA402_MAX_NODES too high — raise CO_MAX_RPDO and CO_MAX_TPDO in canopen.h");
 
-/* ── CANopen stack instance ───────────────────────────────────────────────── */
+/* ── CANopen stack ornegi ────────────────────────────────────────────────── */
 static co_node_t      canopen_node;
 static co_stm32_ctx_t can_ctx;
 
-/* ── Per-instance SDO remote config tables ───────────────────────────────── */
+/* ── Ornek basina uzak SDO yapilandirma tablolari ────────────────────────── */
 typedef struct {
     uint16_t index;
     uint8_t  subindex;
@@ -88,9 +90,9 @@ typedef struct {
     uint8_t  size;
 } sdo_entry_t;
 
-/* Per-instance startup SDO table.  SDO_STEPS_MAX is the storage
- * dimension; the actual entry count varies by driver_type and is recorded in
- * m_sdo_steps[i] so sdo_cfg_run() knows when it has reached the end. */
+/* Ornek basina baslangic SDO tablosu. SDO_STEPS_MAX depolama boyutudur;
+ * gercek giris sayisi driver_type'a gore degisir ve sdo_cfg_run()'in
+ * sona ulastigini anlayabilmesi icin m_sdo_steps[i]'ye kaydedilir. */
 #define SDO_STEPS_MAX 28U
 static sdo_entry_t m_sdo_tbl[CIA402_MAX_NODES][SDO_STEPS_MAX];
 static uint8_t          m_sdo_steps[CIA402_MAX_NODES];
@@ -110,7 +112,7 @@ static void build_sdo_table(uint8_t i)
         const uint32_t t2d = 0x80000000UL | (0x280UL + nid);
         const uint32_t t2e =                 0x280UL + nid;
 
-        /* slave RPDO1 */
+        /* kole RPDO1 */
         t[n++] = (sdo_entry_t){ 0x1400U, 0x01U, r1d,          4U };
         t[n++] = (sdo_entry_t){ 0x1400U, 0x02U, 0xFFU,         1U };
         t[n++] = (sdo_entry_t){ 0x1600U, 0x00U, 0U,            1U };
@@ -120,7 +122,7 @@ static void build_sdo_table(uint8_t i)
         t[n++] = (sdo_entry_t){ 0x1600U, 0x00U, 3U,            1U };
         t[n++] = (sdo_entry_t){ 0x1400U, 0x01U, r1e,           4U };
         t[n++] = (sdo_entry_t){ 0x1400U, 0x05U, 500U,          2U };
-        /* slave TPDO1 */
+        /* kole TPDO1 */
         t[n++] = (sdo_entry_t){ 0x1800U, 0x01U, t1d,          4U };
         t[n++] = (sdo_entry_t){ 0x1800U, 0x02U, 0x01U,         1U };
         t[n++] = (sdo_entry_t){ 0x1A00U, 0x00U, 0U,            1U };
@@ -129,7 +131,7 @@ static void build_sdo_table(uint8_t i)
         t[n++] = (sdo_entry_t){ 0x1A00U, 0x03U, 0x606C0020UL, 4U };
         t[n++] = (sdo_entry_t){ 0x1A00U, 0x00U, 3U,            1U };
         t[n++] = (sdo_entry_t){ 0x1800U, 0x01U, t1e,           4U };
-        /* slave TPDO2 */
+        /* kole TPDO2 */
         t[n++] = (sdo_entry_t){ 0x1801U, 0x01U, t2d,          4U };
         t[n++] = (sdo_entry_t){ 0x1801U, 0x02U, 0x01U,         1U };
         t[n++] = (sdo_entry_t){ 0x1A01U, 0x00U, 0U,            1U };
@@ -137,20 +139,20 @@ static void build_sdo_table(uint8_t i)
         t[n++] = (sdo_entry_t){ 0x1A01U, 0x02U, 0x60770010UL, 4U };
         t[n++] = (sdo_entry_t){ 0x1A01U, 0x00U, 2U,            1U };
         t[n++] = (sdo_entry_t){ 0x1801U, 0x01U, t2e,           4U };
-        /* Profile ramp — written once; accel/decel are no longer PDO-mapped */
+        /* Profil rampasi — bir kez yazilir; ivme/yavaslama artik PDO'ya eslenmez */
         t[n++] = (sdo_entry_t){ 0x6083U, 0x00U, cia402_nodes[i].default_accel, 4U };
         t[n++] = (sdo_entry_t){ 0x6084U, 0x00U, cia402_nodes[i].default_decel, 4U };
-        /* Heartbeat */
+        /* Kalp atisi */
         t[n++] = (sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
         t[n++] = (sdo_entry_t){ 0x1016U, 0x01U,
                                       ((uint32_t)MASTER_NODE_ID << 16) | 150U, 4U };
     } else {
-        /* DRIVER_WAT — placeholder.  Bring the slave online with the bare
-         * minimum every CANopen drive needs: a heartbeat producer the master
-         * can monitor, and a HB consumer entry pointing back at the master.
-         * No PDO mapping is configured here — the application will need to
-         * extend this branch (and the PDO setup in app_canopen_init) once
-         * the WAT object dictionary is known. */
+        /* DRIVER_WAT — yer tutucu. Koleyi her CANopen surucusunun ihtiyac duydugu
+         * asgari duzeyde cevrimici getirin: master'in izleyebilecegi bir kalp atisi
+         * ureticisi ve master'a geri isaret eden bir HB tuketici girisi.
+         * Burada PDO haritalama yapilandirilmamistir — WAT nesne sozlugu
+         * bilindiginde uygulamanin bu dali (ve app_canopen_init icindeki PDO
+         * kurulumunu) genisletmesi gerekecektir. */
         t[n++] = (sdo_entry_t){ 0x1017U, 0x00U, 50U,           2U };
         t[n++] = (sdo_entry_t){ 0x1016U, 0x01U,
                                       ((uint32_t)MASTER_NODE_ID << 16) | 150U, 4U };
@@ -159,7 +161,7 @@ static void build_sdo_table(uint8_t i)
     m_sdo_steps[i] = (uint8_t)n;
 }
 
-/* ── Per-instance runtime state ──────────────────────────────────────────── */
+/* ── Ornek basina calisma zamani durumu ──────────────────────────────────── */
 typedef enum {
     SDO_CFG_IDLE = 0,
     SDO_CFG_RESET_DELAY,
@@ -180,35 +182,34 @@ typedef enum {
 } master_cia402_state_t;
 
 #ifdef DEBUG
-/* Power-of-two; per-instance ring buffer of CiA 402 state-machine transitions.
- * Sized to capture the full enable sequence plus a few faults without
- * wrapping during a postmortem on a "stuck in SOD" / fault-reset-loop event.
- * Compiled in only under -DDEBUG so release builds pay no flash, RAM, or
- * runtime cost; release-build cia402_log_transition() collapses to a single
- * drive_state assignment (see below). */
+/* Iki'nin kuvveti; CiA 402 durum makinesi gecislerinin ornek basina halka tamponu.
+ * "SOD'da takili kaldi" / hata-sifirlama dongusu sonrasi incelemede
+ * tam etkinlestirme dizisini ve birkac hatayi sarmadan yakalayacak buyuklukte.
+ * Yalnizca -DDEBUG altinda derlenir; surum yapilarinda flash, RAM veya
+ * calisma zamani maliyeti yoktur; surum derlemesinde cia402_log_transition()
+ * tek bir drive_state atamasina indirgenir (asagiya bakin). */
 #define CIA402_TRANSITION_LOG_SIZE 16U
 
 typedef struct {
-    uint32_t ts_ms;        /* now_ms() at the moment of the transition */
-    uint16_t statusword;   /* drive 0x6041 at transition (the disambiguator
-                              for "stuck in SOD" investigations) */
-    uint8_t  from;         /* master_cia402_state_t before the transition */
-    uint8_t  to;           /* master_cia402_state_t after the transition  */
+    uint32_t ts_ms;        /* gecis anindaki now_ms() degeri */
+    uint16_t statusword;   /* gecisteki surucu 0x6041 ("SOD'da takili" sorusturmalarinda ayirt edici) */
+    uint8_t  from;         /* gecis oncesi master_cia402_state_t */
+    uint8_t  to;           /* gecis sonrasi master_cia402_state_t  */
 } cia402_transition_t;
 #endif
 
 typedef struct {
 	driver_type_t driver_type_st;
 
-    /* OD backing: TPDO1 — master → slave commands */
+    /* OD yedek: TPDO1 — master → kole komutlari */
     uint16_t controlword;
     int8_t   mode_of_op;
     int32_t  target_vel;
-    /* OD backing: RPDO1 — slave → master feedback */
+    /* OD yedek: RPDO1 — kole → master geri bildirimi */
     uint16_t statusword;
     int8_t   mode_display;
     int32_t  velocity_act;
-    /* OD backing: RPDO2 — slave → master position/torque */
+    /* OD yedek: RPDO2 — kole → master konum/tork */
     int32_t  position_act;
     int16_t  torque_act;
 
@@ -217,26 +218,26 @@ typedef struct {
     uint32_t             sdo_cfg_step_ms;
     bool                 sdo_cfg_resp_ok;
 
-    /* Runtime SDO write queue — filled by cia402_set_accel() etc., drained by
-     * sdo_rt_run() one entry per response cycle.  Only active after
-     * master_started = true (startup config is complete). */
+    /* Calisma zamani SDO yazma kuyrugu — cia402_set_accel() vb. tarafindan doldurulur,
+     * sdo_rt_run() tarafindan yanit dongusu basina bir giris olacak sekilde bosaltilir.
+     * Yalnizca master_started = true oldugunda etkin (baslangic yapilandirmasi tamamlandi). */
     sdo_entry_t sdo_rt_queue[SDO_RT_QUEUE_SIZE];
-    uint8_t          sdo_rt_head;     /* next write slot */
-    uint8_t          sdo_rt_tail;     /* next read slot  */
-    bool             sdo_rt_active;   /* waiting for response to current entry */
+    uint8_t          sdo_rt_head;     /* sonraki yazma yuvasi */
+    uint8_t          sdo_rt_tail;     /* sonraki okuma yuvasi */
+    bool             sdo_rt_active;   /* gecerli giris icin yanit bekleniyor */
     bool             sdo_rt_resp_ok;
     uint32_t         sdo_rt_ms;       /* timestamp of last send */
-    /* Last expedited SDO upload payload (data[4..7], little-endian) for the
-     * current entry.  Meaningful only when the in-flight entry was a read and
-     * the response was an upload confirm (SCS 0x40); writes leave it
-     * unchanged.  Sized for the common 1–4 byte CiA 402 objects (controlword,
-     * statusword, mode_of_op, etc.). */
+    /* Gecerli giris icin son hizlandirilmis SDO yukleme yuku (data[4..7], little-endian).
+     * Yalnizca ucustaki giris bir okuma oldugunda ve yanit bir yukleme onayi (SCS 0x40)
+     * oldugunda anlamlidir; yazmalar bu alani degistirmez.
+     * Yaygin 1–4 baytlik CiA 402 nesneleri icin boyutlandirilmistir
+     * (controlword, statusword, mode_of_op, vb.). */
     uint32_t         sdo_rt_resp_value;
-    /* Last SDO abort observed on the runtime path.  Non-zero means the most
-     * recent runtime SDO write was rejected by the drive; data[4..7] of the
-     * abort frame, plus the index/subindex of the entry that failed.  Cleared
-     * on full instance reset; mirrored to g_sdo_rt_abort_code[] so it is
-     * visible without walking m_node[]. */
+    /* Calisma zamani yolunda gozlemlenen son SDO iptali. Sifirdan farkliysa
+     * en son calisma zamani SDO yazmasi surucu tarafindan reddedilmistir;
+     * iptal cercevesinin data[4..7] alani ve basarisiz girisin indeks/alt-indeksi.
+     * Tam ornek sifirlamada temizlenir; m_node[] icinde dolasmadan gorunur
+     * olmasi icin g_sdo_rt_abort_code[]'a yansitilir. */
     uint32_t         sdo_rt_abort_code;
     uint16_t         sdo_rt_abort_index;
     uint8_t          sdo_rt_abort_subindex;
@@ -249,30 +250,30 @@ typedef struct {
     bool           hb_lost;
     co_nmt_state_t nmt_state;
 
-    /* PRE_OP debounce.  Armed by on_slave_nmt_change when a started drive
-     * reports PRE_OPERATIONAL; cleared on return to OPERATIONAL or when the
-     * main loop confirms the drop after NMT_PREOP_DEBOUNCE_MS. */
+    /* PRE_OP kararli hâle getirme. Baslatilmis bir surucu PRE_OPERATIONAL bildirdiginde
+     * on_slave_nmt_change tarafindan kurulur; OPERATIONAL'a donuldugunde veya
+     * ana dongu NMT_PREOP_DEBOUNCE_MS sonunda dususu onayladiginda temizlenir. */
     bool           pre_op_pending;
     uint32_t       pre_op_entry_ms;
 
-    /* Per-instance encoder constants derived from cia402_nodes[i] at
-     * app_canopen_init() time.  counts_per_rpm_s is driver-specific:
-     *   DRIVER_ZEROERR: cpr * reductor_ratio / 60  (counts/s per output RPM)
-     *   DRIVER_DELTA:   10  * reductor_ratio
-     * Cached once so the SYNC-tick conversion in
-     * cia402_apply_target_internal() and the float math in cia402_get_pos_vel()
-     * don't recompute them every call. */
+    /* app_canopen_init() zamaninda cia402_nodes[i]'den turetilen ornek basina
+     * enkoder sabitleri. counts_per_rpm_s surucuye ozgudur:
+     *   DRIVER_ZEROERR: cpr * reduktor_orani / 60  (cikis RPM'i basina count/s)
+     *   DRIVER_DELTA:   10  * reduktor_orani        (0.1-RPM birimi)
+     * SYNC-tick donusumunun cia402_apply_target_internal() icinde ve
+     * cia402_get_pos_vel() icindeki kayan nokta matematiginin her cagrida
+     * yeniden hesaplamamasi icin bir kez onbellege alinir. */
     int32_t        encoder_counts_per_rev;
     int16_t        ratio;
     int32_t        counts_per_rpm_s;
 
 #ifdef DEBUG
-    /* CiA 402 transition history.  Written by cia402_log_transition() on every
-     * drive_state change; the most recent entry is at
-     * (transition_log_head - 1) & (SIZE - 1).  count saturates at SIZE and
-     * lets a debugger distinguish "log not yet wrapped" from "log full".
-     * Not cleared by node_reset() — surviving the reset is the whole point;
-     * postmortem of "why did we end up back at IDLE" needs the prior state. */
+    /* CiA 402 gecis gecmisi. Her drive_state degisiminde cia402_log_transition()
+     * tarafindan yazilir; en son giris (transition_log_head - 1) & (SIZE - 1)
+     * konumundadir. count, SIZE'da doygunlasir ve hata ayiklayicinin "log henuz
+     * sarilmadi" ile "log dolu" arasinda ayrim yapmasina olanak tanir.
+     * node_reset() tarafindan temizlenmez — sifirlamayi atlatmak zaten amacidir;
+     * "neden IDLE'a donduk" sorusunun sonradan incelenmesi onceki durumu gerektirir. */
     cia402_transition_t transition_log[CIA402_TRANSITION_LOG_SIZE];
     uint8_t           transition_log_head;
     uint8_t           transition_log_count;
@@ -281,22 +282,22 @@ typedef struct {
 
 static node_state_t m_node[CIA402_MAX_NODES];
 
-/* Last EMCY per instance — inspect in debugger to identify faults. */
+/* Ornek basina son EMCY — hatalari tanimlamak icin hata ayiklayicida inceleyin. */
 volatile uint16_t g_emcy_code[CIA402_MAX_NODES];
 volatile uint8_t  g_emcy_reg[CIA402_MAX_NODES];
 
-/* Last runtime-SDO abort per instance.  Non-zero abort_code means a runtime
- * write (e.g. cia402_set_accel) was rejected; the index/subindex identify the
- * entry that failed.  Sticky until cleared by the application or instance
- * reset. */
+/* Ornek basina son calisma zamani SDO iptali. Sifirdan farkli abort_code, bir calisma
+ * zamani yazmasinin (orn. cia402_set_accel) reddedildigi anlamina gelir;
+ * indeks/alt-indeks basarisiz girisi tanimlar. Uygulama veya ornek sifirlamasi
+ * temizleyene kadar kalicidir. */
 volatile uint32_t g_sdo_rt_abort_code[CIA402_MAX_NODES];
 volatile uint16_t g_sdo_rt_abort_index[CIA402_MAX_NODES];
 volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
 
-/* Per-instance target RPM set from any task context. */
+/* Herhangi bir gorev baglamindan ayarlanan ornek basina hedef RPM. */
 volatile float32_t g_target_rpm[CIA402_MAX_NODES];
 
-/* ── CiA 402 statusword helpers ──────────────────────────────────────────── */
+/* ── CiA 402 statusword yardimcilari ────────────────────────────────────── */
 #define SW_RTSO  0x0001U
 #define SW_SO    0x0002U
 #define SW_OE    0x0004U
@@ -329,15 +330,15 @@ static inline uint32_t now_ms(void)
     return canopen_node.iface.millis(canopen_node.iface.user);
 }
 
-/* ── Primitive critical section ──────────────────────────────────────────── */
-/* Save-and-restore PRIMASK guard — three Cortex-M instructions per side and,
- * unlike a mutex, callable from ISR context.  Used to make the producer-side
- * updates in sdo_rt_enqueue() and cia402_set_target_rpm() atomic against
- * any other priority that might also produce into them, including a higher-
- * priority ISR preempting an RTOS task mid-update.  Saving PRIMASK (rather
- * than blindly enabling on exit) keeps the helpers nest-safe: a critical
- * section taken while interrupts are already disabled leaves them disabled
- * on exit, exactly as the caller expects. */
+/* ── Temel kritik bolum ──────────────────────────────────────────────────── */
+/* PRIMASK kaydet-geri-yukle korumasi — her tarafta uc Cortex-M komutu ve
+ * bir mutex'in aksine ISR baglamindan cagrilabilir. sdo_rt_enqueue() ve
+ * cia402_set_target_rpm() icindeki uretici tarafi guncellemelerini, bir RTOS
+ * gorevini guncelleme ortasinda oncelikli kesen daha yuksek oncelikli bir ISR
+ * dahil, diger her oncelige karsi atomik hâle getirmek icin kullanilir.
+ * PRIMASK'i kaydetmek (cikista korce etkinlestirmek yerine) yardimcilari
+ * ic ice gecme icin guvenli tutar: kesmeler zaten devre disiyken alinan bir
+ * kritik bolum, cikista cagiranin bekledigi gibi devre disi birakilmis birakir. */
 static inline uint32_t co_enter_critical(void)
 {
     const uint32_t pm = __get_PRIMASK();
@@ -349,7 +350,7 @@ static inline void co_exit_critical(uint32_t saved_primask)
     __set_PRIMASK(saved_primask);
 }
 
-/* ── Instance lookup ─────────────────────────────────────────────────────── */
+/* ── Ornek arama ─────────────────────────────────────────────────────────── */
 static int8_t node_find(uint8_t node_id)
 {
     for (uint8_t i = 0U; i < cia402_node_count; ++i) {
@@ -358,17 +359,17 @@ static int8_t node_find(uint8_t node_id)
     return -1;
 }
 
-/* ── Transition log ──────────────────────────────────────────────────────── */
-/* Record a CiA 402 state-machine transition into the per-instance ring and
- * commit drive_state.  Self-edges (X→X) are dropped — the cia402 step
- * machine often re-asserts the same state across ticks and the noise would
- * crowd out genuine transitions.  Always commit drive_state, including on
- * the self-edge skip, so callers don't need a separate assignment.
+/* ── Gecis kaydi ─────────────────────────────────────────────────────────── */
+/* CiA 402 durum makinesi gecisini ornek basina halkaya kaydeder ve drive_state'i
+ * taahhut eder. Oz-kenarlar (X→X) atilir — cia402 adim makinesi siklikla ayni
+ * durumu tick'ler arasinda yeniden onaylar ve bu gurultu gercek gecisleri
+ * bastirir. Oz-kenar atlamada da dahil olmak uzere drive_state her zaman
+ * taahhut edilir; boylece cagiranlarin ayri bir atamaya ihtiyaci olmaz.
  *
- * Release builds (-DDEBUG not set) collapse this to a single field
- * assignment — no ring storage, no now_ms() call, no branch — so the call
- * sites scattered through cia402_step / on_hb_event / the main loop
- * don't need their own #ifdef wrappers. */
+ * Surum derlemeleri (-DDEBUG ayarli degil) bunu tek bir alan atamasina
+ * indirger — halka depolamasi yok, now_ms() cagrisi yok, dal yok — dolayisiyla
+ * cia402_step / on_hb_event / ana dongu icindeki cagri noktalari kendi
+ * #ifdef sarmalayicilarina ihtiyac duymaz. */
 #ifdef DEBUG
 static void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 {
@@ -395,7 +396,7 @@ static inline void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 }
 #endif
 
-/* ── Instance reset ──────────────────────────────────────────────────────── */
+/* ── Ornek sifirlama ─────────────────────────────────────────────────────── */
 static void node_reset(uint8_t i, bool full)
 {
     m_node[i].target_vel     = 0;
@@ -413,11 +414,11 @@ static void node_reset(uint8_t i, bool full)
     }
 }
 
-/* Threading: any context (ISR, RTOS task, main loop).  Concurrent callers
- * from any priority are safe — the slot write is wrapped in a primitive
- * disable-IRQ critical section so a higher-priority preemptor cannot observe
- * or produce a torn value, and the volatile guarantees co_transmit_process()
- * picks up the latched value on the next SYNC tick. */
+/* Is parcacigi: herhangi bir baglam (ISR, RTOS gorevi, ana dongu). Her oncelikteki
+ * es zamanli cagiranlar guvenlidir — yuva yazmasi temel bir IRQ-devre-disi kritik
+ * bolumuyle sarilmistir; dolayisiyla daha yuksek oncelikli bir onceliklendirici
+ * yirtik bir deger gozlemleyemez veya uretemez; volatile, co_transmit_process()'in
+ * bir sonraki SYNC tick'inde kilitlenen degeri almasini garanti eder. */
 void cia402_set_target_rpm(uint16_t node_id_u16, float target_rpm_f32)
 {
     const int8_t idx = node_find((uint8_t)node_id_u16);
@@ -434,14 +435,14 @@ static void cia402_apply_target_internal(uint8_t instance, float rpm)
     if (rpm < -CIA402_MAX_VEL_RPM) { rpm = -CIA402_MAX_VEL_RPM; }
 	if (DRIVER_ZEROERR == m_node[instance].driver_type_st) {
 		m_node[instance].target_vel = rpm * m_node[instance].counts_per_rpm_s;
-		/* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
+		/* tork: CiA 402 0x6077 nominal torkunun %0.1 birimindedir */
 	} else if(DRIVER_DELTA == m_node[instance].driver_type_st) {
 		m_node[instance].target_vel = rpm * m_node[instance].ratio * 10.0f;
 	}
 
 }
 
-/* ── SDO send helper ─────────────────────────────────────────────────────── */
+/* ── SDO gonderme yardimcisi ─────────────────────────────────────────────── */
 static void sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
                           uint32_t value, uint8_t size)
 {
@@ -466,7 +467,7 @@ static void sdo_send(uint8_t node_id, uint16_t index, uint8_t subindex,
     (void)canopen_node.iface.send(canopen_node.iface.user, &f);
 }
 
-/* ── NMT state change ────────────────────────────────────────────────────── */
+/* ── NMT durum degisikligi ───────────────────────────────────────────────── */
 static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
 {
     switch (st) {
@@ -475,18 +476,18 @@ static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
         node_reset(i, true);
         break;
     case CO_NMT_PRE_OPERATIONAL:
-        /* Expected during our own startup (we just sent NMT reset / 0x80) —
-         * leave the in-flight cfg sequence alone. */
+        /* Kendi baslangicimizda beklenen durum (NMT sifirlama / 0x80 gonderdik) —
+         * ucustaki yapilandirma dizisine dokunmayin. */
         if (m_node[i].sdo_cfg_state == SDO_CFG_NMT_DELAY ||
             m_node[i].sdo_cfg_state == SDO_CFG_RESET_DELAY) {
             break;
         }
-        /* Unexpected drop from a started drive — arm the debounce instead of
-         * tearing down state.  If the slave returns to OPERATIONAL within
-         * NMT_PREOP_DEBOUNCE_MS this is treated as a transient HB and
-         * the master continues uninterrupted; otherwise the main loop will
-         * commit to a full re-config.  Idempotent: a second PRE_OP transition
-         * inside the window does not restart the timer. */
+        /* Baslatilmis bir surucuden beklenmedik dusus — durumu yikmak yerine
+         * kararli hâle getiriciyi kurun. Kole NMT_PREOP_DEBOUNCE_MS icinde
+         * OPERATIONAL'a donerse bu gecici bir HB olarak degerlendirilir ve
+         * master kesintisiz devam eder; aksi hâlde ana dongu tam yeniden
+         * yapilandirmaya gecer. Idempotent: pencere icindeki ikinci bir
+         * PRE_OP gecisi zamanlayiciyi yeniden baslatmaz. */
         if (!m_node[i].pre_op_pending) {
             m_node[i].pre_op_pending  = true;
             m_node[i].pre_op_entry_ms = now_ms();
@@ -496,18 +497,18 @@ static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
         node_reset(i, true);
         break;
     case CO_NMT_OPERATIONAL:
-        /* Slave returned to OP — cancel any pending re-config. */
+        /* Kole OP'ye dondu — bekleyen yeniden yapilandirmayi iptal edin. */
         m_node[i].pre_op_pending = false;
         break;
     }
 }
 
-/* ── on_rx_frame hook ────────────────────────────────────────────────────── */
+/* ── on_rx_frame kancasi ─────────────────────────────────────────────────── */
 static void on_rx_frame(void *user, const co_can_frame_t *frame)
 {
     (void)user;
 
-    /* Heartbeat: track per-instance NMT state */
+    /* Kalp atisi: ornek basina NMT durumunu takip et */
     if (frame->cob_id >= 0x701U && frame->cob_id <= 0x77FU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x700U);
         const int8_t  idx = node_find(nid);
@@ -521,7 +522,7 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
         return;
     }
 
-    /* EMCY (COB-ID = 0x080 + node_id): capture fault code per instance */
+    /* EMCY (COB-ID = 0x080 + dugum_kimligi): ornek basina hata kodunu yakala */
     if (frame->cob_id >= 0x081U && frame->cob_id <= 0x0FFU && frame->len >= 3U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x080U);
         const int8_t  idx = node_find(nid);
@@ -533,24 +534,23 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
         return;
     }
 
-    /* SDO response (COB-ID = 0x580 + node_id): signal waiting instance.
+    /* SDO yaniti (COB-ID = 0x580 + dugum_kimligi): bekleyen ornegi sinyal.
      *
-     * SCS bits (data[0] & 0xE0):
-     *   0x60 = expedited/segmented download confirm  → success (write ack)
-     *   0x40 = upload response                       → success (read result;
-     *                                                  payload in data[4..7])
-     * data[0] == 0x80                                → abort
+     * SCS bitleri (data[0] & 0xE0):
+     *   0x60 = hizlandirilmis/segmentli indirme onayi → basari (yazma ack)
+     *   0x40 = yukleme yaniti                         → basari (okuma sonucu;
+     *                                                    yuk data[4..7]'de)
+     * data[0] == 0x80                                 → iptal
      *
-     * Aborts must NOT be treated as success silently: the rt queue would
-     * advance with the caller none the wiser.  Capture the 4-byte abort code
-     * (data[4..7]) and the failing entry's index/subindex into per-instance
-     * fields and the g_sdo_rt_abort_*[] surfaces.  The queue still
-     * advances on abort — retrying would produce the same code — but the
-     * failure is now observable.
+     * Iptaller sessizce basari olarak degerlendirilmemelidir: rt kuyrugu
+     * cagiranin haberi olmadan ilerlerdi. 4 baytlik iptal kodunu (data[4..7])
+     * ve basarisiz girisin indeks/alt-indeksini ornek basina alanlara ve
+     * g_sdo_rt_abort_*[] yuzeylerine kaydedin. Iptal durumunda kuyruk hâlâ
+     * ilerler — yeniden denemek ayni kodu uretir — ancak hata artik gozlemlenebilir.
      *
-     * For upload (read) confirms we also stash the expedited payload into
-     * sdo_rt_resp_value so a future read API has somewhere to fetch it from
-     * before the queue advances and the entry is overwritten. */
+     * Yukleme (okuma) onaylari icin hizlandirilmis yuku sdo_rt_resp_value'ya
+     * da saklariz; boylece gelecekteki bir okuma API'si kuyruk ilerlemeden ve
+     * giris uzerine yazilmadan once buradan alabilir. */
     if (frame->cob_id >= 0x581U && frame->cob_id <= 0x5FFU && frame->len >= 1U) {
         const uint8_t nid = (uint8_t)(frame->cob_id - 0x580U);
         const int8_t  idx = node_find(nid);
@@ -590,7 +590,7 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     }
 }
 
-/* ── SDO config state machine (per instance) ─────────────────────────────── */
+/* ── SDO yapilandirma durum makinesi (ornek basina) ──────────────────────── */
 static bool sdo_cfg_run(uint8_t i)
 {
     node_state_t *e  = &m_node[i];
@@ -625,7 +625,7 @@ static bool sdo_cfg_run(uint8_t i)
         return false;
     }
 
-    /* SDO_CFG_WAIT_RESPONSE */
+    /* SDO_CFG_YANIT_BEKLE */
     if (!e->sdo_cfg_resp_ok) {
         if ((t - e->sdo_cfg_step_ms) >= SDO_TIMEOUT_MS) {
             e->sdo_cfg_state = SDO_CFG_IDLE;
@@ -646,20 +646,20 @@ static bool sdo_cfg_run(uint8_t i)
     return false;
 }
 
-/* ── Runtime SDO write queue ─────────────────────────────────────────────────
- * sdo_rt_enqueue() is called from public API (e.g. cia402_set_accel).
- * sdo_rt_run() is called every main-loop tick; it sends one entry at a
- * time and waits for the SDO response before advancing to the next.
- * Only operates when master_started = true so it never races with the startup
- * config sequence, which uses the same SDO channel. */
+/* ── Calisma zamani SDO yazma kuyrugu ───────────────────────────────────────
+ * sdo_rt_enqueue() genel API'den cagrilir (orn. cia402_set_accel).
+ * sdo_rt_run() her ana dongu tick'inde cagrilir; bir seferde bir giris gonderir
+ * ve bir sonrakine gecmeden once SDO yanitini bekler.
+ * Yalnizca master_started = true oldugunda calisir; dolayisiyla ayni SDO
+ * kanalini kullanan baslangic yapilandirma dizisiyle hicbir zaman yarismaz. */
 
-/* Producer side of the runtime SDO queue.  The slot write + head advance is
- * wrapped in a disable-IRQ critical section so concurrent producers from any
- * priority — including an ISR preempting an RTOS-task caller mid-update —
- * cannot interleave their writes onto the same slot or lose an enqueue by
- * racing the head pointer.  The consumer (sdo_rt_run()) only mutates
- * tail and so does not need the guard, but it does benefit from it: any
- * head value it reads is fully published. */
+/* Calisma zamani SDO kuyrugunun uretici tarafi. Yuva yazmasi + bas ilerlemesi
+ * IRQ-devre-disi kritik bolumuyle sarilmistir; dolayisiyla her oncelikteki
+ * es zamanli ureticiler — guncelleme ortasinda bir RTOS gorevini onceliklendiren
+ * bir ISR dahil — yazimlarini ayni yuvaya serpistiremez veya bas isaretcisini
+ * yarisarak bir kuyrugu kaybedemez. Tuketici (sdo_rt_run()) yalnizca tail'i
+ * degistirir ve bu nedenle korumaya ihtiyac duymaz; ancak bundan yararlanir:
+ * okudugu her bas degeri tam olarak yayimlanmistir. */
 static bool sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
                                  uint32_t value, uint8_t size)
 {
@@ -668,7 +668,7 @@ static bool sdo_rt_enqueue(uint8_t i, uint16_t index, uint8_t subindex,
     const uint8_t next = (uint8_t)((e->sdo_rt_head + 1U) % SDO_RT_QUEUE_SIZE);
     if (next == e->sdo_rt_tail) {
         co_exit_critical(pm);
-        return false;                                   /* full — caller should retry */
+        return false;                                   /* dolu — cagiran yeniden denemeli */
     }
     e->sdo_rt_queue[e->sdo_rt_head] =
         (sdo_entry_t){ index, subindex, value, size };
@@ -686,19 +686,19 @@ static void sdo_rt_run(uint8_t i)
 
     if (e->sdo_rt_active) {
         if (e->sdo_rt_resp_ok) {
-            /* Response received — consume entry and move on. */
+            /* Yanit alindi — girisi tuket ve devam et. */
             e->sdo_rt_resp_ok = false;
             e->sdo_rt_active  = false;
             e->sdo_rt_tail    = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
         } else if ((t - e->sdo_rt_ms) >= SDO_TIMEOUT_MS) {
-            /* Timeout — drop entry and continue with the rest. */
+            /* Zaman asimi — girisi dusur ve geri kalanla devam et. */
             e->sdo_rt_active = false;
             e->sdo_rt_tail   = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
         }
         return;
     }
 
-    if (e->sdo_rt_tail == e->sdo_rt_head) { return; }  /* queue empty */
+    if (e->sdo_rt_tail == e->sdo_rt_head) { return; }  /* kuyruk bos */
 
     const sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
     sdo_send(cia402_nodes[i].node_id, w->index, w->subindex, w->value, w->size);
@@ -707,7 +707,7 @@ static void sdo_rt_run(uint8_t i)
     e->sdo_rt_ms      = t;
 }
 
-/* ── CiA 402 state machine (per instance) ────────────────────────────────── */
+/* ── CiA 402 durum makinesi (ornek basina) ───────────────────────────────── */
 static void cia402_step(uint8_t i)
 {
     node_state_t *e   = &m_node[i];
@@ -724,14 +724,14 @@ static void cia402_step(uint8_t i)
             cia402_log_transition(i, MASTER_CIA402_FAULT_RESET);
             e->state_entry_ms = t;
         } else if (sw != 0U) {
-            /* Any non-zero, non-fault statusword including Quick Stop Active
-             * (0x0003) and Switch On Disabled with QS bit set (0x0060).
-             * CiA 402 Table 7 marks QS "don't care" in several states so
-             * exact-mask checks miss valid words with unexpected bits set.
-             * CW is set immediately so the next master TPDO carries the
-             * Shutdown command — without this the drive sees a stale CW for
-             * one event-timer cycle, which is the typical cause of the drive
-             * "lingering" in Switch On Disabled. */
+            /* Sifirdan farkli, hata olmayan her statusword; Quick Stop Active
+             * (0x0003) ve QS biti ayarli Switch On Disabled (0x0060) dahil.
+             * CiA 402 Tablo 7, QS'yi bircok durumda "onemsiz" olarak isaretler;
+             * dolayisiyla kesin maske kontrolleri beklenmedik bitlerle gecerli
+             * kelimeleri kacirir. CW hemen ayarlanir; boylece bir sonraki master
+             * TPDO'su Shutdown komutunu tasir — bu olmadan surucu bir olay
+             * zamanlayicisi dongusu icin eski CW'yi gorur; bu da surucunun
+             * Switch On Disabled'da "oyalanmasinin" tipik nedenidir. */
             e->controlword    = CW_SHUTDOWN;
             cia402_log_transition(i, MASTER_CIA402_SHUTDOWN);
             e->state_entry_ms = t;
@@ -823,11 +823,12 @@ static void cia402_step(uint8_t i)
             cia402_log_transition(i, MASTER_CIA402_FAULT);
             e->state_entry_ms = t;
         } else if (!cia402_sw_operation_enabled(sw)) {
-            /* Drive dropped out of Operation Enabled without asserting Fault
-             * (e.g. Quick Stop Active, Switch On Disabled after cable-replug,
-             * or an inhibit input).  Zero velocity and fall back to IDLE so
-             * the state machine re-reads the live statusword on the next
-             * RPDO1 and runs the correct CiA 402 re-enable sequence. */
+            /* Surucu Hata bildirmeden Operation Enabled'dan cikti
+             * (orn. Quick Stop Active, kablo yeniden takilmasindan sonra Switch On
+             * Disabled veya bir engelleme girisi). Hizi sifirlayin ve IDLE'a
+             * geri donun; boylece durum makinesi bir sonraki RPDO1'de canli
+             * statusword'u yeniden okur ve dogru CiA 402 yeniden etkinlestirme
+             * dizisini calistirir. */
             e->target_vel     = 0;
             e->controlword    = CW_SHUTDOWN;
             cia402_log_transition(i, MASTER_CIA402_IDLE);
@@ -851,7 +852,7 @@ static void cia402_step(uint8_t i)
             cia402_log_transition(i, MASTER_CIA402_SHUTDOWN);
             e->state_entry_ms = t;
         } else if ((t - e->state_entry_ms) >= CIA402_STATE_TIMEOUT_MS) {
-            /* Restart fault-reset cycle. */
+            /* Hata sifirlama dongusunu yeniden baslat. */
             e->controlword    = CW_FAULT_RESET;
             e->state_entry_ms = t;
         } else {
@@ -861,7 +862,7 @@ static void cia402_step(uint8_t i)
     }
 }
 
-/* ── RPDO frame callback ─────────────────────────────────────────────────── */
+/* ── RPDO cerceve geri cagirmasi ─────────────────────────────────────────── */
 static void on_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
 {
     (void)node; (void)user;
@@ -873,10 +874,10 @@ static void on_rpdo_frame(co_node_t *node, uint8_t rpdo_num, void *user)
         m_node[i].last_rpdo1_ms = now_ms();
         cia402_step(i);
     }
-    /* RPDO2 (position + torque) needs no immediate action */
+    /* RPDO2 (konum + tork) anlik islem gerektirmez */
 }
 
-/* ── Heartbeat consumer callback ─────────────────────────────────────────── */
+/* ── Kalp atisi tuketici geri cagirmasi ──────────────────────────────────── */
 static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
                         co_hb_event_t event, void *user)
 {
@@ -886,13 +887,13 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
     const uint8_t i = (uint8_t)idx;
 
     if (event == CO_HB_EVENT_TIMEOUT) {
-        /* Ignore timeouts that fire before the drive has been started.
-         * sdo_cfg_run() issues an NMT reset (0x82) as its first step,
-         * which takes the drive offline for ~500 ms — longer than
-         * SLAVE_HB_TIMEOUT_MS.  That expected gap must not disrupt the SDO
-         * config sequence.  Recovery for drives that never completed startup
-         * is handled by on_slave_nmt_change() via the NMT heartbeat callbacks,
-         * not through this path. */
+        /* Surucu baslatilmadan once tetiklenen zaman asimlarini yoksay.
+         * sdo_cfg_run() ilk adim olarak bir NMT sifirlamasi (0x82) gonderir;
+         * bu surucuyu ~500 ms boyunca cevrimdisi alir — SLAVE_HB_TIMEOUT_MS'den
+         * daha uzun. Bu beklenen bosluk SDO yapilandirma dizisini bozmamalidir.
+         * Baslangici hic tamamlayamamis suruculerin kurtarilmasi, bu yoldan
+         * degil, NMT kalp atisi geri cagirmalari araciligiyla
+         * on_slave_nmt_change() tarafindan ele alinir. */
         if (!m_node[i].master_started) { return; }
         m_node[i].target_vel  = 0;
         m_node[i].controlword = CW_QUICK_STOP;
@@ -914,7 +915,7 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
     }
 }
 
-/* ── NMT Reset Communication callback ───────────────────────────────────────*/
+/* ── NMT Iletisim Sifirlama geri cagirmasi ───────────────────────────────── */
 static void on_reset_communication(void *user)
 {
     (void)user;
@@ -924,41 +925,42 @@ static void on_reset_communication(void *user)
 }
 
 
-/* ── Public API ──────────────────────────────────────────────────────────── */
+/* ── Genel API ───────────────────────────────────────────────────────────── */
 
-/* Threading: any context.  Reads m_node[] PDO feedback fields written from
- * the main-loop RPDO callback path; 32-bit reads of position/velocity can
- * tear relative to a concurrent RPDO update.  Suitable for telemetry, not
- * for sub-cycle synchronization. */
+/* Is parcacigi: herhangi bir baglam. Ana dongu RPDO geri cagirma yolundan
+ * yazilan m_node[] PDO geri bildirim alanlarini okur; konum/hizin 32-bit
+ * okumalari es zamanli bir RPDO guncellemesine gore yirtilabilir.
+ * Telemetri icin uygundur, alt-dongu senkronizasyonu icin degil. */
 void cia402_get_pos_vel(uint16_t node_id_u16, float *const p_pos_deg_f32,
                       float *const p_vel_rpm_f32, float *const p_torque_pct_f32)
 {
     const int8_t idx = node_find((uint8_t)node_id_u16);
     if (idx < 0) { return; }
 	const int32_t cpr = m_node[idx].encoder_counts_per_rev ;
-	/* Wrap signed encoder counts into [0, counts_per_rev) before scaling.
-	 * C truncates negative modulo toward zero, so an explicit add-back is
-	 * needed for the result to land in [0, 360) for both signs. */
+	/* Olceklendirmeden once isaretli enkoder sayilarini [0, counts_per_rev)
+	 * araligina sar. C, negatif modulu sifira dogru kirpar; dolayisiyla
+	 * sonucun her iki isaret icin [0, 360) araligina dusmesi icin acik bir
+	 * geri-ekleme gerekir. */
 	int32_t mod_counts = m_node[idx].position_act % cpr ;
 	if (mod_counts < 0) { mod_counts += cpr; }
 	*p_pos_deg_f32 = (float)mod_counts * (360.0f / (float)cpr);
 
 	if (DRIVER_ZEROERR == m_node[idx].driver_type_st) {
-        /* velocity: counts/s ÷ counts_per_rpm_s = RPM */
+        /* hiz: count/s ÷ counts_per_rpm_s = RPM */
 		*p_vel_rpm_f32    = (float)m_node[idx].velocity_act / (float)m_node[idx].counts_per_rpm_s;
 	} else if(DRIVER_DELTA == m_node[idx].driver_type_st) {
 		*p_vel_rpm_f32    = (float)m_node[idx].velocity_act / (10.0f * m_node[idx].ratio);
 	}
 
-	/* torque: CiA 402 0x6077 is in 0.1 % of rated torque */
+	/* tork: CiA 402 0x6077 nominal torkunun %0.1 birimindedir */
     *p_torque_pct_f32 = (float)m_node[idx].torque_act * 0.1f;
 }
 
-/* Threading: any context (ISR, RTOS task, main loop).  Concurrent callers
- * are serialised by the disable-IRQ critical section in
- * sdo_rt_enqueue(), so two producers cannot race the head pointer; the
- * consumer (sdo_rt_run() in app_canopen_loop()) only mutates tail and
- * so never contends with this path. */
+/* Is parcacigi: herhangi bir baglam (ISR, RTOS gorevi, ana dongu). Es zamanli
+ * cagiranlar sdo_rt_enqueue() icindeki IRQ-devre-disi kritik bolumu tarafindan
+ * serilestirilir; iki uretici bas isaretcisini yarisamaz. Tuketici
+ * (app_canopen_loop() icindeki sdo_rt_run()) yalnizca tail'i degistirir ve
+ * bu nedenle bu yolla hicbir zaman cakismaz. */
 void cia402_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t decel_plus_s)
 {
     const int8_t idx = node_find((uint8_t)node_id_u16);
@@ -967,16 +969,16 @@ void cia402_set_accel(uint16_t node_id_u16, uint32_t accel_plus_s, uint32_t dece
     (void)sdo_rt_enqueue((uint8_t)idx, 0x6084U, 0x00U, decel_plus_s, 4U);
 }
 
-/* ── Initialization ──────────────────────────────────────────────────────── */
-/* Threading: call once during system init, before FDCAN interrupts are
- * enabled and before app_canopen_loop() / co_transmit_process() begin. */
+/* ── Baslatma ────────────────────────────────────────────────────────────── */
+/* Is parcacigi: sistem baslatma sirasinda bir kez cagrilir; FDCAN kesmeleri
+ * etkinlestirilmeden ve app_canopen_loop() / co_transmit_process() baslamadan once. */
 co_error_t app_canopen_init(void)
 {
     co_error_t err;
 
-    /* Range-check the application-supplied table before we walk it.  The
-     * count comes from a different translation unit so the storage cap can
-     * only be enforced at startup, not by the compiler. */
+    /* Tabloyu dolasmadan once uygulama tarafindan saglanan tabloyu aralik
+     * kontrolunden gecirin. Sayi farkli bir ceviri biriminden gelir; dolayisiyla
+     * depolama siniri yalnizca baslangicta uygulanabilir, derleyici tarafindan degil. */
     if (cia402_node_count == 0U || cia402_node_count > CIA402_MAX_NODES) {
         return CO_ERROR_INVALID_ARGS;
     }
@@ -989,21 +991,21 @@ co_error_t app_canopen_init(void)
     for (uint8_t i = 0U; i < cia402_node_count; ++i) {
         build_sdo_table(i);
 
-        /* Cache the encoder constants once.  counts_per_rpm_s folds the gear
-         * reduction into the RPM↔counts conversion so values supplied to
-         * the public API are interpreted on the OUTPUT shaft.
-         * 64-bit intermediate guards against overflow at large CPR × ratio
-         * products; the result still fits int32_t for any realistic actuator. */
+        /* Enkoder sabitlerini bir kez onbellege al. counts_per_rpm_s, disli
+         * indirimini RPM↔count donusumune katar; boylece genel API'ye saglanan
+         * degerler CIKIS milinde yorumlanir. 64-bit ara deger, buyuk CPR × oran
+         * carpimlarinda tasmaya karsi korur; sonuc herhangi bir gercekci aktuator
+         * icin int32_t'ye sigar. */
         const uint32_t cpr   = cia402_nodes[i].encoder_counts_per_rev;
         const uint16_t ratio = cia402_nodes[i].reductor_ratio;
         m_node[i].encoder_counts_per_rev = (int32_t)cpr * ratio;
         m_node[i].ratio = ratio;
-        /* counts_per_rpm_s: scaling factor from output-shaft RPM to the
-         * velocity register unit used by this driver.
-         *   DRIVER_ZEROERR: 0x60FF / 0x606C in encoder counts/s
-         *     → 1 RPM_out = cpr * ratio / 60 counts/s
-         *   DRIVER_DELTA (ASDA-B3): 0x60FF / 0x606C in 0.1-RPM units
-         *     → 1 RPM_out = ratio motor RPM = ratio * 10 in 0.1-RPM units */
+        /* counts_per_rpm_s: cikis mili RPM'inden bu surucunun kullandigi hiz
+         * kayit birimine donusum faktoru.
+         *   DRIVER_ZEROERR: 0x60FF / 0x606C enkoder count/s biriminde
+         *     → 1 RPM_cikis = cpr * oran / 60 count/s
+         *   DRIVER_DELTA (ASDA-B3): 0x60FF / 0x606C, 0.1-RPM biriminde
+         *     → 1 RPM_cikis = oran motor RPM = oran * 10, 0.1-RPM biriminde */
         if (cia402_nodes[i].driver_type == DRIVER_DELTA) {
             m_node[i].counts_per_rpm_s = (int32_t)ratio * 10;
         } else {
@@ -1016,18 +1018,18 @@ co_error_t app_canopen_init(void)
         m_node[i].drive_state = MASTER_CIA402_IDLE;
         m_node[i].nmt_state     = CO_NMT_INITIALIZING;
         m_node[i].driver_type_st = cia402_nodes[i].driver_type;
-        /* OD backing storage and PDO mapping below assume the CiA 402 layout
-         * (controlword 0x6040, statusword 0x6041, target velocity 0x60FF,
-         * etc.).  A non-CiA-402 driver gets a stub heartbeat-only SDO table
-         * from build_sdo_table() and is otherwise left untouched —
-         * extend this branch when the alternative driver's OD is defined. */
+        /* Asagidaki OD yedek depolama ve PDO haritalama CiA 402 duzenini varsayar
+         * (controlword 0x6040, statusword 0x6041, hedef hiz 0x60FF, vb.).
+         * CiA-402 disi bir surucu, build_sdo_table()'dan yalnizca kalp atisi
+         * iceren bir taslak SDO tablosu alir; aksi hâlde dokunulmaz birakilir —
+         * alternatif surucunun OD'si tanimlandiginda bu dali genisletin. */
         if (!((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
               (cia402_nodes[i].driver_type == DRIVER_DELTA  ))   ) {
             continue;
         }
 
-        /* Vendor-specific OD indices avoid collision between instances.
-         * Instance i TPDO data: 0x4000+i,  RPDO data: 0x4100+i  (sub 1–5) */
+        /* Saticiya ozgu OD indeksleri ornekler arasindaki cakismayi onler.
+         * Ornek i TPDO verisi: 0x4000+i,  RPDO verisi: 0x4100+i  (alt 1–5) */
         const uint16_t ti = (uint16_t)(0x4000U + i);
         const uint16_t ri = (uint16_t)(0x4100U + i);
 
@@ -1057,7 +1059,7 @@ co_error_t app_canopen_init(void)
                         (uint8_t *)&m_node[i].torque_act,    2U, true, true);
         if (err != CO_ERROR_NONE) { return err; }
 
-        /* RPDO comm + mapping.  Instance i uses rpdo_num = i*2 and i*2+1. */
+        /* RPDO iletisim + haritalama. Ornek i, rpdo_num = i*2 ve i*2+1 kullanir. */
         const uint8_t  rn0      = (uint8_t)(i * 2U);
         const uint8_t  rn1      = (uint8_t)(i * 2U + 1U);
         const uint32_t rcob0    = 0x180UL + cia402_nodes[i].node_id;
@@ -1091,7 +1093,7 @@ co_error_t app_canopen_init(void)
         if (co_od_write(&canopen_node, 0x1600U + rn1, 0x02U, (const uint8_t *)&r2m2, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
         if (co_od_write(&canopen_node, 0x1600U + rn1, 0x00U, &two,  1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-        /* TPDO comm + mapping.  Instance i uses tpdo_num = i*2 only. */
+        /* TPDO iletisim + haritalama. Ornek i yalnizca tpdo_num = i*2 kullanir. */
         const uint8_t  tn0   = (uint8_t)(i * 2U);
         const uint32_t tcob0 = 0x200UL + cia402_nodes[i].node_id;
         const uint8_t  tev   = 0xFFU;
@@ -1116,7 +1118,7 @@ co_error_t app_canopen_init(void)
     co_set_rpdo_frame_hook(&canopen_node, on_rpdo_frame, NULL);
     co_set_hb_event_hook(&canopen_node,  on_hb_event,   NULL);
 
-    /* SYNC producer: master generates COB-ID 0x080 every 1 ms */
+    /* SYNC ureticisi: master her 1 ms'de COB-ID 0x080 uretir */
     const uint32_t sync_cob_id   = 0x40000080UL;
     const uint32_t sync_cycle_us = SYNC_PERIOD_US;
     if (co_od_write(&canopen_node, 0x1005U, 0x00U,
@@ -1124,7 +1126,7 @@ co_error_t app_canopen_init(void)
     if (co_od_write(&canopen_node, 0x1006U, 0x00U,
                     (const uint8_t *)&sync_cycle_us, 4U) != 0U) { return CO_ERROR_INVALID_ARGS; }
 
-    /* Heartbeat consumer: one sub-index per slave instance */
+    /* Kalp atisi tuketicisi: kole ornegi basina bir alt-indeks */
     const uint8_t hb_count = cia402_node_count;
     if (co_od_write(&canopen_node, 0x1016U, 0x00U,
                     &hb_count, 1U) != 0U) { return CO_ERROR_INVALID_ARGS; }
@@ -1138,11 +1140,11 @@ co_error_t app_canopen_init(void)
     return CO_ERROR_NONE;
 }
 
-/* ── FDCAN RX interrupt ──────────────────────────────────────────────────── */
+/* ── FDCAN RX kesmesi ────────────────────────────────────────────────────── */
 
-/* Threading: FDCAN RX FIFO0 ISR only.  Invoked by HAL from interrupt
- * context; do not call from task code.  Drains the FDCAN FIFO into the SPSC
- * ring buffer consumed by app_canopen_loop(). */
+/* Is parcacigi: yalnizca FDCAN RX FIFO0 ISR. HAL tarafindan kesme baglamindan
+ * cagrilir; gorev kodundan cagirmayin. FDCAN FIFO'sunu app_canopen_loop()
+ * tarafindan tuketilen SPSC halka tamponuna bosaltir. */
 void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
 {
     (void)RxFifo0ITs;
@@ -1151,22 +1153,22 @@ void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
     }
 }
 
-/* ── Main loop ───────────────────────────────────────────────────────────── */
-/* Threading: main-loop / single task context only.  Not reentrant.  Consumes
- * the SPSC ring filled by HAL_FDCAN_RxFifo0Callback() and owns every
- * m_node[] mutation outside of the ISR heartbeat-timestamp fast path; must
- * therefore be the sole context driving the CiA 402 state machine. */
+/* ── Ana dongu ───────────────────────────────────────────────────────────── */
+/* Is parcacigi: yalnizca ana dongu / tek gorev baglami. Yeniden girisli degil.
+ * HAL_FDCAN_RxFifo0Callback() tarafindan doldurulan SPSC halkasini tuketir ve
+ * ISR kalp atisi zaman damgasi hizli yolu disindaki her m_node[] mutasyonuna
+ * sahiptir; dolayisiyla CiA 402 durum makinesini suren tek baglam olmalidir. */
 void app_canopen_loop(void)
 {
-	/* 1. Deliver queued frames (heartbeat timestamps already updated by ISR). */
+	/* 1. Kuyruklanmis cerceveleri ilet (kalp atisi zaman damgalari ISR tarafindan zaten guncellendi). */
 	co_stm32_drain_rx(&canopen_node, &can_ctx);
 
-	/* 2. Self-promote master to OPERATIONAL once it reaches PRE_OPERATIONAL. */
+	/* 2. Master PRE_OPERATIONAL'a ulastiginda kendisini OPERATIONAL'a yukselt. */
 	if (canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
 		co_nmt_set_state(&canopen_node, CO_NMT_OPERATIONAL);
 	}
 
-	/* 3. Per-instance startup: SDO config → NMT Start. */
+	/* 3. Ornek basina baslangic: SDO yapilandirma → NMT Baslatma. */
 	if (canopen_node.nmt_state == CO_NMT_OPERATIONAL) {
 		for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 			if (!m_node[i].master_started && sdo_cfg_run(i)) {
@@ -1177,14 +1179,13 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 4. Tick the CiA 402 enable sequence for every started CiA 402 instance.
-	 *    on_rpdo_frame() also invokes this on RPDO1 receipt for fast response,
-	 *    but driving it from the main loop guarantees forward progress and
-	 *    timeout handling even if RPDO1 frames are missed (e.g. drive slow to
-	 *    leave SOD).  The state machine is idempotent — repeated calls with
-	 *    the same statusword and state are safe.  Non-CiA-402 instances are
-	 *    skipped here; their state machine, if any, is the application's
-	 *    responsibility. */
+	/* 4. Baslatilmis her CiA 402 ornegi icin CiA 402 etkinlestirme dizisini ilerlет.
+	 *    on_rpdo_frame() hizli yanit icin RPDO1 alindiginda da bunu cagirir;
+	 *    ancak ana donguden surmek, RPDO1 cerceveleri kacirilsa dahi (orn. surucu
+	 *    SOD'dan cikmakta yavas) ilerlemeyi ve zaman asimi islemeyi garanti eder.
+	 *    Durum makinesi idempotent'tir — ayni statusword ve durumla tekrarlanan
+	 *    cagrilar guvenlidir. CiA-402 disi ornekler burada atlanir; varsa durum
+	 *    makineleri uygulamanin sorumlulugundadir. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if ((m_node[i].master_started                       ) &&
 		    ((cia402_nodes[i].driver_type == DRIVER_ZEROERR) ||
@@ -1193,8 +1194,9 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 5. RPDO watchdog: if RUNNING but no RPDO1 for CIA402_RPDO_WATCHDOG_MS,
-	 *    send Quick Stop; drive's own event timer provides redundant stop. */
+	/* 5. RPDO izleme: RUNNING durumunda ancak CIA402_RPDO_WATCHDOG_MS sure
+	 *    RPDO1 alinmadiysa Quick Stop gonder; surucunun kendi olay zamanlayicisi
+	 *    yedek durdurma saglar. */
 	const uint32_t now = now_ms();
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if (m_node[i].master_started &&
@@ -1207,10 +1209,10 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 5b. PRE_OP debounce.  Confirmed slave drop (PRE_OP held past the
-	 *     debounce window) → tear down state and replay the SDO config.
-	 *     Transient drops that resolve back to OP inside the window are
-	 *     cleared by on_slave_nmt_change and never reach this branch. */
+	/* 5b. PRE_OP kararli hâle getirme. Onaylanan kole dususu (PRE_OP pencereyi
+	 *     asti) → durumu yik ve SDO yapilandirmasini yeniden oynat.
+	 *     Pencere icinde OP'ye geri donen gecici dususler on_slave_nmt_change
+	 *     tarafindan temizlenir ve bu dala hic ulasmaz. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		if (m_node[i].pre_op_pending &&
 			(now - m_node[i].pre_op_entry_ms) >= NMT_PREOP_DEBOUNCE_MS) {
@@ -1220,37 +1222,37 @@ void app_canopen_loop(void)
 		}
 	}
 
-	/* 6. Drain runtime SDO write queue for each instance. */
+	/* 6. Her ornek icin calisma zamani SDO yazma kuyrugunu bosalt. */
 	for (uint8_t i = 0U; i < cia402_node_count; ++i) {
 		sdo_rt_run(i);
 	}
 }
 
-/* Invocation policy — read this before wiring the call site:
+/* Cagirma politikasi — cagri noktasini baglamadan once bunu okuyun:
  *
- *   • MUST be called every SYNC_PERIOD_US (1 ms by default).  This is the
- *     transmit half of the stack — it generates the SYNC frame, latches
- *     g_target_rpm[] into the OD, and emits the synchronous TPDOs that
- *     carry controlword + target velocity to every drive.  Skipping a tick
- *     means the slaves see a stale CW/target for that cycle; sustained
- *     skipping trips the master's own HB producer and the drive-side RPDO
- *     event timer, which faults the drives with "communication lost".
+ *   • Her SYNC_PERIOD_US'da (varsayilan olarak 1 ms) cagrilmalidir. Bu,
+ *     stack'in iletim yarisidir — SYNC cercevesini uretir, g_target_rpm[]'yi
+ *     OD'ye kilitler ve her surucuye controlword + hedef hizi tasiyan eszamanli
+ *     TPDO'lari yayar. Bir tick atlamak kolelerin o dongu icin eski CW/hedef
+ *     gormesi anlamina gelir; surekli atlama master'in kendi HB ureticisini ve
+ *     surucu tarafindaki RPDO olay zamanlayicisini tetikler ve suruculeri
+ *     "iletisim kesildi" hatasiyla hata durumuna sokar.
  *
- *   • MUST run from a high-priority context — a hardware timer ISR or the
- *     top-priority RTOS task.  Co-locating it with app_canopen_loop() in a
- *     low-priority main loop is a foot-gun: any longer-running task
- *     (logging, flash write, SDO upload from a slower bus) will jitter the
- *     SYNC period and reproduce the symptoms above.
+ *   • Yuksek oncelikli bir baglamdan calismalidir — bir donanim zamanlayicisi
+ *     ISR'si veya en yuksek oncelikli RTOS gorevi. app_canopen_loop() ile dusuk
+ *     oncelikli bir ana dongude birlestirmek tehlikelidir: herhangi bir uzun
+ *     suren gorev (gunlukleme, flash yazma, yavas bir veri yolundan SDO yukleme)
+ *     SYNC periyodunu titretir ve yukaridaki belirtileri yeniden uretir.
  *
- *   • MUST share its execution context with app_canopen_loop() — both
- *     touch m_node[] and the canopen_node SDO/PDO state without locks, so
- *     they cannot preempt each other.  In practice this means: either run
- *     both from the same timer/task, or guard m_node[] and canopen_node
- *     with a critical section / mutex if they live on different priorities.
+ *   • app_canopen_loop() ile yurutme baglamini paylasmalidir — her ikisi de
+ *     kilit olmadan m_node[] ve canopen_node SDO/PDO durumuna erisir; dolayisiyla
+ *     birbirini onceliklendiremezler. Pratikte bu su anlama gelir: her ikisini
+ *     de ayni zamanlayici/gorevden calistirin ya da farkli onceliklerde
+ *     yasiyorlarsa m_node[] ve canopen_node'u kritik bolum / mutex ile koruyun.
  */
 void co_transmit_process(void)
 {
-    /* 5. Forward application target velocities on each SYNC tick. */
+    /* 5. Her SYNC tick'inde uygulama hedef hizlarini ilet. */
     if (canopen_node.sync_event_pending) {
         canopen_node.sync_event_pending = false;
         for (uint8_t i = 0U; i < cia402_node_count; ++i) {
@@ -1258,6 +1260,6 @@ void co_transmit_process(void)
         }
     }
 
-    /* Run CANopen stack: SYNC, TPDOs, heartbeat, HB consumer timeout. */
+    /* CANopen stack'i calistir: SYNC, TPDO'lar, kalp atisi, HB tuketici zaman asimi. */
 	co_process(&canopen_node);
 }

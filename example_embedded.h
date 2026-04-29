@@ -4,58 +4,56 @@
 #include "canopen.h"
 #include "app_config.h"
 
-/* ── Driver type ─────────────────────────────────────────────────────────── */
-/* Selects which init recipe app_canopen_init() applies to a given node:
- *   DRIVER_ZEROERR — CiA 402 Profile Velocity (ZeroErr eRob actuator).
- *                    Full PDO mapping + profile-ramp SDO + heartbeat.
- *   DRIVER_DELTA   — CiA 402 Profile Velocity (Delta ASDA servo).
- *                    Same PDO layout; counts_per_rpm_s calculated differently.
- *   DRIVER_WAT     — non-CiA-402 drive sharing the same bus.  Master writes
- *                    only the bare-minimum heartbeat config; PDO mapping and
- *                    the CiA 402 state machine are skipped. */
+/* ── Surucu tipi ─────────────────────────────────────────────────────────── */
+/* app_canopen_init() fonksiyonunun bir dugume hangi baslatma tarifini uygulayacagini secer:
+ *   DRIVER_ZEROERR — CiA 402 Profil Hiz modu (ZeroErr eRob aktuator).
+ *                    Tam PDO haritalama + profil rampasi SDO + kalp atisi.
+ *   DRIVER_DELTA   — CiA 402 Profil Hiz modu (Delta ASDA servo).
+ *                    Ayni PDO duzeni; counts_per_rpm_s farkli hesaplanir.
+ *   DRIVER_WAT     — Ayni veri yolunu paylasan CiA-402 disi surucu. Master yalnizca
+ *                    asgari kalp atisi yapilandirmasini yazar; PDO haritalama ve
+ *                    CiA 402 durum makinesi atlanir. */
 typedef enum {
     DRIVER_ZEROERR,
     DRIVER_DELTA,
 	DRIVER_WAT
 } driver_type_t;
 
-/* ── Per-node configuration ──────────────────────────────────────────────── */
+/* ── Dugum basina yapilandirma ───────────────────────────────────────────── */
 typedef struct {
-    uint8_t       node_id;             /* CANopen node id (1..127) */
-    uint32_t      default_accel;       /* [counts/s²] written once to 0x6083 at startup;
-                                          updated at runtime via cia402_set_accel(). */
-    uint32_t      default_decel;       /* [counts/s²] written once to 0x6084 at startup;
-                                          updated at runtime via cia402_set_accel(). */
-    uint32_t      encoder_counts_per_rev; /* encoder counts per motor revolution.
-                                             Supply the raw CPR value, e.g.:
-                                               524288   — ZeroErr 19-bit absolute
-                                               16777216 — Delta ASDA-B3 24-bit optical
-                                               131072   — Delta ASDA-B3 17-bit magnetic
-                                               10000    — 2500-PPR incremental ×4
-                                             For DRIVER_DELTA, velocity commands
-                                             use 0.1-RPM units (not counts/s) so
-                                             this field affects only position
-                                             reporting in cia402_get_pos_vel(). */
-    uint16_t      reductor_ratio;      /* gearbox ratio: motor revolutions per
-                                          one output revolution.  Use 1 for a
-                                          direct-drive actuator.  Folded into the
-                                          cached counts_per_rpm_s so target/RPM
-                                          values supplied to the public API are
-                                          interpreted on the OUTPUT shaft, while
-                                          the encoder counts on the motor side. */
-    driver_type_t driver_type;         /* selects the init recipe (see above) */
+    uint8_t       node_id;             /* CANopen dugum kimligi (1..127) */
+    uint32_t      default_accel;       /* [count/s²] baslangicta 0x6083'e bir kez yazilir;
+                                          calisma zamaninda cia402_set_accel() ile guncellenir. */
+    uint32_t      default_decel;       /* [count/s²] baslangicta 0x6084'e bir kez yazilir;
+                                          calisma zamaninda cia402_set_accel() ile guncellenir. */
+    uint32_t      encoder_counts_per_rev; /* Motor devri basina enkoder count sayisi (CPR).
+                                             Ham CPR degerini girin, orn.:
+                                               524288   — ZeroErr 19-bit mutlak enkoder
+                                               16777216 — Delta ASDA-B3 24-bit optik enkoder
+                                               131072   — Delta ASDA-B3 17-bit manyetik enkoder
+                                               10000    — 2500-PPR artimli ×4
+                                             DRIVER_DELTA icin hiz komutlari count/s degil
+                                             0.1-RPM birimi kullanir; bu alan yalnizca
+                                             cia402_get_pos_vel() icindeki konum
+                                             raporlamasini etkiler. */
+    uint16_t      reductor_ratio;      /* Reduktor orani: cikis mili basina motor devri sayisi.
+                                          Dogrudan tahrik icin 1 kullanin.
+                                          counts_per_rpm_s onbellegine katlanir; boylece
+                                          genel API'ye saglanan hedef/RPM degerleri CIKIS
+                                          milinde yorumlanirken enkoder motor tarafinda sayar. */
+    driver_type_t driver_type;         /* baslatma tarifini secer (yukariya bakin) */
 } cia402_cfg_t;
 
-/* Compile-time upper bound on the number of slave instances.  Storage in
- * example_embedded.c (m_node[], m_sdo_tbl[], g_*[], etc.) is sized to this
- * cap; cia402_node_count <= CIA402_MAX_NODES is checked at startup.  Bump
- * this and CO_MAX_RPDO / CO_MAX_TPDO (canopen.h) together if more drives
- * are needed. */
+/* Ornek sayisinin derleme zamani ust siniri. example_embedded.c icindeki
+ * (m_node[], m_sdo_tbl[], g_*[], vb.) depolama bu sinira gore boyutlandirilir;
+ * baslangicta cia402_node_count <= CIA402_MAX_NODES kontrol edilir.
+ * Daha fazla surucu gerekiyorsa bunu ve canopen.h icindeki
+ * CO_MAX_RPDO / CO_MAX_TPDO degerlerini birlikte artirin. */
 #ifndef CIA402_MAX_NODES
 #warning "CIA402_MAX_NODES is not defined"
 #endif
 
-/* Configuration table — define once in your application, e.g.:
+/* Yapilandirma tablosu — uygulamanizda bir kez tanimlayin, orn.:
  *
  *   const cia402_cfg_t cia402_nodes[] = {
  *       { 0x05U, 50000U, 200000U,  524288U, 1U, DRIVER_ZEROERR },  /* ZeroErr 19-bit */
@@ -64,13 +62,12 @@ typedef struct {
  *   const uint8_t cia402_node_count =
  *       (uint8_t)(sizeof(cia402_nodes) / sizeof(cia402_nodes[0]));
  *
- * example_embedded.c only references these by extern, so the application
- * can supply the table from any translation unit without modifying the
- * stack source. */
+ * example_embedded.c bunlara yalnizca extern ile basvurur; dolayisiyla uygulama
+ * tabloyu stack kaynagini degistirmeden herhangi bir ceviri biriminden saglayabilir. */
 extern const cia402_cfg_t cia402_nodes[];
 extern const uint8_t      cia402_node_count;
 
-/* ── Public API ──────────────────────────────────────────────────────────── */
+/* ── Genel API ───────────────────────────────────────────────────────────── */
 co_error_t app_canopen_init(void);
 void       app_canopen_loop(void);
 void       co_transmit_process(void);
