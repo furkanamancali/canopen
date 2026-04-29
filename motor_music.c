@@ -34,12 +34,13 @@ static void load_note(motor_music_t *p)
 
 void motor_music_start(motor_music_t *p,
                        const mus_note_t *notes, uint16_t len,
-                       uint16_t node_id, float ampl_rpm, bool loop)
+                       uint16_t node_id, float ampl_rpm, uint16_t gap_ms, bool loop)
 {
     p->notes    = notes;
     p->len      = len;
     p->node_id  = node_id;
     p->ampl_rpm = ampl_rpm;
+    p->gap_ms   = gap_ms;
     p->loop     = loop;
 
     p->note_idx    = 0U;
@@ -66,8 +67,14 @@ void motor_music_tick(motor_music_t *p)
 
     const mus_note_t *note = &p->notes[p->note_idx];
 
-    /* Osilayon guncelleme -------------------------------------------------- */
-    if (note->freq_hz == MUS_REST || note->freq_hz == 0U) {
+    /* Gap bolgesi: notanin sonundaki son gap_ms milisaniye sessizdir.
+     * Bu sure icerisinde hiz 0'a cekilir; surucu manyetik titresimi keser
+     * ve bir sonraki nota baslangicinda tiz bir gecis olusturur. Boylece
+     * arka arkaya gelen ayni frekanstaki notalar da ayirt edilebilir hale gelir.
+     * Nota suresi gap_ms'den kisa ya da esitse gap atlanir (sessizlik notasi gibi davranir). */
+    const bool in_gap = (p->gap_ms > 0U) && (p->note_ms_left <= (uint32_t)p->gap_ms);
+
+    if (in_gap || note->freq_hz == MUS_REST || note->freq_hz == 0U) {
         cia402_set_target_rpm(p->node_id, 0.0f);
     } else {
         /* Bresenham: yarim periyot asimini kontrol et (us cinsinden). */

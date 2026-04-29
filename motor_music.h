@@ -91,7 +91,10 @@ typedef struct {
     const mus_note_t *notes;
     uint16_t          len;
     uint16_t          node_id;    /* RPM hedefinin ayarlanacagi CANopen dugum kimligi */
-    float             ampl_rpm;   /* +/- titresim genliği (RPM); 20–60 onerilir      */
+    float             ampl_rpm;   /* +/- titresim genligi (RPM); 100-200 onerilir    */
+    uint16_t          gap_ms;     /* her notanin sonundaki quick-stop sessizligi (ms).
+                                     15-30 ms nota ayrimini belirginlestirir; nota
+                                     suresi gap_ms'den kisa ise sessizlik atlanir.   */
     bool              loop;       /* true ise melodi bittikten sonra basa doner       */
 
     /* Calisma zamani durumu — motor_music_start() ile sifirlaniir */
@@ -108,16 +111,19 @@ typedef struct {
  * Oynatmayi baslatir.  Daha once durumda olan bir oynaticiyi yeniden
  * baslatir (loop = false iken bitmis bile olsa).
  *
- * @param p         Kullanici tarafindan ayrilmis ve sifirlanmis motor_music_t
+ * @param p         Kullanici tarafindan ayrilmis motor_music_t
  * @param notes     Nota dizisi (ROM veya RAM'de)
- * @param len       Dizi uzunlugu (not sayisi)
+ * @param len       Dizi uzunlugu (nota sayisi)
  * @param node_id   Melodinin gonderilecegi CANopen dugum kimligi
- * @param ampl_rpm  Titresim genliği; surucu akiminı sinirlandirmak icin kucuk tutun
+ * @param ampl_rpm  Titresim genligi; buyuk deger = daha yuksek akim = daha yuksek ses
+ *                  100–200 RPM onerilir; surucu akim siniri asiliyor ise azaltin
+ * @param gap_ms    Her notanin sonuna eklenen quick-stop sessizligi (ms).
+ *                  15–30 ms nota ayrimi belirginlestirir; 0 devre disi birakar
  * @param loop      true → melodi bitince basa don
  */
 void motor_music_start(motor_music_t *p,
                        const mus_note_t *notes, uint16_t len,
-                       uint16_t node_id, float ampl_rpm, bool loop);
+                       uint16_t node_id, float ampl_rpm, uint16_t gap_ms, bool loop);
 
 /**
  * Her 1 ms'de bir cagrilmasi gereken ana tick fonksiyonu.

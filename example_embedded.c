@@ -306,8 +306,11 @@ static motor_music_t s_music;
  * master_started her false→true gecisinde melodiyi bir kez baslatir.
  * Kalp atisi kaybi sonrasi yeniden baglantida melodi yeniden oynar. */
 #define MUSIC_NODE_ID     0x01U
-#define MUSIC_AMPL_RPM    35.0f   /* titresim genligi; surucu akim sinirini
-                                     asmaması icin 20-60 RPM arasinda tutun */
+#define MUSIC_AMPL_RPM   200.0f   /* titresim genligi; buyuk deger = daha buyuk
+                                     akim komutu = daha yuksek ses seviyesi.
+                                     Surucu asiri akim alarmi verirse azaltin. */
+#define MUSIC_GAP_MS      20U     /* notalar arasi quick-stop suresi (ms);
+                                     nota ayrimini belirginlestirir           */
 static bool s_music_node_ready;
 
 /* ── CiA 402 statusword yardimcilari ────────────────────────────────────── */
@@ -1295,7 +1298,7 @@ void motor_music_play_ceddin_deden(uint16_t node_id, float ampl_rpm, bool loop)
 {
     motor_music_start(&s_music,
                       g_ceddin_deden, g_ceddin_deden_len,
-                      node_id, ampl_rpm, loop);
+                      node_id, ampl_rpm, MUSIC_GAP_MS, loop);
 }
 
 void motor_music_stop_melody(void)
