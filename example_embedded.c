@@ -1,12 +1,12 @@
 /*
- * CANopen Master — STM32H7 FDCAN (cok ornekli)
+ * CANopen Master — cok ornekli (MCU-bagimsiz; bkz. canopen_port.h)
  *
  * Bir veya daha fazla CiA 402 Profil Hiz aktuatorunu (ve DRIVER_WAT isaretli
  * CiA-402 disi suruculeri taslak olarak) kontrol eder.
  *
  * Topoloji
  * ────────
- *   STM32H7 (master, dugum 0x7F) ←──CAN──→ kole[0] (dugum 0x05)
+ *   MCU    (master, dugum 0x7F) ←──CAN──→ kole[0] (dugum 0x05)
  *                                            kole[1] (dugum 0x06)  ← istege bagli
  *                                            ...
  *
@@ -30,16 +30,7 @@
 #include "canopen.h"
 #include "cia402_app.h"
 #include "utils/utils.h"
-
-#if defined(STM32H723xx)
-#  include "canopen_stm32h7_fdcan.h"
-   extern FDCAN_HandleTypeDef hfdcan1;
-#elif defined(STM32F423xx)
-#  include "canopen_stm32f4_can.h"
-   extern CAN_HandleTypeDef hcan1;
-#else
-#  error "Desteklenmeyen MCU: STM32H723xx veya STM32F423xx tanimlanmali"
-#endif
+#include "canopen_port.h"
 
 /* ── Master yapilandirmasi ───────────────────────────────────────────────── */
 #define MASTER_NODE_ID              0x7FU
@@ -86,12 +77,8 @@ _Static_assert(CIA402_MAX_NODES * 2U <= CO_MAX_RPDO,
     "CIA402_MAX_NODES too high — raise CO_MAX_RPDO and CO_MAX_TPDO in canopen.h");
 
 /* ── CANopen stack ornegi ────────────────────────────────────────────────── */
-static co_node_t canopen_node;
-#if defined(STM32H723xx)
-static co_stm32_ctx_t    can_ctx;
-#elif defined(STM32F423xx)
-static co_stm32f4_ctx_t  can_ctx;
-#endif
+static co_node_t      canopen_node;
+static co_port_ctx_t  can_ctx;
 
 /* ── Ornek basina uzak SDO yapilandirma tablolari ────────────────────────── */
 typedef struct {
@@ -994,13 +981,7 @@ co_error_t app_canopen_init(void)
         return CO_ERROR_INVALID_ARGS;
     }
 
-#if defined(STM32H723xx)
-    co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx,
-                    MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
-#elif defined(STM32F423xx)
-    co_stm32f4_attach(&canopen_node, &hcan1, &can_ctx,
-                      MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
-#endif
+    co_port_attach(&canopen_node, &can_ctx, MASTER_NODE_ID, MASTER_HEARTBEAT_MS);
     canopen_node.iface.on_reset_communication = on_reset_communication;
     canopen_node.iface.on_rx_frame            = on_rx_frame;
 
@@ -1161,22 +1142,7 @@ co_error_t app_canopen_init(void)
 /* Is parcacigi: yalnizca RX FIFO0 ISR. HAL tarafindan kesme baglamindan
  * cagrilir; gorev kodundan cagirmayin. CAN FIFO'sunu app_canopen_loop()
  * tarafindan tuketilen SPSC halka tamponuna bosaltir. */
-#if defined(STM32H723xx)
-void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
-{
-    (void)RxFifo0ITs;
-    if (hfdcan == &hfdcan1) {
-        co_stm32_rx_isr(&canopen_node, &can_ctx);
-    }
-}
-#elif defined(STM32F423xx)
-void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
-{
-    if (hcan == &hcan1) {
-        co_stm32f4_rx_isr(&canopen_node, &can_ctx);
-    }
-}
-#endif
+CO_PORT_DEFINE_RX_ISR(canopen_node, can_ctx)
 
 /* ── Ana dongu ───────────────────────────────────────────────────────────── */
 /* Is parcacigi: yalnizca ana dongu / tek gorev baglami. Yeniden girisli degil.
@@ -1186,11 +1152,7 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 void app_canopen_loop(void)
 {
 	/* 1. Kuyruklanmis cerceveleri ilet (kalp atisi zaman damgalari ISR tarafindan zaten guncellendi). */
-#if defined(STM32H723xx)
-	co_stm32_drain_rx(&canopen_node, &can_ctx);
-#elif defined(STM32F423xx)
-	co_stm32f4_drain_rx(&canopen_node, &can_ctx);
-#endif
+	co_port_drain_rx(&canopen_node, &can_ctx);
 
 	/* 2. Master PRE_OPERATIONAL'a ulastiginda kendisini OPERATIONAL'a yukselt. */
 	if (canopen_node.nmt_state == CO_NMT_PRE_OPERATIONAL) {
