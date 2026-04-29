@@ -31,6 +31,7 @@
 #include "cia402_app.h"
 #include "utils/utils.h"
 #include "canopen_port.h"
+#include "motor_music.h"
 
 /* ── Master yapilandirmasi ───────────────────────────────────────────────── */
 #define MASTER_NODE_ID              0x7FU
@@ -294,6 +295,12 @@ volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
 
 /* Herhangi bir gorev baglamindan ayarlanan ornek basina hedef RPM. */
 volatile float32_t g_target_rpm[CIA402_MAX_NODES];
+
+/* Motor muzik oynatici — tek ornek, co_transmit_process() icinden surulur.
+ * motor_music_start() ile yapilandirilir; node_id calacak surucu dugumunu secer.
+ * Melodi calarken cia402_set_target_rpm() ile hedef hiz yazilir; dolayisiyla
+ * normal surucu kontrolu (cia402_set_target_rpm / g_target_rpm) gecersiz kalir. */
+static motor_music_t s_music;
 
 /* ── CiA 402 statusword yardimcilari ────────────────────────────────────── */
 #define SW_RTSO  0x0001U
@@ -1243,7 +1250,12 @@ void app_canopen_loop(void)
  */
 void co_transmit_process(void)
 {
-    /* 5. Her SYNC tick'inde uygulama hedef hizlarini ilet. */
+    /* Muzik oynaticisi aktifse g_target_rpm[]'yi sync olayindan ONCE guncelle;
+     * boylece ayni TPDO'ya dogru RPM hedefi yuklenir.
+     * Oynatici devre disiyse bu cagri hicbir sey yapmaz (is_playing == false). */
+    motor_music_tick(&s_music);
+
+    /* Her SYNC tick'inde uygulama hedef hizlarini ilet. */
     if (canopen_node.sync_event_pending) {
         canopen_node.sync_event_pending = false;
         for (uint8_t i = 0U; i < cia402_node_count; ++i) {
@@ -1252,5 +1264,24 @@ void co_transmit_process(void)
     }
 
     /* CANopen stack'i calistir: SYNC, TPDO'lar, kalp atisi, HB tuketici zaman asimi. */
-	co_process(&canopen_node);
+    co_process(&canopen_node);
+}
+
+/* ── Motor muzik yardimci sarmalayicilari ────────────────────────────────── */
+
+void motor_music_play_ceddin_deden(uint16_t node_id, float ampl_rpm, bool loop)
+{
+    motor_music_start(&s_music,
+                      g_ceddin_deden, g_ceddin_deden_len,
+                      node_id, ampl_rpm, loop);
+}
+
+void motor_music_stop_melody(void)
+{
+    motor_music_stop(&s_music);
+}
+
+bool motor_music_melody_playing(void)
+{
+    return motor_music_is_playing(&s_music);
 }

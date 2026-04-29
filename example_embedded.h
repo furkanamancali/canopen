@@ -76,4 +76,28 @@ void cia402_set_target_rpm(uint16_t node_id, float target_rpm);
 void cia402_set_accel(uint16_t node_id, uint32_t accel_counts_s2, uint32_t decel_counts_s2);
 void cia402_get_pos_vel(uint16_t node_id, float *pos_deg, float *vel_rpm, float *torque_pct);
 
+/* ── Motor muzik API ─────────────────────────────────────────────────────── */
+/* Ceddin Deden marsi secilen dugumde calar.
+ *
+ * Cagri oncesi:
+ *   1. app_canopen_init() tamamlanmis ve surucu OPERATIONAL olmalidir.
+ *   2. Titresim net olarak duyulabilmesi icin surucu ivme/yavaslamasi
+ *      mumkun olan en yuksek degere ayarlanmalidir; orn.:
+ *        cia402_set_accel(node_id, 10000000U, 10000000U);
+ *   3. Muzik bittikten sonra normal ivme/yavaslamasi geri yukleyin ve
+ *      cia402_set_target_rpm(node_id, 0.0f) ile hizi sifirlayin.
+ *
+ * @param node_id   Melodinin gonderilecegi CANopen dugum kimligi
+ * @param ampl_rpm  Titresim genliği (RPM); 20–60 RPM onerilir;
+ *                  cok buyuk degerler surucu akim sinirini tetikleyebilir.
+ * @param loop      true → melodi bitince basa don; false → bir kez cal
+ */
+void motor_music_play_ceddin_deden(uint16_t node_id, float ampl_rpm, bool loop);
+
+/* Suregulen melodiyi durdurur ve surucu hizini 0 RPM'e ayarlar. */
+void motor_music_stop_melody(void);
+
+/* Melodi hala caliyorsa true doner. */
+bool motor_music_melody_playing(void);
+
 #endif /* __CIA402_APP_H__ */
