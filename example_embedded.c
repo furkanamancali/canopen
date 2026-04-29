@@ -302,6 +302,14 @@ volatile float32_t g_target_rpm[CIA402_MAX_NODES];
  * normal surucu kontrolu (cia402_set_target_rpm / g_target_rpm) gecersiz kalir. */
 static motor_music_t s_music;
 
+/* Dugum 0x01 icin muzik tetikleyici bayragi.
+ * master_started her false→true gecisinde melodiyi bir kez baslatir.
+ * Kalp atisi kaybi sonrasi yeniden baglantida melodi yeniden oynar. */
+#define MUSIC_NODE_ID     0x01U
+#define MUSIC_AMPL_RPM    35.0f   /* titresim genligi; surucu akim sinirini
+                                     asmaması icin 20-60 RPM arasinda tutun */
+static bool s_music_node_ready;
+
 /* ── CiA 402 statusword yardimcilari ────────────────────────────────────── */
 #define SW_RTSO  0x0001U
 #define SW_SO    0x0002U
@@ -909,6 +917,10 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
         m_node[i].sdo_cfg_step   = 0U;
         m_node[i].master_started = false;
         m_node[i].hb_lost        = true;
+        if (cia402_nodes[i].node_id == MUSIC_NODE_ID) {
+            motor_music_stop(&s_music);
+            s_music_node_ready = false;
+        }
     } else {
         if (!m_node[i].hb_lost) { return; }
         m_node[i].hb_lost        = false;
@@ -1173,6 +1185,16 @@ void app_canopen_loop(void)
 				(void)co_nmt_master_send(&canopen_node, 0x01U,
 										cia402_nodes[i].node_id);
 				m_node[i].master_started = true;
+
+				/* Dugum 0x01 hazir oldugunda melodiyi baslat.
+				 * default_accel/decel zaten SDO yapilandirmasi sirasinda
+				 * 10 000 000 count/s^2'ye ayarlanmistir (app_node_config.c). */
+				if (cia402_nodes[i].node_id == MUSIC_NODE_ID) {
+					s_music_node_ready = true;
+					motor_music_play_ceddin_deden(MUSIC_NODE_ID,
+					                              MUSIC_AMPL_RPM,
+					                              false);
+				}
 			}
 		}
 	}
