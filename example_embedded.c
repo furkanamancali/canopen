@@ -130,12 +130,7 @@ static uint8_t   m_node_bus[CIA402_MAX_NODES];   /* global kole i → bus indeks
 static uint8_t   m_node_local[CIA402_MAX_NODES]; /* global kole i → bus icindeki yerel indeks */
 
 /* ── Ornek basina uzak SDO yapilandirma tablolari ────────────────────────── */
-typedef struct {
-    uint16_t index;
-    uint8_t  subindex;
-    uint32_t value;
-    uint8_t  size;
-} sdo_entry_t;
+/* sdo_entry_t tanimlamasi example_embedded.h'e tasindi. */
 
 /* Ornek basina baslangic SDO tablosu. SDO_STEPS_MAX depolama boyutudur;
  * gercek giris sayisi driver_type'a gore degisir ve sdo_cfg_run()'in
@@ -663,7 +658,7 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
                                             | ((uint32_t)frame->data[5] << 8)
                                             | ((uint32_t)frame->data[6] << 16)
                                             | ((uint32_t)frame->data[7] << 24);
-                        const sdo_entry_t *w = &m_sdo_tbl[idx][m_node[idx].sdo_cfg_step];
+                        const sdo_entry_t *w = sdo_cfg_entry((uint8_t)idx, m_node[idx].sdo_cfg_step);
                         co_diag_info_t d;
                         d.event                    = CO_DIAG_SDO_ABORT;
                         d.node_id                  = nid;
@@ -709,6 +704,24 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
     }
 }
 
+/* ── SDO yapilandirma yardimcilari ───────────────────────────────────────── */
+/* Yerlesik tablo (m_sdo_tbl) + uygulamanin ek tablosu (extra_sdo) birlesik
+ * bir sanal dizi olarak ele alinir; sdo_cfg_step bu sanal dizide ilerler.
+ * Bu sayede sdo_cfg_run() tek bir adim sayacini korur ve dal icermez. */
+
+static uint32_t sdo_cfg_total(uint8_t i)
+{
+    return (uint32_t)m_sdo_steps[i] + (uint32_t)cia402_nodes[i].extra_sdo_count;
+}
+
+static const sdo_entry_t *sdo_cfg_entry(uint8_t i, uint32_t step)
+{
+    if (step < (uint32_t)m_sdo_steps[i]) {
+        return &m_sdo_tbl[i][step];
+    }
+    return &cia402_nodes[i].extra_sdo[step - (uint32_t)m_sdo_steps[i]];
+}
+
 /* ── SDO yapilandirma durum makinesi (ornek basina) ──────────────────────── */
 static bool sdo_cfg_run(uint8_t i)
 {
@@ -741,7 +754,7 @@ static bool sdo_cfg_run(uint8_t i)
         if ((t - e->sdo_cfg_step_ms) < NMT_PREOP_DELAY_MS) { return false; }
         e->sdo_cfg_step_ms = t;
         e->sdo_cfg_state   = SDO_CFG_WAIT_RESPONSE;
-        const sdo_entry_t *w = &m_sdo_tbl[i][0];
+        const sdo_entry_t *w = sdo_cfg_entry(i, 0U);
         sdo_send(bidx, nid, w->index, w->subindex, w->value, w->size);
         return false;
     }
@@ -749,7 +762,7 @@ static bool sdo_cfg_run(uint8_t i)
     /* SDO_CFG_YANIT_BEKLE */
     if (!e->sdo_cfg_resp_ok) {
         if ((t - e->sdo_cfg_step_ms) >= SDO_TIMEOUT_MS) {
-            const sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
+            const sdo_entry_t *w = sdo_cfg_entry(i, e->sdo_cfg_step);
             co_diag_info_t d;
             d.event                     = CO_DIAG_SDO_TIMEOUT;
             d.node_id                   = cia402_nodes[i].node_id;
@@ -765,12 +778,12 @@ static bool sdo_cfg_run(uint8_t i)
 
     e->sdo_cfg_resp_ok = false;
     e->sdo_cfg_step++;
-    if (e->sdo_cfg_step >= m_sdo_steps[i]) {
+    if (e->sdo_cfg_step >= sdo_cfg_total(i)) {
         e->sdo_cfg_state = SDO_CFG_DONE;
         return true;
     }
     e->sdo_cfg_step_ms = t;
-    const sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
+    const sdo_entry_t *w = sdo_cfg_entry(i, e->sdo_cfg_step);
     sdo_send(bidx, nid, w->index, w->subindex, w->value, w->size);
     return false;
 }

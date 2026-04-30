@@ -120,6 +120,8 @@ Nodes sharing the same `handle` share one CAN bus and one master `co_node_t`. No
 | `encoder_counts_per_rev` | `uint32_t` | Raw encoder CPR (counts per motor revolution). Examples: 524 288 for ZeroErr 19-bit absolute, 16 777 216 for Delta ASDA-B3 24-bit optical |
 | `reductor_ratio` | `uint16_t` | Gearbox ratio (output-shaft revolutions per motor revolution). Use `1` for direct drive. Multiplied into the internal counts-per-RPM constant so all RPM values in the API refer to the **output shaft** |
 | `driver_type` | `driver_type_t` | Selects the startup recipe — see below |
+| `extra_sdo` | `const sdo_entry_t *` | Pointer to an application-defined table of additional SDO writes executed **after** the driver's built-in init sequence. `NULL` = no extras |
+| `extra_sdo_count` | `uint8_t` | Number of entries in `extra_sdo`. `0` when `extra_sdo` is `NULL` |
 
 #### Driver types
 
@@ -418,6 +420,34 @@ When a slave is first detected or after heartbeat recovery, `sdo_cfg_run()` exec
 10. NMT Start (0x01)
 
 Any SDO abort or timeout fires `CO_DIAG_SDO_ABORT` / `CO_DIAG_SDO_TIMEOUT` and restarts the sequence from step 1.
+
+### Adding node-specific parameters via `extra_sdo`
+
+Provide a `const sdo_entry_t[]` table in your application and pass it through `cia402_cfg_t`. The driver appends these writes to its built-in sequence automatically — no driver source files need to be modified:
+
+```c
+#include "example_embedded.h"   // sdo_entry_t is declared here
+
+// Additional parameters for node 0x01 (ZeroErr) — homing + following error limit
+static const sdo_entry_t node01_params[] = {
+    { 0x6065U, 0x00U, 100000U, 4U },  // following error window
+    { 0x6066U, 0x00U,    500U, 2U },  // following error timeout [ms]
+    { 0x6098U, 0x00U,     35U, 1U },  // homing method
+    { 0x6099U, 0x01U,   5000U, 4U },  // homing fast approach speed
+    { 0x6099U, 0x02U,    500U, 4U },  // homing slow approach speed
+};
+#define NODE01_PARAMS_COUNT  ((uint8_t)(sizeof(node01_params) / sizeof(node01_params[0])))
+
+// Node with no extras (use NULL / 0)
+const cia402_cfg_t cia402_nodes[] = {
+    { 0x01U, &hfdcan1, 50000U, 200000U, 524288U, 1U, DRIVER_ZEROERR,
+      node01_params, NODE01_PARAMS_COUNT },
+    { 0x02U, &hfdcan1, 50000U, 200000U, 524288U, 1U, DRIVER_ZEROERR,
+      NULL, 0U },
+};
+```
+
+`sdo_entry_t.size` is the byte width of the value: `1` for `uint8_t`, `2` for `uint16_t`, `4` for `uint32_t`. Each entry is sent as an expedited SDO download with the same `SDO_TIMEOUT_MS` timeout as the built-in sequence.
 
 ---
 

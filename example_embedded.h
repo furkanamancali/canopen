@@ -5,6 +5,17 @@
 #include "canopen_port.h"
 #include "app_config.h"
 
+/* ── SDO giris tipi ──────────────────────────────────────────────────────── */
+/* Baslangic parametre tablolari ve calisma zamani SDO kuyruklari icin ortak tip.
+ * Uygulamanin cia402_cfg_t.extra_sdo alani araciligiyla dugum basina ek SDO
+ * yazmalarini tanimlamasi icin burada acikca tanimlanir. */
+typedef struct {
+    uint16_t index;
+    uint8_t  subindex;
+    uint32_t value;
+    uint8_t  size;    /* bayt: 1, 2, 3 veya 4 */
+} sdo_entry_t;
+
 /* ── Surucu tipi ─────────────────────────────────────────────────────────── */
 /* app_canopen_init() fonksiyonunun bir dugume hangi baslatma tarifini uygulayacagini secer:
  *   DRIVER_ZEROERR — CiA 402 Profil Hiz modu (ZeroErr eRob aktuator).
@@ -48,7 +59,22 @@ typedef struct {
                                           counts_per_rpm_s onbellegine katlanir; boylece
                                           genel API'ye saglanan hedef/RPM degerleri CIKIS
                                           milinde yorumlanirken enkoder motor tarafinda sayar. */
-    driver_type_t driver_type;         /* baslatma tarifini secer (yukariya bakin) */
+    driver_type_t    driver_type;       /* baslatma tarifini secer (yukariya bakin) */
+
+    /* Dugum basina ek baslangic SDO tablosu (istege bagli).
+     * Surucu, yerlesik PDO + rampa + kalp atisi dizisini tamamladiktan
+     * hemen sonra bu girisleri siraliyla yazar.  Ek giris yoksa NULL/0 kullanin.
+     *
+     * Ornek:
+     *   static const sdo_entry_t node5_extra[] = {
+     *       { 0x6098U, 0x00U,  35U, 1U },   // homing methodu
+     *       { 0x6099U, 0x01U, 500U, 4U },   // hizli yaklasma hizi
+     *   };
+     *   { 0x05U, &hfdcan1, ..., DRIVER_ZEROERR,
+     *     node5_extra, (uint8_t)(sizeof(node5_extra)/sizeof(node5_extra[0])) }
+     */
+    const sdo_entry_t *extra_sdo;       /* NULL = ek yok */
+    uint8_t            extra_sdo_count;
 } cia402_cfg_t;
 
 /* Ornek sayisinin derleme zamani ust siniri. example_embedded.c icindeki
