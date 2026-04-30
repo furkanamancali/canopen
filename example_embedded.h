@@ -57,7 +57,9 @@ typedef struct {
  * Daha fazla surucu gerekiyorsa bunu ve canopen.h icindeki
  * CO_MAX_RPDO / CO_MAX_TPDO degerlerini birlikte artirin. */
 #ifndef CIA402_MAX_NODES
-#warning "CIA402_MAX_NODES is not defined"
+#  error "CIA402_MAX_NODES must be defined in app_config.h or via a -D compiler flag. " \
+         "Set it to the maximum total slave count across all CAN buses. " \
+         "Also ensure CO_MAX_RPDO >= CIA402_MAX_NODES * 2 and CO_MAX_TPDO >= CIA402_MAX_NODES * 2."
 #endif
 
 /* Yapilandirma tablosu — uygulamanizda bir kez tanimlayin, orn.:

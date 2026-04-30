@@ -268,14 +268,44 @@ Keep the callback short and non-blocking. A ring buffer log is a safe pattern.
 
 ## Configuration reference
 
-All tuneable compile-time constants are grouped below. Constants marked **`app_config.h`** must be defined by the application; all others have defaults in the file shown.
+Every compile-time constant in the driver is wrapped with an `#ifndef` guard so it can be overridden **without touching any driver source file**. This is the intended usage when the driver is added as a git submodule.
 
-### Slave count and bus count — `app_config.h` + `example_embedded.c`
+### How to override
 
-| Constant | Default | File | Description |
-|----------|---------|------|-------------|
-| `CIA402_MAX_NODES` | *(required)* | `app_config.h` | Maximum total slave count. Sizes `m_node[]`, `m_sdo_tbl[]`, `g_*[]`. Must satisfy `CIA402_MAX_NODES * 2 ≤ CO_MAX_RPDO` |
-| `CO_PORT_MAX_BUSES` | `4` | `example_embedded.c` | Maximum distinct CAN peripherals (unique `can_handle` values). Sizes `s_buses[]` |
+**Option A — `app_config.h`** (recommended for submodule use)
+
+The driver includes `app_config.h` (via `example_embedded.h` → `canopen.h`). Define any constant there before the driver headers are processed:
+
+```c
+// app_config.h  (your project, not the submodule)
+#define CIA402_MAX_NODES     6U    // required — no default
+#define CO_MAX_RPDO         12U    // must be >= CIA402_MAX_NODES * 2
+#define CO_MAX_TPDO         12U    // must be >= CIA402_MAX_NODES * 2
+#define SYNC_PERIOD_US    2000UL   // 2 ms SYNC
+#define CIA402_MAX_VEL_RPM 1500    // tighter velocity clamp
+```
+
+**Option B — compiler `-D` flags** (CMake / Makefile)
+
+```cmake
+target_compile_definitions(myapp PRIVATE
+    CIA402_MAX_NODES=6
+    CO_MAX_RPDO=12
+    CO_MAX_TPDO=12
+    SYNC_PERIOD_US=2000
+)
+```
+
+Both options work simultaneously — `app_config.h` is evaluated first because it is `#include`d inside the guard, so `-D` flags from the compiler still take precedence over any `#define` inside it.
+
+`CIA402_MAX_NODES` is the **only required** constant — omitting it is a hard `#error` at compile time. All others have safe defaults.
+
+### Slave count and bus count
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CIA402_MAX_NODES` | **required** | Maximum total slave count across all buses. Sizes `m_node[]`, `m_sdo_tbl[]`, `g_*[]`. A compile-time `_Static_assert` enforces `CIA402_MAX_NODES * 2 ≤ CO_MAX_RPDO` |
+| `CO_PORT_MAX_BUSES` | `4` | Maximum distinct CAN peripherals (unique `can_handle` values). Sizes `s_buses[]` |
 
 ### Timing — `example_embedded.c`
 
@@ -314,8 +344,8 @@ All tuneable compile-time constants are grouped below. Constants marked **`app_c
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `CO_MAX_OD_ENTRIES` | `192` | Maximum object dictionary entries per node. Each slave uses ~8 vendor OD entries for PDO backing; raise if adding many custom objects |
-| `CO_MAX_RPDO` | `4` | Maximum RPDOs per node. Must be ≥ `CIA402_MAX_NODES * 2` (2 RPDOs per slave per bus) |
-| `CO_MAX_TPDO` | `4` | Maximum TPDOs per node. Same constraint as `CO_MAX_RPDO` |
+| `CO_MAX_RPDO` | `4` | Maximum RPDOs per node. **Must be ≥ `CIA402_MAX_NODES * 2`** — each slave consumes 2 RPDOs on its bus. Enforced by `_Static_assert` at compile time |
+| `CO_MAX_TPDO` | `4` | Maximum TPDOs per node. **Must be ≥ `CIA402_MAX_NODES * 2`** — same constraint as `CO_MAX_RPDO` |
 | `CO_PDO_MAP_ENTRIES` | `8` | Maximum mapped objects per PDO |
 | `CO_SDO_CHANNELS` | `2` | Concurrent SDO server channels |
 | `CO_SDO_TRANSFER_BUF_SIZE` | `1024` | Buffer for segmented/block SDO transfers [bytes] |

@@ -5,12 +5,16 @@
 #include "stm32f4xx_hal.h"
 
 /* ISR basina islenen maksimum cerceve sayisi (yoklama yolu). */
-#define CO_STM32F4_RX_MAX_PER_POLL 32U
+#ifndef CO_STM32F4_RX_MAX_PER_POLL
+#  define CO_STM32F4_RX_MAX_PER_POLL 32U
+#endif
 
 /* ISR→ana-dongu cerceve kuyrugu kapasitesi. Iki'nin kuvveti olmalidir.
  * 1 ms SYNC'te yaklasik ~10 cerceve/ms ile 64 yuva, asiri yuklemede
  * ~6 ms bosluk saglar. */
-#define CO_STM32F4_RX_QUEUE_SIZE   64U
+#ifndef CO_STM32F4_RX_QUEUE_SIZE
+#  define CO_STM32F4_RX_QUEUE_SIZE   64U
+#endif
 
 /* ISR tarafindan doldurulan, ana dongu tarafindan bosaltilan SPSC halka tamponu.
  * head yalnizca ISR tarafindan; tail yalnizca ana dongu tarafindan yazilir —

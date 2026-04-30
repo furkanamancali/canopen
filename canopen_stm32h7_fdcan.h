@@ -6,12 +6,16 @@
 
 /* Maximum frames processed per co_stm32_poll_rx() call (legacy polling path).
  * Caps the worst-case execution time of a single poll under bus overload. */
-#define CO_STM32_RX_MAX_PER_POLL 32U
+#ifndef CO_STM32_RX_MAX_PER_POLL
+#  define CO_STM32_RX_MAX_PER_POLL 32U
+#endif
 
 /* Ring buffer capacity for the ISR→main-loop frame queue.  Must be a power of
  * two.  At 1 ms SYNC with up to ~10 frames/ms, 64 slots gives ~6 ms headroom
  * before overflow under sustained load. */
-#define CO_STM32_RX_QUEUE_SIZE   64U
+#ifndef CO_STM32_RX_QUEUE_SIZE
+#  define CO_STM32_RX_QUEUE_SIZE   64U
+#endif
 
 /* SPSC ring buffer populated by co_stm32_rx_isr() and drained by
  * co_stm32_drain_rx().  head is written only by the ISR; tail only by the

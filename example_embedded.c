@@ -33,25 +33,54 @@
 #include "canopen_port.h"
 
 /* ── Master yapilandirmasi ───────────────────────────────────────────────── */
-#define MASTER_NODE_ID              0x7FU
-#define MASTER_HEARTBEAT_MS         50U
-#define SLAVE_HB_TIMEOUT_MS          150U
-#define SYNC_PERIOD_US              1000UL
-#define CIA402_MAX_VEL_RPM            3000
-#define CIA402_STATE_TIMEOUT_MS       2000U
-#define CIA402_FAULT_RESET_MS         10U
-#define CIA402_RPDO_WATCHDOG_MS       100U
-#define NMT_RESET_DELAY_MS     500U
-#define NMT_PREOP_DELAY_MS     100U
+/* Her sabit #ifndef ile sarmalanmistir: app_config.h icinde veya derleyici
+ * -D bayraklari araciligiyla alt modül kaynagini degistirmeden ustune yazilabilir. */
+#ifndef MASTER_NODE_ID
+#  define MASTER_NODE_ID         0x7FU
+#endif
+#ifndef MASTER_HEARTBEAT_MS
+#  define MASTER_HEARTBEAT_MS    50U
+#endif
+#ifndef SLAVE_HB_TIMEOUT_MS
+#  define SLAVE_HB_TIMEOUT_MS    150U
+#endif
+#ifndef SYNC_PERIOD_US
+#  define SYNC_PERIOD_US         1000UL
+#endif
+#ifndef CIA402_MAX_VEL_RPM
+#  define CIA402_MAX_VEL_RPM     3000
+#endif
+#ifndef CIA402_STATE_TIMEOUT_MS
+#  define CIA402_STATE_TIMEOUT_MS  2000U
+#endif
+#ifndef CIA402_FAULT_RESET_MS
+#  define CIA402_FAULT_RESET_MS  10U
+#endif
+#ifndef CIA402_RPDO_WATCHDOG_MS
+#  define CIA402_RPDO_WATCHDOG_MS  100U
+#endif
+#ifndef NMT_RESET_DELAY_MS
+#  define NMT_RESET_DELAY_MS     500U
+#endif
+#ifndef NMT_PREOP_DELAY_MS
+#  define NMT_PREOP_DELAY_MS     100U
+#endif
 /* Surucu yapilandirildiktan sonra PRE_OPERATIONAL durumunun gercek bir kole
  * dususu sayilmasi icin en az bu kadar sure devam etmesi gerekir; aksi hâlde
  * SDO yapilandirmasi yeniden calistirilmaz. Deger kalp atisi periyodunun cok
  * uzerinde tutulur; boylece iki OP cercevesi arasindaki tek bir bozuk/kayip
  * PRE_OP kalp atisi tek basina master_started'i sifirlayip 28 adimli SDO
  * dizisini yeniden baslatamaz. */
-#define NMT_PREOP_DEBOUNCE_MS  150U
-#define SDO_TIMEOUT_MS         500U
-#define SDO_RT_QUEUE_SIZE      4U   /* ornek basina maksimum kuyruklanmis calisma zamani SDO yazmasi */
+#ifndef NMT_PREOP_DEBOUNCE_MS
+#  define NMT_PREOP_DEBOUNCE_MS  150U
+#endif
+#ifndef SDO_TIMEOUT_MS
+#  define SDO_TIMEOUT_MS         500U
+#endif
+/* ornek basina maksimum kuyruklanmis calisma zamani SDO yazmasi */
+#ifndef SDO_RT_QUEUE_SIZE
+#  define SDO_RT_QUEUE_SIZE      4U
+#endif
 
 #define CW_SHUTDOWN             0x0006U
 #define CW_SWITCH_ON            0x0007U
@@ -81,7 +110,9 @@ _Static_assert(CIA402_MAX_NODES * 2U <= CO_MAX_RPDO,
  * gelir ve kendi co_node_t + co_port_ctx_t ciftini alir. Bu sayede farkli CAN
  * cevre birimlerine (orn. FDCAN1, FDCAN2) bagli koleler bagimsiz olarak
  * yonetilebilir. Ayni cevre birimini paylasan koleler ayni bus'i paylasilir. */
-#define CO_PORT_MAX_BUSES  4U
+#ifndef CO_PORT_MAX_BUSES
+#  define CO_PORT_MAX_BUSES  4U
+#endif
 
 typedef struct {
     co_node_t        node;
@@ -195,7 +226,9 @@ typedef enum {
  * Yalnizca -DDEBUG altinda derlenir; surum yapilarinda flash, RAM veya
  * calisma zamani maliyeti yoktur; surum derlemesinde cia402_log_transition()
  * tek bir drive_state atamasina indirgenir (asagiya bakin). */
-#define CIA402_TRANSITION_LOG_SIZE 16U
+#ifndef CIA402_TRANSITION_LOG_SIZE
+#  define CIA402_TRANSITION_LOG_SIZE 16U
+#endif
 
 typedef struct {
     uint32_t ts_ms;        /* gecis anindaki now_ms() degeri */
