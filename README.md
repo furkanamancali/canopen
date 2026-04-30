@@ -1,295 +1,440 @@
-# CANopen (CiA 301 + CiA 402) starter for STM32H7
+# CANopen CiA 301 + CiA 402 Master Stack
 
-This repository contains a compact C implementation intended as a **starting point** for CANopen nodes on STM32H7:
+A compact, production-oriented CANopen **master** implementation in C for STM32 microcontrollers. The master controls one or more CiA 402 Profile Velocity servo drives (ZeroErr eRob, Delta ASDA) across one or more independent CAN buses. The MCU abstraction layer keeps application code free of `#ifdef` guards for different STM32 families.
 
-- CiA 301 essentials:
-  - NMT state handling
-  - NMT boot-up/reset lifecycle (including communication vs application reset hooks)
-  - Heartbeat production
-  - Expedited SDO server (upload/download)
-  - RPDO receive / TPDO transmit buffers
-- Structured object dictionary registration (built-ins + app extensions)
-- CiA 402 essentials:
-  - Basic drive state machine transitions
-  - Controlword / statusword handling
-  - Mode and feedback data containers
-- STM32H7 integration:
-  - FDCAN send/poll wrappers based on STM32 HAL
+---
 
-## Files
+## What is implemented
 
-- `canopen.h`, `canopen.c`: CiA 301 core node stack.
-- `cia402.h`, `cia402.c`: CiA 402 drive profile state logic.
-- `canopen_stm32h7_fdcan.h`, `canopen_stm32h7_fdcan.c`: STM32H7 HAL FDCAN bindings.
-- `example_embedded.c`: reference STM32H7 application loop with PDO mapping, EMCY hooks, SYNC timing, and heartbeat consumer supervision.
+### CiA 301 Core (`canopen.h` / `canopen.c`)
 
-## Quick integration steps
+- NMT state machine (Initializing → Pre-Operational → Operational → Stopped) with master send
+- Boot-up frame emission; communication reset and application reset hooks
+- Heartbeat producer (configurable period) and heartbeat consumer (up to `CO_HEARTBEAT_CONSUMERS_MAX` slaves)
+- Expedited, segmented, and block SDO server (upload and download)
+- RPDO receive with OD unpack; TPDO transmit with OD pack
+- SYNC producer/consumer with configurable COB-ID and cycle period
+- Emergency (EMCY) producer with fault raise / clear / clear-all API
+- Object dictionary with up to `CO_MAX_OD_ENTRIES` entries, optional read/write callbacks
 
-1. Add these files to your STM32CubeIDE project.
-2. Ensure FDCAN is configured for classic CAN 2.0 frames (11-bit ID) and started.
-3. Initialize a node once:
+### CiA 402 Drive Profile (`cia402.h` / `cia402.c`)
+
+- Full CiA 402 state machine (Not Ready → Switch-On Disabled → Ready-To-Switch-On → Switched-On → Operation Enabled → Quick Stop → Fault Reaction → Fault)
+- Controlword / statusword handling; mode-of-operation and mode-display
+- Profile velocity, profile position, profile torque, homing, CSP/CSV/CST containers
+- Velocity window monitoring (0x606D / 0x606E) for target-reached detection
+- Fault → EMCY propagation
+
+### Master Application (`example_embedded.c` / `example_embedded.h`)
+
+- Multi-slave, multi-bus CANopen master
+- Automatic SDO configuration sequence for each slave on first connect
+- Per-slave CiA 402 state machine driven by RPDO feedback
+- Runtime SDO write queue (`cia402_set_accel`) with timeout and abort detection
+- RPDO watchdog: Quick Stop if no RPDO received within `CIA402_RPDO_WATCHDOG_MS`
+- PRE-OP debounce: transient heartbeat loss does not trigger full re-init
+- Structured diagnostic callback covering all fault/state-change events
+- DEBUG-mode per-slave CiA 402 transition ring buffer
+
+### MCU Port Layer (`canopen_port.h`)
+
+- Unified API wrapping STM32H7 FDCAN and STM32F4 bxCAN
+- ISR→main-loop SPSC ring buffer; no mutex required on single-core Cortex-M
+- `CO_PORT_DEFINE_RX_ISR` macro generates the HAL callback for any number of buses
+
+---
+
+## File map
+
+| File | Purpose |
+|------|---------|
+| `canopen.h` / `canopen.c` | CiA 301 protocol core |
+| `cia402.h` / `cia402.c` | CiA 402 drive profile state machine |
+| `canopen_port.h` | MCU abstraction — selects H7 or F4 driver |
+| `canopen_stm32h7_fdcan.h` / `.c` | STM32H7 FDCAN HAL bindings |
+| `canopen_stm32f4_can.h` / `.c` | STM32F4 bxCAN HAL bindings |
+| `example_embedded.h` | Public master API — node config table, diagnostic types |
+| `example_embedded.c` | Master implementation — SDO sequencer, CiA 402 FSM, loop |
+| `tests_host.c` | Host-side deterministic test harness |
+
+---
+
+## MCU target selection
+
+Define exactly one of the following symbols before including any project header, or add it as a compiler flag (`-DSTM32H723xx`):
+
+| Symbol | Peripheral | HAL type |
+|--------|-----------|---------|
+| `STM32H723xx` | FDCAN | `FDCAN_HandleTypeDef` |
+| `STM32F423xx` | bxCAN | `CAN_HandleTypeDef` |
+
+`canopen_port.h` reads this symbol and transparently maps `co_port_handle_t`, `co_port_ctx_t`, `co_port_attach()`, `co_port_drain_rx()`, `co_port_rx_isr()`, and `CO_PORT_DEFINE_RX_ISR()` to the correct HAL calls. No `#ifdef` is needed anywhere else in the project.
+
+---
+
+## Integration — step by step
+
+### 1. Add files to your project
+
+Add all `.c` and `.h` files to your STM32CubeIDE (or CMake) project. Ensure the MCU symbol is defined (see above).
+
+### 2. Define `CIA402_MAX_NODES` in `app_config.h`
 
 ```c
-co_node_t canopen_node;
-co_stm32_ctx_t can_ctx;
-co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx, 0x01, 100);
+// app_config.h
+#define CIA402_MAX_NODES  4U   // upper bound on total slave count across all buses
 ```
 
-4. Register OD variables (application extensions on top of built-in CiA 301 objects):
+This value sizes all static arrays inside `example_embedded.c`. Raise it together with `CO_MAX_RPDO` / `CO_MAX_TPDO` in `canopen.h` when adding more slaves (each slave consumes 2 RPDOs and 2 TPDOs on its bus).
+
+### 3. Declare the node configuration table
+
+Provide `cia402_nodes[]` and `cia402_node_count` in any translation unit:
 
 ```c
-static uint16_t statusword = 0;
-co_od_add(&canopen_node, 0x6041, 0x00, (uint8_t *)&statusword, sizeof(statusword), true, false);
+#include "example_embedded.h"
+
+// STM32H7 example — two buses, three slaves
+extern FDCAN_HandleTypeDef hfdcan1, hfdcan2;
+
+const cia402_cfg_t cia402_nodes[] = {
+    //  node_id  handle    accel(c/s²)  decel(c/s²)  CPR        ratio  driver
+    { 0x01U, &hfdcan1,  50000U,      200000U,      524288U,   1U,    DRIVER_ZEROERR },
+    { 0x02U, &hfdcan1,  50000U,      200000U,      524288U,   5U,    DRIVER_ZEROERR },
+    { 0x05U, &hfdcan2,  30000U,      100000U,      16777216U, 1U,    DRIVER_DELTA   },
+};
+const uint8_t cia402_node_count =
+    (uint8_t)(sizeof(cia402_nodes) / sizeof(cia402_nodes[0]));
 ```
 
-Use `co_od_add_ex` for variable-length entries, access flags, and read/write callbacks.
+Nodes sharing the same `handle` share one CAN bus and one master `co_node_t`. Nodes with different handles get independent buses, independent SYNC generators, and independent heartbeat consumers. The bus pool is built automatically at init time — no extra setup is needed.
 
-5. In your main loop:
+#### `cia402_cfg_t` fields
 
-```c
-co_stm32_poll_rx(&canopen_node, &hfdcan1);
-co_process(&canopen_node);
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `node_id` | `uint8_t` | CANopen node ID of the slave (1–127) |
+| `can_handle` | `co_port_handle_t` | Pointer to the HAL peripheral handle the slave is wired to (`&hfdcan1`, `&hcan1`, …) |
+| `default_accel` | `uint32_t` | Acceleration ramp written to 0x6083 once at startup [count/s²] |
+| `default_decel` | `uint32_t` | Deceleration ramp written to 0x6084 once at startup [count/s²] |
+| `encoder_counts_per_rev` | `uint32_t` | Raw encoder CPR (counts per motor revolution). Examples: 524 288 for ZeroErr 19-bit absolute, 16 777 216 for Delta ASDA-B3 24-bit optical |
+| `reductor_ratio` | `uint16_t` | Gearbox ratio (output-shaft revolutions per motor revolution). Use `1` for direct drive. Multiplied into the internal counts-per-RPM constant so all RPM values in the API refer to the **output shaft** |
+| `driver_type` | `driver_type_t` | Selects the startup recipe — see below |
 
-6. Update CiA 402 axis state from received controlword values and expose statusword via OD.
+#### Driver types
 
-## Detailed STM32H7 main loop example (PDO mapping + EMCY + SYNC + guarding)
+| Value | Drive | Startup recipe |
+|-------|-------|---------------|
+| `DRIVER_ZEROERR` | ZeroErr eRob (19-bit absolute encoder) | Full PDO mapping + profile ramp SDO + heartbeat. Velocity unit: count/s |
+| `DRIVER_DELTA` | Delta ASDA-B3 servo | Same PDO layout; velocity unit: 0.1 RPM (driver native). `counts_per_rpm_s` adjusted accordingly |
+| `DRIVER_WAT` | Non-CiA-402 drive sharing the same bus | Minimal startup: heartbeat period + consumer only. PDO mapping and CiA 402 FSM are skipped. Extend `build_sdo_table()` when the slave's OD is known |
 
-See `example_embedded.c` for the complete reference implementation.
-
-The snippet below shows a practical pattern for a **single-axis drive node** on STM32H7:
-
-- RPDO1 receives command objects (controlword, mode, target velocity).
-- TPDO1 publishes feedback (statusword, actual velocity).
-- Runtime verifies that expected PDO mapping is present.
-- EMCY is raised/cleared from application-detected hardware faults.
-- Control/update loop is SYNC-driven (1 ms SYNC period example).
-- Master supervision uses heartbeat consumer (practical replacement for legacy node guarding).
-- CiA 402 is run in **profile velocity mode** (`0x6060 = 3`).
-- The loop is split into fast CANopen servicing and slower control updates.
+### 4. Call init and loop functions
 
 ```c
-#include "canopen.h"
-#include "cia402.h"
-#include "canopen_stm32h7_fdcan.h"
+#include "example_embedded.h"
 
-extern FDCAN_HandleTypeDef hfdcan1;
+// In your RTOS task or main():
+app_canopen_init();   // called once before any interrupts are enabled
 
-static co_node_t canopen_node;
-static co_stm32_ctx_t can_ctx;
-static cia402_axis_t axis;
+// Optional — register diagnostic callback before or after init:
+app_canopen_set_diag_cb(my_diag_handler, NULL);
 
-static volatile int32_t velocity_feedback_rpm = 0;
-static volatile bool inverter_fault_active = false;
-static volatile uint8_t sync_tick = 0;
-
-static void on_rpdo_map_written(co_node_t *node, uint8_t rpdo_num, uint16_t index, uint8_t subindex, void *user)
-{
-    (void)node;
-    (void)user;
-    /* Optional: log/map-audit hook when 0x1600.. map entries change at runtime. */
-    if (rpdo_num == 1U && index == 0x1600U && subindex == 0x00U) {
-        /* RPDO1 map count changed. */
-    }
+// High-priority timer ISR or highest-priority RTOS task (1 ms period):
+void TIM_PeriodElapsedCallback(void) {
+    co_transmit_process();   // produces SYNC, locks targets, sends TPDOs
 }
 
-static void on_tpdo_pre_tx(co_node_t *node, uint8_t tpdo_num, void *user)
-{
-    (void)user;
-    if (tpdo_num == 1U) {
-        /* Keep status/feedback coherent exactly at TPDO1 packing time. */
-        cia402_set_feedback(&axis,
-                            axis.position_actual,
-                            axis.velocity_actual,
-                            axis.torque_actual);
-    }
-    (void)node;
-}
-
-static void app_fault_monitor_step(void)
-{
-    if (inverter_fault_active) {
-        (void)co_fault_raise(&canopen_node,
-                             CO_FAULT_CIA402_PROFILE,
-                             CO_EMCY_ERR_PROFILE,
-                             CO_ERROR_REG_DEVICE_PROFILE,
-                             0x01U,
-                             NULL);
-    } else {
-        (void)co_fault_clear(&canopen_node, CO_FAULT_CIA402_PROFILE, 0x00U, NULL);
-    }
-}
-
-static void app_drive_hw_step(cia402_axis_t *a)
-{
-    /* Example: convert target velocity command to inverter units and apply it. */
-    if (a->state == CIA402_OPERATION_ENABLED &&
-        a->mode_of_operation == CIA402_MODE_PROFILE_VELOCITY) {
-        const int32_t cmd_rpm = a->target_velocity;
-        /* TODO: set motor/inverter target speed from cmd_rpm. */
-    } else {
-        /* TODO: command safe torque-off / zero output. */
-    }
-}
-
-void app_canopen_init(void)
-{
-    /* 1) Attach CANopen stack to STM32H7 FDCAN. */
-    co_stm32_attach(&canopen_node, &hfdcan1, &can_ctx, 0x01, 100);
-
-    /* 2) Initialize and bind CiA 402 axis OD entries (0x6040/41, 0x6060/61, etc). */
-    cia402_init(&axis);
-    cia402_attach_node(&axis, &canopen_node);
-    cia402_bind_od(&axis, &canopen_node);
-    co_set_hooks(&canopen_node, on_rpdo_map_written, on_tpdo_pre_tx, NULL);
-
-    /* 3) Optional defaults before master takes control via RPDO/SDO. */
-    axis.mode_of_operation = CIA402_MODE_PROFILE_VELOCITY;
-    axis.profile_acceleration = 1000; /* rpm/s */
-    axis.profile_deceleration = 1000; /* rpm/s */
-
-    /* 4) PDO mapping is configured by the master through standard objects:
-       - RPDO1 comm/map: 0x1400 / 0x1600
-       - TPDO1 comm/map: 0x1800 / 0x1A00
-       Typical map for profile velocity drive:
-       RPDO1: 0x6040:00 (16), 0x6060:00 (8), 0x60FF:00 (32)
-       TPDO1: 0x6041:00 (16), 0x606C:00 (32)
-    */
-
-    /* 5) Optional local default mapping (before/without external SDO config). */
-    const uint32_t rpdo1_map1 = (0x6040UL << 16) | (0x00UL << 8) | 16UL;
-    const uint32_t rpdo1_map2 = (0x6060UL << 16) | (0x00UL << 8) | 8UL;
-    const uint32_t rpdo1_map3 = (0x60FFUL << 16) | (0x00UL << 8) | 32UL;
-    const uint32_t tpdo1_map1 = (0x6041UL << 16) | (0x00UL << 8) | 16UL;
-    const uint32_t tpdo1_map2 = (0x606CUL << 16) | (0x00UL << 8) | 32UL;
-    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){0}, 1);
-    (void)co_od_write(&canopen_node, 0x1600, 0x01, (const uint8_t *)&rpdo1_map1, sizeof(rpdo1_map1));
-    (void)co_od_write(&canopen_node, 0x1600, 0x02, (const uint8_t *)&rpdo1_map2, sizeof(rpdo1_map2));
-    (void)co_od_write(&canopen_node, 0x1600, 0x03, (const uint8_t *)&rpdo1_map3, sizeof(rpdo1_map3));
-    (void)co_od_write(&canopen_node, 0x1600, 0x00, (const uint8_t[]){3}, 1);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){0}, 1);
-    (void)co_od_write(&canopen_node, 0x1A00, 0x01, (const uint8_t *)&tpdo1_map1, sizeof(tpdo1_map1));
-    (void)co_od_write(&canopen_node, 0x1A00, 0x02, (const uint8_t *)&tpdo1_map2, sizeof(tpdo1_map2));
-    (void)co_od_write(&canopen_node, 0x1A00, 0x00, (const uint8_t[]){2}, 1);
-
-    /* 6) SYNC-driven timing: consumer on COB-ID 0x80 with 1 ms cycle. */
-    const uint32_t sync_cob_id = 0x00000080UL; /* valid, consumer, std-id */
-    const uint32_t sync_cycle_us = 1000UL;
-    (void)co_od_write(&canopen_node, 0x1005, 0x00, (const uint8_t *)&sync_cob_id, sizeof(sync_cob_id));
-    (void)co_od_write(&canopen_node, 0x1006, 0x00, (const uint8_t *)&sync_cycle_us, sizeof(sync_cycle_us));
-    const uint8_t tpdo1_sync_type = 1U; /* every SYNC */
-    (void)co_od_write(&canopen_node, 0x1800, 0x02, &tpdo1_sync_type, sizeof(tpdo1_sync_type));
-
-    /* 7) Guarding/supervision: configure heartbeat consumer for master node 0x7E, 500 ms timeout. */
-    const uint8_t hb_consumer_count = 1U;
-    const uint32_t hb_master = (0x7EUL << 16) | 500UL; /* 0x1016:01 */
-    (void)co_od_write(&canopen_node, 0x1016, 0x00, &hb_consumer_count, sizeof(hb_consumer_count));
-    (void)co_od_write(&canopen_node, 0x1016, 0x01, (const uint8_t *)&hb_master, sizeof(hb_master));
-}
-
-void app_main_loop(void)
-{
+// Main loop or lower-priority task:
+void main_loop(void) {
     for (;;) {
-        /* Fast path: drain RX FIFO and process protocol state machine. */
-        co_stm32_poll_rx(&canopen_node, &hfdcan1);
-        co_process(&canopen_node);
-
-        /* Run control update on every SYNC event (1 ms from master in this example). */
-        if (canopen_node.sync_event_pending) {
-            canopen_node.sync_event_pending = false;
-            ++sync_tick;
-
-            /* Update actual feedback from your motor control ISR/state. */
-            axis.velocity_actual = velocity_feedback_rpm; /* 0x606C */
-            axis.position_actual += axis.velocity_actual / 60; /* mock integration */
-
-            /* Apply latest RPDO-written controlword and mode commands. */
-            cia402_apply_controlword(&axis, axis.controlword);
-            cia402_step(&axis);
-
-            /* Run hardware command side according to CiA 402 state/mode. */
-            app_drive_hw_step(&axis);
-
-            /* Raise/clear EMCY faults from application hardware diagnostics. */
-            app_fault_monitor_step();
-
-            /* Optionally emit additional async TPDO every 10 SYNC ticks (10 ms). */
-            if ((sync_tick % 10U) == 0U) {
-                (void)co_send_tpdo(&canopen_node, 1U);
-            }
-        }
-
-        /* Optional: low-power idle until next interrupt/event. */
+        app_canopen_loop();   // drains RX, runs SDO sequencer, CiA 402 FSM
     }
 }
 ```
 
-### Why this loop structure works
+### 5. Wire the RX interrupt
 
-- `co_stm32_poll_rx()` + `co_process()` runs every iteration to keep SDO/PDO/NMT/heartbeat timing responsive.
-- SYNC edges gate the control law, so command/feedback exchange is aligned to network time.
-- Explicit local PDO mapping defaults make bring-up deterministic before external SDO tooling is added.
-- Heartbeat consumer (`0x1016`) provides master supervision and drives communication EMCY on timeout.
-- EMCY fault hooks (`co_fault_raise` / `co_fault_clear`) cleanly connect hardware diagnostics to CANopen diagnostics.
+Place this macro **once** in any `.c` file (typically `example_embedded.c` already contains it):
 
-## Notes
+```c
+CO_PORT_DEFINE_RX_ISR(s_buses, s_bus_count)
+```
 
-- This is intentionally minimal and deterministic for embedded use.
-- For production, add:
-  - segmented/block SDO,
-  - PDO mapping objects (0x1600/0x1A00),
-  - EMCY/error register and fault logging,
-  - SYNC-driven PDO timing,
-  - node guarding / heartbeat consumer,
-  - conformance test coverage.
+This emits `HAL_FDCAN_RxFifo0Callback` (H7) or `HAL_CAN_RxFifo0MsgPendingCallback` (F4) and dispatches to the correct bus context by matching the peripheral handle.
 
+---
 
-## Host-side deterministic test harness
+## Public API
 
-A host-side harness is provided to exercise `canopen.c` and `cia402.c` without MCU dependencies:
+```c
+// Initialise all buses and slaves. Call once before interrupts.
+co_error_t app_canopen_init(void);
 
-- `tests_host.c` uses:
-  - deterministic fake CAN send callback (captures all transmitted frames in-order),
-  - deterministic fake clock (`millis`) controlled by test code,
-  - reset hook counters for communication/application reset coverage.
-- Build and run:
+// Drain RX, run SDO sequencer, advance CiA 402 state machines.
+// Call from main loop or low-priority task.
+void app_canopen_loop(void);
+
+// Produce SYNC, commit target RPMs to OD, send TPDOs via co_process().
+// Must be called every SYNC_PERIOD_US (default 1 ms) from high-priority context.
+void co_transmit_process(void);
+
+// Set velocity target for one slave. Thread-safe (IRQ-disabled critical section).
+// target_rpm refers to the output shaft (reductor_ratio already applied).
+void cia402_set_target_rpm(uint16_t node_id, float target_rpm);
+
+// Queue acceleration and deceleration updates via runtime SDO write.
+// Thread-safe. Enqueued into the per-slave SDO runtime queue (depth: SDO_RT_QUEUE_SIZE).
+void cia402_set_accel(uint16_t node_id, uint32_t accel_counts_s2, uint32_t decel_counts_s2);
+
+// Read back latest position, velocity, and torque from RPDO feedback.
+// pos_deg  : output-shaft angle in degrees [0, 360)
+// vel_rpm  : output-shaft velocity in RPM (signed)
+// torque_pct: torque as percentage of rated torque (0.1 % resolution from 0x6077)
+void cia402_get_pos_vel(uint16_t node_id, float *pos_deg, float *vel_rpm, float *torque_pct);
+
+// Register the structured diagnostic callback.
+// Call any time — safe before app_canopen_init().
+void app_canopen_set_diag_cb(co_diag_cb_t cb, void *user);
+```
+
+### Observable globals (read-only from application)
+
+```c
+volatile uint16_t g_emcy_code[CIA402_MAX_NODES];       // last EMCY code per slave
+volatile uint8_t  g_emcy_reg[CIA402_MAX_NODES];        // last EMCY error register
+
+volatile uint32_t g_sdo_rt_abort_code[CIA402_MAX_NODES];    // last runtime SDO abort code
+volatile uint16_t g_sdo_rt_abort_index[CIA402_MAX_NODES];   // object index that was rejected
+volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
+```
+
+---
+
+## Structured diagnostic callback
+
+Register a single callback to receive all fault and state-change events:
+
+```c
+void my_diag(const co_diag_info_t *info, void *user)
+{
+    switch (info->event) {
+    case CO_DIAG_HB_TIMEOUT:
+        // info->node_id — which slave lost its heartbeat
+        break;
+    case CO_DIAG_HB_RECOVERED:
+        // slave heartbeat is back; re-init sequence will start automatically
+        break;
+    case CO_DIAG_EMCY_RECEIVED:
+        // info->detail.emcy.emcy_code  — CiA 301 emergency error code
+        // info->detail.emcy.error_reg  — error register (0x1001)
+        // info->detail.emcy.msef       — manufacturer sub-error code (byte 3)
+        break;
+    case CO_DIAG_SDO_ABORT:
+        // info->detail.sdo_abort.index      — OD index of rejected write
+        // info->detail.sdo_abort.subindex
+        // info->detail.sdo_abort.abort_code — CiA 301 abort code (e.g. 0x06090030)
+        break;
+    case CO_DIAG_SDO_TIMEOUT:
+        // info->detail.sdo_timeout.index
+        // info->detail.sdo_timeout.subindex
+        // info->detail.sdo_timeout.is_init  — true: init sequence, false: runtime queue
+        break;
+    case CO_DIAG_DRIVE_STATE_CHANGE:
+        // info->detail.drive.from  — master_cia402_state_t before transition
+        // info->detail.drive.to    — master_cia402_state_t after  transition
+        break;
+    case CO_DIAG_NMT_STATE_CHANGE:
+        // info->detail.nmt.state   — new co_nmt_state_t of the slave
+        break;
+    }
+}
+
+app_canopen_set_diag_cb(my_diag, NULL);
+```
+
+**Context warning:** the callback may fire from different execution contexts depending on the event:
+
+| Event | Typical context |
+|-------|----------------|
+| `CO_DIAG_EMCY_RECEIVED`, `CO_DIAG_SDO_ABORT`, `CO_DIAG_SDO_TIMEOUT` (init) | `app_canopen_loop()` (main loop) |
+| `CO_DIAG_SDO_TIMEOUT` (runtime) | `app_canopen_loop()` (main loop) |
+| `CO_DIAG_DRIVE_STATE_CHANGE`, `CO_DIAG_NMT_STATE_CHANGE` | `app_canopen_loop()` or RPDO callback |
+| `CO_DIAG_HB_TIMEOUT`, `CO_DIAG_HB_RECOVERED` | `co_transmit_process()` (high-priority) |
+
+Keep the callback short and non-blocking. A ring buffer log is a safe pattern.
+
+---
+
+## Configuration reference
+
+All tuneable compile-time constants are grouped below. Constants marked **`app_config.h`** must be defined by the application; all others have defaults in the file shown.
+
+### Slave count and bus count — `app_config.h` + `example_embedded.c`
+
+| Constant | Default | File | Description |
+|----------|---------|------|-------------|
+| `CIA402_MAX_NODES` | *(required)* | `app_config.h` | Maximum total slave count. Sizes `m_node[]`, `m_sdo_tbl[]`, `g_*[]`. Must satisfy `CIA402_MAX_NODES * 2 ≤ CO_MAX_RPDO` |
+| `CO_PORT_MAX_BUSES` | `4` | `example_embedded.c` | Maximum distinct CAN peripherals (unique `can_handle` values). Sizes `s_buses[]` |
+
+### Timing — `example_embedded.c`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `MASTER_NODE_ID` | `0x7F` | CANopen node ID of the master on every bus |
+| `MASTER_HEARTBEAT_MS` | `50` | Master heartbeat period sent to slaves [ms] |
+| `SLAVE_HB_TIMEOUT_MS` | `150` | Heartbeat consumer timeout per slave [ms]. Must be > `MASTER_HEARTBEAT_MS` with enough margin to absorb one missed frame |
+| `SYNC_PERIOD_US` | `1000` | SYNC frame period [µs]. Each bus produces its own SYNC. Determines `co_transmit_process()` call rate |
+| `NMT_RESET_DELAY_MS` | `500` | Wait after sending NMT Reset Communication (0x82) before sending Pre-Op (0x80) [ms] |
+| `NMT_PREOP_DELAY_MS` | `100` | Wait in Pre-Operational before sending the first init SDO [ms] |
+| `NMT_PREOP_DEBOUNCE_MS` | `150` | Minimum time a slave must stay in PRE-OP after commissioning before re-init is triggered. Prevents a single corrupt/missed HB from restarting the 28-step SDO sequence [ms] |
+| `SDO_TIMEOUT_MS` | `500` | SDO response timeout for both init sequence and runtime queue [ms] |
+| `SDO_RT_QUEUE_SIZE` | `4` | Runtime SDO write queue depth per slave. `cia402_set_accel()` enqueues 2 entries; full queue returns false silently |
+
+### CiA 402 FSM — `example_embedded.c`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CIA402_MAX_VEL_RPM` | `3000` | Software velocity clamp applied inside `co_transmit_process()` before writing to OD [RPM, output shaft] |
+| `CIA402_STATE_TIMEOUT_MS` | `2000` | Timeout for each CiA 402 state transition (Shutdown→Ready, Switch-On→Switched-On, etc.). Expiry triggers a fault-reset cycle [ms] |
+| `CIA402_FAULT_RESET_MS` | `10` | Duration the fault-reset controlword (0x0080) is held before clearing [ms] |
+| `CIA402_RPDO_WATCHDOG_MS` | `100` | If no RPDO1 (statusword + velocity) is received within this window while RUNNING, the master sends Quick Stop and drops to IDLE [ms] |
+
+### CAN ring buffer — `canopen_stm32h7_fdcan.h` / `canopen_stm32f4_can.h`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CO_STM32_RX_QUEUE_SIZE` | `64` | ISR→main-loop frame ring buffer size (H7). Must be a power of two. At 1 ms SYNC with ~10 frames/ms, 64 slots gives ~6 ms headroom |
+| `CO_STM32_RX_MAX_PER_POLL` | `32` | Frames drained per `co_stm32_drain_rx()` call on the legacy poll path |
+| `CO_STM32F4_RX_QUEUE_SIZE` | `64` | Same for F4 bxCAN |
+| `CO_STM32F4_RX_MAX_PER_POLL` | `32` | Same for F4 bxCAN |
+
+### Core stack — `canopen.h`
+
+| Constant | Default | Description |
+|----------|---------|-------------|
+| `CO_MAX_OD_ENTRIES` | `192` | Maximum object dictionary entries per node. Each slave uses ~8 vendor OD entries for PDO backing; raise if adding many custom objects |
+| `CO_MAX_RPDO` | `4` | Maximum RPDOs per node. Must be ≥ `CIA402_MAX_NODES * 2` (2 RPDOs per slave per bus) |
+| `CO_MAX_TPDO` | `4` | Maximum TPDOs per node. Same constraint as `CO_MAX_RPDO` |
+| `CO_PDO_MAP_ENTRIES` | `8` | Maximum mapped objects per PDO |
+| `CO_SDO_CHANNELS` | `2` | Concurrent SDO server channels |
+| `CO_SDO_TRANSFER_BUF_SIZE` | `1024` | Buffer for segmented/block SDO transfers [bytes] |
+| `CO_EMCY_FAULT_SLOTS` | `16` | Number of simultaneous active faults the EMCY producer can track |
+| `CO_HEARTBEAT_CONSUMERS_MAX` | `16` | Maximum slaves the HB consumer can supervise per node |
+
+---
+
+## Multi-bus topology
+
+Each entry in `cia402_nodes[]` carries a `can_handle`. At `app_canopen_init()` time the master scans the table, groups entries by unique handle, and allocates one `co_node_t` + `co_port_ctx_t` pair per distinct peripheral:
+
+```
+cia402_nodes[0] — node 0x01, &hfdcan1  ─┐
+cia402_nodes[1] — node 0x02, &hfdcan1  ─┤→ s_buses[0]  (FDCAN1, node_id 0x7F)
+                                          │   SYNC, HB consumer for 0x01 + 0x02
+cia402_nodes[2] — node 0x05, &hfdcan2  ──→ s_buses[1]  (FDCAN2, node_id 0x7F)
+                                              SYNC, HB consumer for 0x05 only
+```
+
+- Each bus produces its own SYNC and supervises only its own slaves.
+- RPDO/TPDO slot numbers restart at 0 within each bus (`local_index * 2`).
+- The ISR macro dispatches by matching the peripheral handle — a single HAL callback covers all buses.
+- `on_reset_communication` fires independently per bus; only that bus's slaves are reset.
+
+---
+
+## Threading model
+
+Two execution contexts are used; they must **not** preempt each other without a mutex unless noted:
+
+| Context | Functions | Touches |
+|---------|----------|---------|
+| High-priority (1 ms timer ISR or top-priority task) | `co_transmit_process()` | `s_buses[].node.sync_event_pending`, OD target velocity fields, `co_process()` |
+| Main loop / low-priority task | `app_canopen_loop()` | `m_node[]`, `s_buses[]`, SDO state machines |
+| Any context (ISR-safe) | `cia402_set_target_rpm()`, `cia402_set_accel()` | `g_target_rpm[]` via IRQ-disabled critical section |
+| RX FIFO ISR only | `CO_PORT_DEFINE_RX_ISR` → `co_port_rx_isr()` | ISR ring buffer head — SPSC, no mutex needed |
+
+If `co_transmit_process()` and `app_canopen_loop()` run at different priority levels, protect `m_node[]` and `s_buses[]` with a mutex or run both from the same context.
+
+---
+
+## PDO layout per CiA 402 slave
+
+Each DRIVER_ZEROERR / DRIVER_DELTA slave is configured with two TPDO/RPDO pairs (from the master's perspective):
+
+| Direction | PDO | COB-ID | Mapped objects |
+|-----------|-----|--------|---------------|
+| Master→Slave (TPDO) | TPDO0 of bus | `0x200 + node_id` | 0x6040:00 controlword (16 bit), 0x6060:00 mode (8 bit), 0x60FF:00 target velocity (32 bit) |
+| Slave→Master (RPDO) | RPDO0 of bus | `0x180 + node_id` | 0x6041:00 statusword (16 bit), 0x6061:00 mode display (8 bit), 0x606C:00 velocity actual (32 bit) |
+| Slave→Master (RPDO) | RPDO1 of bus | `0x280 + node_id` | 0x6064:00 position actual (32 bit), 0x6077:00 torque actual (16 bit) |
+
+Transmission type for both TPDO and RPDO is `0x01` (every SYNC). The init SDO sequence (`build_sdo_table()`) writes these mappings to the slave's OD; no external SDO tooling is required.
+
+---
+
+## Slave init SDO sequence
+
+When a slave is first detected or after heartbeat recovery, `sdo_cfg_run()` executes the following sequence automatically, with a `SDO_TIMEOUT_MS` timeout per step:
+
+1. NMT Reset Communication (0x82) → wait `NMT_RESET_DELAY_MS`
+2. NMT Pre-Operational (0x80) → wait `NMT_PREOP_DELAY_MS`
+3. Configure slave RPDO1 communication + mapping (COB-ID, transmission type, 3 mapped objects)
+4. Configure slave TPDO1 communication + mapping
+5. Configure slave TPDO2 communication + mapping
+6. Write acceleration ramp (0x6083) = `default_accel`
+7. Write deceleration ramp (0x6084) = `default_decel`
+8. Write slave heartbeat period (0x1017) = 50 ms
+9. Write slave heartbeat consumer (0x1016:01) = master node ID + 150 ms timeout
+10. NMT Start (0x01)
+
+Any SDO abort or timeout fires `CO_DIAG_SDO_ABORT` / `CO_DIAG_SDO_TIMEOUT` and restarts the sequence from step 1.
+
+---
+
+## DEBUG build
+
+Define `DEBUG` (`-DDEBUG`) to enable the per-slave transition ring buffer:
+
+```c
+#ifdef DEBUG
+    cia402_transition_t transition_log[CIA402_TRANSITION_LOG_SIZE];  // 16 entries
+    uint8_t             transition_log_head;
+    uint8_t             transition_log_count;
+#endif
+```
+
+Each entry records `ts_ms`, `statusword`, `from`, and `to` state. Inspect via debugger watch on `m_node[i].transition_log`. The ring does not wrap in `transition_log_count` — when full, count saturates at 16 so the debugger can distinguish "not yet wrapped" from "full".
+
+`CIA402_TRANSITION_LOG_SIZE` defaults to 16 and must be a power of two.
+
+---
+
+## Host-side test harness
+
+Build and run without any MCU hardware:
 
 ```sh
 make test
 ```
 
-This compiles `tests_host` from `tests_host.c`, `canopen.c`, and `cia402.c`, then executes all tests.
+`tests_host.c` exercises `canopen.c` and `cia402.c` with:
+- Deterministic fake CAN transmit callback (captures frames in order)
+- Fake clock (`millis`) advanced by test code
+- Reset hook counters
 
-## Minimal conformance checklist (implemented vs gaps)
+### What is covered
 
-### Implemented and covered by host tests
+- NMT command routing, boot-up sequence, communication/application reset hooks
+- SDO expedited, segmented, and block upload/download; abort paths
+- RPDO unpack and TPDO pack against OD variables
+- Heartbeat producer timing
+- EMCY raise/clear behavior
+- CiA 402 core transition matrix (shutdown → switch-on → enable → quick-stop → fault-reset)
 
-- **NMT command handling and node lifecycle**
-  - NMT start/stop/pre-operational command routing (broadcast and node-targeted).
-  - Boot-up frame emission and reset-triggered re-initializing/boot-up flow.
-  - Communication reset vs application reset callback behavior.
-- **SDO server transfer paths**
-  - Expedited upload/download success.
-  - Segmented upload/download success.
-  - Block upload/download success.
-  - Abort paths: unknown object, toggle/sequence mismatch, invalid command handling.
-- **PDO mapping and runtime data exchange**
-  - Mapping validation failures (e.g., unmapped OD object).
-  - RPDO runtime unpack into OD variables.
-  - TPDO runtime pack from OD variables.
-- **Heartbeat + EMCY behavior**
-  - Heartbeat periodic timing against fake clock.
-  - EMCY emit/clear behavior via fault raise/clear.
-- **CiA 402 state and statusword**
-  - Core transition matrix coverage (shutdown/switch on/enable op/quick stop/fault reset).
-  - Statusword low-bit correctness for key states.
-  - Profile-fault to EMCY propagation on unsupported-mode fault path.
+### Known gaps
 
-### Known gaps (not yet covered or intentionally minimal)
-
-- Full CiA 301 certification profile coverage is not claimed (this is a compact starter stack).
-- SDO block transfer edge cases (CRC variants, retransmit corner cases, malformed-frame fuzzing) are not exhaustively tested.
-- TPDO timing matrix is only partially covered in host tests (no exhaustive SYNC type/inhibit/event combinations).
-- Heartbeat consumer coverage exists, but full node-guarding protocol behavior is intentionally minimal in this starter stack.
-- Advanced CiA 402 operation-mode semantics (trajectory/profile constraints, hardware interlocks, mode-specific diagnostics) remain application-specific.
-- No automated hardware-in-loop conformance run is included.
+- SDO block transfer edge cases (CRC variants, retransmit corner cases) not exhaustively tested
+- TPDO SYNC-type / inhibit-time / event-timer combinations partially covered
+- Heartbeat consumer full timeout recovery path not in host tests
+- No hardware-in-loop conformance run
+- Full CiA 301 certification profile not claimed — this is a compact production starter, not a certified stack

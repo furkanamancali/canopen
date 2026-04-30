@@ -186,16 +186,7 @@ typedef enum {
     SDO_CFG_DONE,
 } sdo_cfg_state_t;
 
-typedef enum {
-    MASTER_CIA402_IDLE = 0,
-    MASTER_CIA402_FAULT_RESET,
-    MASTER_CIA402_WAIT_FAULT_CLEAR,
-    MASTER_CIA402_SHUTDOWN,
-    MASTER_CIA402_SWITCH_ON,
-    MASTER_CIA402_ENABLE,
-    MASTER_CIA402_RUNNING,
-    MASTER_CIA402_FAULT,
-} master_cia402_state_t;
+/* master_cia402_state_t tanimlamasi example_embedded.h'e tasindi. */
 
 #ifdef DEBUG
 /* Iki'nin kuvveti; CiA 402 durum makinesi gecislerinin ornek basina halka tamponu.
@@ -313,6 +304,21 @@ volatile uint8_t  g_sdo_rt_abort_subindex[CIA402_MAX_NODES];
 /* Herhangi bir gorev baglamindan ayarlanan ornek basina hedef RPM. */
 volatile float32_t g_target_rpm[CIA402_MAX_NODES];
 
+/* ── Tanisal geri cagirma ────────────────────────────────────────────────── */
+static co_diag_cb_t s_diag_cb   = NULL;
+static void        *s_diag_user = NULL;
+
+void app_canopen_set_diag_cb(co_diag_cb_t cb, void *user)
+{
+    s_diag_cb   = cb;
+    s_diag_user = user;
+}
+
+static void diag_fire(const co_diag_info_t *info)
+{
+    if (s_diag_cb != NULL) { s_diag_cb(info, s_diag_user); }
+}
+
 /* ── CiA 402 statusword yardimcilari ────────────────────────────────────── */
 #define SW_RTSO  0x0001U
 #define SW_SO    0x0002U
@@ -402,6 +408,13 @@ static void cia402_log_transition(uint8_t i, master_cia402_state_t to)
     node_state_t *e = &m_node[i];
     if (e->drive_state == to) { return; }
 
+    co_diag_info_t d;
+    d.event            = CO_DIAG_DRIVE_STATE_CHANGE;
+    d.node_id          = cia402_nodes[i].node_id;
+    d.detail.drive.from = e->drive_state;
+    d.detail.drive.to   = to;
+    diag_fire(&d);
+
     cia402_transition_t *r = &e->transition_log[e->transition_log_head];
     r->ts_ms      = now_ms();
     r->statusword = e->statusword;
@@ -418,6 +431,14 @@ static void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 #else
 static inline void cia402_log_transition(uint8_t i, master_cia402_state_t to)
 {
+    if (m_node[i].drive_state != to) {
+        co_diag_info_t d;
+        d.event             = CO_DIAG_DRIVE_STATE_CHANGE;
+        d.node_id           = cia402_nodes[i].node_id;
+        d.detail.drive.from = m_node[i].drive_state;
+        d.detail.drive.to   = to;
+        diag_fire(&d);
+    }
     m_node[i].drive_state = to;
 }
 #endif
@@ -498,6 +519,12 @@ static void sdo_send(uint8_t bus_idx, uint8_t node_id, uint16_t index,
 /* ── NMT durum degisikligi ───────────────────────────────────────────────── */
 static void on_slave_nmt_change(uint8_t i, co_nmt_state_t st)
 {
+    co_diag_info_t d;
+    d.event          = CO_DIAG_NMT_STATE_CHANGE;
+    d.node_id        = cia402_nodes[i].node_id;
+    d.detail.nmt.state = st;
+    diag_fire(&d);
+
     switch (st) {
     case CO_NMT_INITIALIZING:
         if (m_node[i].sdo_cfg_state == SDO_CFG_RESET_DELAY) { break; }
@@ -559,6 +586,14 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
             g_emcy_code[idx] = (uint16_t)frame->data[0]
                                   | ((uint16_t)frame->data[1] << 8);
             g_emcy_reg[idx]  = frame->data[2];
+
+            co_diag_info_t d;
+            d.event                = CO_DIAG_EMCY_RECEIVED;
+            d.node_id              = nid;
+            d.detail.emcy.emcy_code = g_emcy_code[idx];
+            d.detail.emcy.error_reg = frame->data[2];
+            d.detail.emcy.msef      = (frame->len >= 4U) ? frame->data[3] : 0U;
+            diag_fire(&d);
         }
         return;
     }
@@ -590,6 +625,20 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
             const bool    is_abort      = (frame->data[0] == 0x80U);
             if (is_dl_confirm || is_ul_confirm || is_abort) {
                 if (m_node[idx].sdo_cfg_state == SDO_CFG_WAIT_RESPONSE) {
+                    if (is_abort && frame->len >= 8U) {
+                        const uint32_t code = (uint32_t)frame->data[4]
+                                            | ((uint32_t)frame->data[5] << 8)
+                                            | ((uint32_t)frame->data[6] << 16)
+                                            | ((uint32_t)frame->data[7] << 24);
+                        const sdo_entry_t *w = &m_sdo_tbl[idx][m_node[idx].sdo_cfg_step];
+                        co_diag_info_t d;
+                        d.event                    = CO_DIAG_SDO_ABORT;
+                        d.node_id                  = nid;
+                        d.detail.sdo_abort.index      = w->index;
+                        d.detail.sdo_abort.subindex   = w->subindex;
+                        d.detail.sdo_abort.abort_code = code;
+                        diag_fire(&d);
+                    }
                     m_node[idx].sdo_cfg_resp_ok = true;
                 } else if (m_node[idx].sdo_rt_active) {
                     if (is_abort && frame->len >= 8U) {
@@ -605,6 +654,14 @@ static void on_rx_frame(void *user, const co_can_frame_t *frame)
                         g_sdo_rt_abort_code[idx]     = code;
                         g_sdo_rt_abort_index[idx]    = w->index;
                         g_sdo_rt_abort_subindex[idx] = w->subindex;
+
+                        co_diag_info_t d;
+                        d.event                    = CO_DIAG_SDO_ABORT;
+                        d.node_id                  = nid;
+                        d.detail.sdo_abort.index      = w->index;
+                        d.detail.sdo_abort.subindex   = w->subindex;
+                        d.detail.sdo_abort.abort_code = code;
+                        diag_fire(&d);
                     } else if (is_ul_confirm && frame->len >= 8U) {
                         m_node[idx].sdo_rt_resp_value =
                               (uint32_t)frame->data[4]
@@ -659,6 +716,14 @@ static bool sdo_cfg_run(uint8_t i)
     /* SDO_CFG_YANIT_BEKLE */
     if (!e->sdo_cfg_resp_ok) {
         if ((t - e->sdo_cfg_step_ms) >= SDO_TIMEOUT_MS) {
+            const sdo_entry_t *w = &m_sdo_tbl[i][e->sdo_cfg_step];
+            co_diag_info_t d;
+            d.event                     = CO_DIAG_SDO_TIMEOUT;
+            d.node_id                   = cia402_nodes[i].node_id;
+            d.detail.sdo_timeout.index    = w->index;
+            d.detail.sdo_timeout.subindex = w->subindex;
+            d.detail.sdo_timeout.is_init  = true;
+            diag_fire(&d);
             e->sdo_cfg_state = SDO_CFG_IDLE;
             e->sdo_cfg_step  = 0U;
         }
@@ -723,6 +788,14 @@ static void sdo_rt_run(uint8_t i)
             e->sdo_rt_tail    = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
         } else if ((t - e->sdo_rt_ms) >= SDO_TIMEOUT_MS) {
             /* Zaman asimi — girisi dusur ve geri kalanla devam et. */
+            const sdo_entry_t *w = &e->sdo_rt_queue[e->sdo_rt_tail];
+            co_diag_info_t d;
+            d.event                     = CO_DIAG_SDO_TIMEOUT;
+            d.node_id                   = cia402_nodes[i].node_id;
+            d.detail.sdo_timeout.index    = w->index;
+            d.detail.sdo_timeout.subindex = w->subindex;
+            d.detail.sdo_timeout.is_init  = false;
+            diag_fire(&d);
             e->sdo_rt_active = false;
             e->sdo_rt_tail   = (uint8_t)((e->sdo_rt_tail + 1U) % SDO_RT_QUEUE_SIZE);
         }
@@ -932,6 +1005,12 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
          * degil, NMT kalp atisi geri cagirmalari araciligiyla
          * on_slave_nmt_change() tarafindan ele alinir. */
         if (!m_node[i].master_started) { return; }
+
+        co_diag_info_t d;
+        d.event   = CO_DIAG_HB_TIMEOUT;
+        d.node_id = slave_node_id;
+        diag_fire(&d);
+
         m_node[i].target_vel  = 0;
         m_node[i].controlword = CW_QUICK_STOP;
         (void)co_send_tpdo(&s_buses[m_node_bus[i]].node,
@@ -945,6 +1024,11 @@ static void on_hb_event(co_node_t *node, uint8_t slave_node_id,
     } else {
         if (!m_node[i].hb_lost) { return; }
         m_node[i].hb_lost        = false;
+
+        co_diag_info_t d;
+        d.event   = CO_DIAG_HB_RECOVERED;
+        d.node_id = slave_node_id;
+        diag_fire(&d);
         m_node[i].sdo_cfg_state  = SDO_CFG_IDLE;
         m_node[i].sdo_cfg_step   = 0U;
         m_node[i].master_started = false;

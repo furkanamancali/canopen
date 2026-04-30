@@ -76,6 +76,69 @@ typedef struct {
 extern const cia402_cfg_t cia402_nodes[];
 extern const uint8_t      cia402_node_count;
 
+/* ── Master CiA 402 durum makinesi ──────────────────────────────────────────
+ * co_diag_info_t.detail.drive uygulama katmanina gorunur olmasi icin burada
+ * tanimlanir. */
+typedef enum {
+    MASTER_CIA402_IDLE = 0,
+    MASTER_CIA402_FAULT_RESET,
+    MASTER_CIA402_WAIT_FAULT_CLEAR,
+    MASTER_CIA402_SHUTDOWN,
+    MASTER_CIA402_SWITCH_ON,
+    MASTER_CIA402_ENABLE,
+    MASTER_CIA402_RUNNING,
+    MASTER_CIA402_FAULT,
+} master_cia402_state_t;
+
+/* ── Yapilandirilmis tanisal geri cagirma ────────────────────────────────── */
+typedef enum {
+    CO_DIAG_EMCY_RECEIVED      = 0, /* kole EMCY cercevesi gonderdi; detail.emcy dolu */
+    CO_DIAG_HB_TIMEOUT         = 1, /* kole kalp atisi zaman asimina ugradi */
+    CO_DIAG_HB_RECOVERED       = 2, /* kole kalp atisi geri geldi */
+    CO_DIAG_SDO_TIMEOUT        = 3, /* SDO yazmasi zaman asimina ugradi; detail.sdo_timeout dolu */
+    CO_DIAG_SDO_ABORT          = 4, /* kole SDO'yu reddetti; detail.sdo_abort dolu */
+    CO_DIAG_DRIVE_STATE_CHANGE = 5, /* CiA 402 master FSM gecisi; detail.drive dolu */
+    CO_DIAG_NMT_STATE_CHANGE   = 6, /* kole NMT durumu degisti; detail.nmt dolu */
+} co_diag_event_t;
+
+typedef struct {
+    co_diag_event_t event;
+    uint8_t         node_id;  /* hangi kole (0 = gecerli degil) */
+    union {
+        struct {
+            uint16_t emcy_code;
+            uint8_t  error_reg;
+            uint8_t  msef;        /* manufacturer-specific error sub-code (byte 3) */
+        } emcy;
+        struct {
+            uint16_t index;
+            uint8_t  subindex;
+            uint32_t abort_code;
+        } sdo_abort;
+        struct {
+            uint16_t index;
+            uint8_t  subindex;
+            bool     is_init;     /* true = baslangic SDO dizisi, false = calisma zamani */
+        } sdo_timeout;
+        struct {
+            master_cia402_state_t from;
+            master_cia402_state_t to;
+        } drive;
+        struct {
+            co_nmt_state_t state;
+        } nmt;
+    } detail;
+} co_diag_info_t;
+
+/* Tanisal geri cagirma tipi.
+ * Birden fazla baglam tarafindan tetiklenebilir (ISR, ana dongu, zamanlayici);
+ * kisa, bloke edici olmayan uygulamalar yazilmalidir (orn. halka tamponu gunlugu). */
+typedef void (*co_diag_cb_t)(const co_diag_info_t *info, void *user);
+
+/* Tanisal geri cagirmayi kaydet. app_canopen_init()'den once cagrilabilir;
+ * is parcacigi-guvenlidir (tek bir isaretci atamasiyla gerceklenir). */
+void app_canopen_set_diag_cb(co_diag_cb_t cb, void *user);
+
 /* ── Genel API ───────────────────────────────────────────────────────────── */
 co_error_t app_canopen_init(void);
 void       app_canopen_loop(void);
