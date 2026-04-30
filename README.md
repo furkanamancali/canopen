@@ -50,8 +50,9 @@ A compact, production-oriented CANopen **master** implementation in C for STM32 
 |------|---------|
 | `canopen.h` / `canopen.c` | CiA 301 protocol core |
 | `cia402.h` / `cia402.c` | CiA 402 drive profile state machine |
-| `canopen_port.h` | MCU abstraction — selects H7 or F4 driver |
+| `canopen_port.h` | MCU abstraction — selects H7, G4, or F4 driver |
 | `canopen_stm32h7_fdcan.h` / `.c` | STM32H7 FDCAN HAL bindings |
+| `canopen_stm32g4_fdcan.h` / `.c` | STM32G4 FDCAN HAL bindings |
 | `canopen_stm32f4_can.h` / `.c` | STM32F4 bxCAN HAL bindings |
 | `example_embedded.h` | Public master API — node config table, diagnostic types |
 | `example_embedded.c` | Master implementation — SDO sequencer, CiA 402 FSM, loop |
@@ -63,10 +64,13 @@ A compact, production-oriented CANopen **master** implementation in C for STM32 
 
 Define exactly one of the following symbols before including any project header, or add it as a compiler flag (`-DSTM32H723xx`):
 
-| Symbol | Peripheral | HAL type |
-|--------|-----------|---------|
-| `STM32H723xx` | FDCAN | `FDCAN_HandleTypeDef` |
-| `STM32F423xx` | bxCAN | `CAN_HandleTypeDef` |
+| Symbol | Peripheral | HAL type | HAL include |
+|--------|-----------|---------|-------------|
+| `STM32H723xx` | FDCAN | `FDCAN_HandleTypeDef` | `stm32h7xx_hal.h` |
+| `STM32G474xx` (or any G4 variant — see below) | FDCAN | `FDCAN_HandleTypeDef` | `stm32g4xx_hal.h` |
+| `STM32F423xx` | bxCAN | `CAN_HandleTypeDef` | `stm32f4xx_hal.h` |
+
+Supported STM32G4 variants: `STM32G431xx`, `STM32G441xx`, `STM32G471xx`, `STM32G473xx`, `STM32G474xx`, `STM32G483xx`, `STM32G484xx`, `STM32G491xx`, `STM32G4A1xx`.
 
 `canopen_port.h` reads this symbol and transparently maps `co_port_handle_t`, `co_port_ctx_t`, `co_port_attach()`, `co_port_drain_rx()`, `co_port_rx_isr()`, and `CO_PORT_DEFINE_RX_ISR()` to the correct HAL calls. No `#ifdef` is needed anywhere else in the project.
 
@@ -332,14 +336,16 @@ Both options work simultaneously — `app_config.h` is evaluated first because i
 | `CIA402_FAULT_RESET_MS` | `10` | Duration the fault-reset controlword (0x0080) is held before clearing [ms] |
 | `CIA402_RPDO_WATCHDOG_MS` | `100` | If no RPDO1 (statusword + velocity) is received within this window while RUNNING, the master sends Quick Stop and drops to IDLE [ms] |
 
-### CAN ring buffer — `canopen_stm32h7_fdcan.h` / `canopen_stm32f4_can.h`
+### CAN ring buffer — per-driver headers
 
-| Constant | Default | Description |
-|----------|---------|-------------|
-| `CO_STM32_RX_QUEUE_SIZE` | `64` | ISR→main-loop frame ring buffer size (H7). Must be a power of two. At 1 ms SYNC with ~10 frames/ms, 64 slots gives ~6 ms headroom |
-| `CO_STM32_RX_MAX_PER_POLL` | `32` | Frames drained per `co_stm32_drain_rx()` call on the legacy poll path |
-| `CO_STM32F4_RX_QUEUE_SIZE` | `64` | Same for F4 bxCAN |
-| `CO_STM32F4_RX_MAX_PER_POLL` | `32` | Same for F4 bxCAN |
+| Constant | Default | Driver | Description |
+|----------|---------|--------|-------------|
+| `CO_STM32_RX_QUEUE_SIZE` | `64` | H7 FDCAN | ISR→main-loop ring buffer size. Must be a power of two |
+| `CO_STM32_RX_MAX_PER_POLL` | `32` | H7 FDCAN | Max frames drained per legacy poll call |
+| `CO_STM32G4_RX_QUEUE_SIZE` | `64` | G4 FDCAN | Same semantics as H7 variant |
+| `CO_STM32G4_RX_MAX_PER_POLL` | `32` | G4 FDCAN | Same semantics as H7 variant |
+| `CO_STM32F4_RX_QUEUE_SIZE` | `64` | F4 bxCAN | Same semantics |
+| `CO_STM32F4_RX_MAX_PER_POLL` | `32` | F4 bxCAN | Same semantics |
 
 ### Core stack — `canopen.h`
 

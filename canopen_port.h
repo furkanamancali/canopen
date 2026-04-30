@@ -9,8 +9,11 @@
  * #ifdefs.
  *
  * Supported targets (select by defining the MCU symbol before including):
- *   STM32H723xx  — FDCAN peripheral via canopen_stm32h7_fdcan
- *   STM32F423xx  — bxCAN peripheral via canopen_stm32f4_can
+ *   STM32H723xx                    — FDCAN via canopen_stm32h7_fdcan
+ *   STM32F423xx                    — bxCAN  via canopen_stm32f4_can
+ *   STM32G4xx (any variant below)  — FDCAN via canopen_stm32g4_fdcan
+ *     STM32G431xx, STM32G441xx, STM32G471xx, STM32G473xx, STM32G474xx,
+ *     STM32G483xx, STM32G484xx, STM32G491xx, STM32G4A1xx
  *
  * Public surface exposed to the application:
  *   co_port_handle_t                            — HAL peripheral handle pointer type
@@ -115,8 +118,54 @@
        }                                                                      \
    }
 
+#elif defined(STM32G431xx) || defined(STM32G441xx) || defined(STM32G471xx) || \
+      defined(STM32G473xx) || defined(STM32G474xx) || defined(STM32G483xx) || \
+      defined(STM32G484xx) || defined(STM32G491xx) || defined(STM32G4A1xx)
+/* ── STM32G4 — FDCAN ────────────────────────────────────────────────────── */
+/* The G4 FDCAN HAL API is identical to H7: same function names, same header
+ * structs, same ISR callback (HAL_FDCAN_RxFifo0Callback), same DLC constants.
+ * The CO_PORT_DEFINE_RX_ISR macro below is therefore structurally identical to
+ * the H7 variant — only the underlying co_stm32g4_* functions differ. */
+#  include "canopen_stm32g4_fdcan.h"
+
+   typedef FDCAN_HandleTypeDef  *co_port_handle_t;
+   typedef co_stm32g4_ctx_t      co_port_ctx_t;
+
+   static inline void co_port_attach(co_node_t *node, co_port_handle_t handle,
+                                     co_port_ctx_t *ctx,
+                                     uint8_t node_id, uint16_t heartbeat_ms)
+   {
+       co_stm32g4_attach(node, handle, ctx, node_id, heartbeat_ms);
+   }
+
+   static inline void co_port_drain_rx(co_node_t *node, co_port_ctx_t *ctx)
+   {
+       co_stm32g4_drain_rx(node, ctx);
+   }
+
+   static inline void co_port_rx_isr(co_node_t *node, co_port_ctx_t *ctx)
+   {
+       co_stm32g4_rx_isr(node, ctx);
+   }
+
+   /* Emits HAL_FDCAN_RxFifo0Callback.  Identical dispatch pattern to H7 —
+    * both families share the same HAL callback name for FDCAN FIFO0. */
+#  define CO_PORT_DEFINE_RX_ISR(buses_, count_)                              \
+   void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan,              \
+                                   uint32_t RxFifo0ITs)                     \
+   {                                                                         \
+       (void)RxFifo0ITs;                                                     \
+       for (uint8_t _b = 0U; _b < (count_); ++_b) {                        \
+           if (hfdcan == (buses_)[_b].handle) {                             \
+               co_port_rx_isr(&(buses_)[_b].node, &(buses_)[_b].ctx);      \
+               break;                                                        \
+           }                                                                 \
+       }                                                                     \
+   }
+
 #else
-#  error "canopen_port.h: unsupported MCU — define STM32H723xx or STM32F423xx"
+#  error "canopen_port.h: unsupported MCU — define STM32H723xx, STM32F423xx, " \
+         "or a STM32G4xx variant (STM32G474xx, STM32G473xx, STM32G431xx, …)"
 #endif
 
 #endif /* CANOPEN_PORT_H */
